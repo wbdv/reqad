@@ -1,0 +1,66 @@
+#!/bin/bash
+
+WHITE='\033[1;37m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+GREY='\033[1;30m'
+NC='\033[0m' # No Color
+
+echo -ne "${YELLOW}"
+#echo -e "________________________________________________________________________________\n"
+echo -e "┌──────────────────────────────────────────────────────────────────────────────┐"
+echo -e "│                   SERVER INFORMATION                                         │ "
+echo -e "├──────────────────────────────────────────────────────────────────────────────┤"
+echo -ne "${NC}"
+
+#if [ "$EUID" -ne 0 ]
+#    then echo "Please run as root"  1>&2
+#    exit 1
+#fi
+
+IP=`ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print $2'} | awk -F/ {'print $1'}`
+#HOSTNAME=`hostname`
+HOSTNAME=`hostnamectl status | grep 'Static hostname:' | awk {'print $3'}`
+#REVERSE=`hostname -i`
+REVERSE=`dig +short A ${HOSTNAME}`
+ARCH=`hostnamectl status | grep 'Architecture:' | awk {'print $2'}`
+OS=`hostnamectl status | grep 'Operating System:' | awk {'print $3 " " $4 " " $5'}`
+MEMORY=`free -hmw --si | grep 'Mem:' | awk {'print $2'}`
+CPU=`lscpu | grep 'Model name' | awk -F\: {'print $2'} | awk '{$1=$1};1'`
+VCORE=`lscpu | grep -e '^CPU(s):' | awk -F\: '{print $2}' | awk '{$1=$1};1'`
+DISKSPACE=`lsblk | grep 'disk' | awk {'print $4'}`
+SESTATUS=`sestatus | awk {'print $3'}`
+TIMEZONE=`ls -l1 /etc/localtime | awk -F\/ {'print $7"/"$8'}`
+DATE=`date -R`
+
+echo -e "${YELLOW}│        ${GREY}IP Address: ${WHITE}${IP}                                               ${YELLOW}│"
+hostnamectl status | grep -E --color=none 'Static hostname|Operating System|Kernel|Architecture|Virtualization'
+echo "│         Processor: ${CPU}"
+echo "│            vCores: ${VCORE}"
+echo "│            Memory: ${MEMORY}"
+echo "│        Disk Space: ${DISKSPACE}"
+echo "│          Timezone: ${TIMEZONE}"
+echo "│              Date: ${DATE}"
+echo -ne "${YELLOW}"
+echo -e "└──────────────────────────────────────────────────────────────────────────────┘\n"
+echo -ne "${NC}"
+
+if [[ "${ARCH}" != "x86-64" ]]
+    then echo -e "\n ${RED}ERROR: Detected architecture ${ARCH}. Only x86-64 architecture is supported.${NC}\n"  1>&2
+    exit 1
+fi
+
+#if [[ "${OS}" != "CentOS Linux 7" ]]
+#    then echo -e "\n ${RED}ERROR: Detected operating system: ${OS}. Only CentOS Linux 7 is supported.${NC}\n" 1>&2
+#    exit 1
+#fi
+
+if [[ "${REVERSE}" == "" ]]; then
+    REVERSE='unknown'
+fi
+if [[ "${IP}" != "${REVERSE}" ]]
+    then echo -e "\n ${RED}ERROR: Reverse IP for ${HOSTNAME} is ${REVERSE} instead of ${IP}.${NC}\n" 1>&2
+    exit 1
+fi

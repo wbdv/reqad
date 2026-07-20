@@ -1,0 +1,23 @@
+<?php header("Cache-Control: no-cache, must-revalidate"); ?><!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, shrink-to-fit=yes, user-scalable=no, minimal-ui">
+  <style>
+    h1,p {font-family: sans-serif; }
+    h1 {color: #2a6099; }
+    #reqad { opacity: 0.1; transition: opacity 1s; float: right; margin-bottom: 40px; }
+    #reqad:hover { opacity: 1}
+    #container { width:auto; max-width:440px;margin:10% auto;padding:20px 40px 50px;background:#dfe7f0;background: linear-gradient(190deg, #dfe7f0 0%, #ffffff 90%);border-top:6px solid #2a6099; }
+    </style>
+    <title><?php echo $_SERVER['SERVER_NAME'];?> / Magento 2.4.3 - powered by Reqad</title>
+</head>
+<body>
+    <div id="container">
+        <h1>Welcome to <?php echo $_SERVER['SERVER_NAME'];?>!</h1>
+        <p>A new account "<?php echo $_SERVER['USER'];?>" was created on the server. You can upload your magento 2.4.3 files in:</p>
+        <pre><?php echo substr($_SERVER['DOCUMENT_ROOT'], 0, strlen($_SERVER['DOCUMENT_ROOT'])-3); ?></pre>
+        <p>Running on <?php echo str_replace('/', ' ', $_SERVER['SERVER_SOFTWARE']); ?> with php-fpm <?php echo phpversion(); ?></p><br />
+        <img width="100" height="27" id="reqad" src="data:image/png;base64,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">
+    </div>
+</body>
+</html>

@@ -1,0 +1,51 @@
+# Reqad — public export tree. The publish script already strips these,
+# this file is defense-in-depth so nothing sensitive is ever committed.
+
+# Live config / secrets — never publish
+src/public_html/defines.php
+
+# Databases — schema ships as src/db/*.sql; installs build the DB from create.sql
+*.db
+
+# Panel auth (password hashes)
+src/nginx_auth
+
+# Logs & caches
+src/log/*
+!src/log/.gitkeep
+*.log
+*.cache
+src/public_html/dashboard.cache
+
+# Bundled third-party apps (installed separately, not part of this repo)
+src/public_html/phpmyadmin/
+src/public_html/roundcubemail/
+src/public_html/sqadmin/
+src/public_html/webmail
+
+# Premium / separately-packaged modules
+src/public_html/plugins/
+src/scripts/wireguard/
+
+# Throwaway dev scripts with hardcoded credentials — never publish
+src/scripts/cloudflare_add_domain.sh
+src/scripts/cloudflare_add_mx.sh
+src/scripts/cloudflare_dns_records.sh
+src/scripts/cloudflare_radar_api.sh
+src/scripts/test_api.php
+src/scripts/test_cpanel_api.php
+src/scripts/test_post_cpanel_api.sh
+src/scripts/backupdb.sh
+
+# Home-dir cruft (the app root is also the reqad user's home)
+.ssh/
+.vscode-server/
+.cache/
+.config/
+_test_/
+
+# Editor / OS cruft
+*.bak
+*.bak.*
+*.swp
+.DS_Store

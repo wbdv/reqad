@@ -1,0 +1,51 @@
+#!/bin/bash
+
+DOMAIN=$1
+
+GEN_CSR=$(expect -c "
+
+set timeout 10
+spawn openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout /etc/ssl/certs/${DOMAIN}.key -out /etc/ssl/certs/${DOMAIN}.csr 
+
+expect \"Country Name (2 letter code)\"
+send -- \"XX\r\"
+
+expect \"State or Province Name\"
+send -- \"Default\r\"
+
+expect \"Locality Name\"
+send -- \"Default Locality\r\"
+
+expect \"Organization Name\"
+send -- \"Default Company\r\"
+
+expect \"Organizational Unit Name\"
+send -- \"Default Organizational Unit\r\"
+
+expect \"Common Name\"
+send -- \"*.${DOMAIN}\r\"
+
+expect \"Email Address\"
+send -- \"\r\"
+
+expect \"A challenge password\"
+send -- \"\r\"
+
+expect \"An optional company name\"
+send -- \"\r\"
+
+expect eof
+")
+
+
+if [ -f "/etc/ssl/certs/${DOMAIN}.csr" ]; then
+    (openssl x509 -req -days 365 -in /etc/ssl/certs/${DOMAIN}.csr -signkey /etc/ssl/certs/${DOMAIN}.key -out /etc/ssl/certs/${DOMAIN}.crt && rm -f /etc/ssl/certs/${DOMAIN}.csr) > /dev/null 2>&1
+    if [ -f "/etc/ssl/certs/${DOMAIN}.crt" ]; then
+       exit 0;
+       #echo "Self-signed certificate was successfully created"; 
+       #cat /etc/ssl/certs/${DOMAIN}.crt
+    else
+        rm -f /etc/ssl/certs/${DOMAIN}.key
+    fi
+    rm -f /etc/ssl/certs/${DOMAIN}.csr
+fi

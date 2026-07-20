@@ -1,0 +1,75 @@
+#!/usr/bin/php82
+<?php
+if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+if(!is_file(__DIR__.'/../db/reqad.db')) {
+	echo "Missing SQLite Database '".__DIR__."'/../db/reqad.db'\n";
+	exit;
+}
+
+if(isset($argv) && count($argv)>1) {
+	$argp = explode('=', $argv[1]);
+	if($argp[0]=='--help') {
+		echo "Create an user and configure the main domain.\n";
+		echo "Usage: ".$argv[0]." [--db-delete=ID]\n";
+		exit;	
+	}
+}
+
+$db = new SQLite3(__DIR__.'/../db/reqad.db');
+
+if(isset($argv) && count($argv)>1 && $argp[0]=='--db-delete' && isset($argp[1])) {
+	$results = $db->query('SELECT count(*) as nb FROM accounts WHERE id='.(int)($argp[1]));
+	$row = $results->fetchArray();
+	$nb_accounts = (int)($row["nb"]);
+	if($nb_accounts == 0) {
+		echo "There is no account with id #".(int)($argp[1]).".\n";
+	 	exit;
+	} else {
+		$db->query('DELETE FROM accounts WHERE id='.(int)($argp[1]));
+		echo "Account #".(int)($argp[1])." deleted.\n";
+	}
+	exit;
+}
+
+$results = $db->query('SELECT count(*) as nb FROM accounts');
+$row = $results->fetchArray();
+$nb_accounts = (int)($row["nb"]);
+if($nb_accounts == 0) {
+	echo "There are no accounts created on this server.\n";
+ 	exit;
+} else {
+	$results = $db->query('SELECT * FROM accounts');
+	$i=0;
+	echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+	echo "│ \033[97m   #   Domain                           User                Usage                           Status\033[0m   │\n";
+	echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────┤\n";
+	while ($row = $results->fetchArray()) {
+		$i++;
+		if($row["status"]!='active') {
+			echo "\033[41m"; echo "\033[97m"; // white on red
+		}
+		echo '│ '.substr(str_pad($row["id"].' ', 5, ' ', STR_PAD_LEFT), 0, 5);
+		echo '│ '.substr(str_pad($row["domain"], 31), 0, 31);
+		echo '│ '.substr(str_pad($row["user"], 18), 0, 18);
+		if($row["disk_quota"]==0) {
+			echo '│ '.substr(str_pad('unlimited', 30), 0, 30);
+		} else {
+			if($row["disk_quota"]>1023)
+				if(number_format($row["disk_quota"]/1024*10)%10==0)
+					echo '│ '.substr(str_pad(number_format($row["disk_usage"]).' MB of '.number_format($row["disk_quota"]/1024).' GB ('.round($row["disk_usage"]*100/$row["disk_quota"]).'%)', 30), 0, 30);
+				else
+					echo '│ '.substr(str_pad(number_format($row["disk_usage"]).' MB of '.number_format($row["disk_quota"]/1024,1).' GB ('.round($row["disk_usage"]*100/$row["disk_quota"]).'%)', 30), 0, 30);
+			else
+				echo '│ '.substr(str_pad(number_format($row["disk_usage"]).' MB of '.number_format($row["disk_quota"]).' MB ('.round($row["disk_usage"]*100/$row["disk_quota"]).'%)', 30), 0, 30);
+		}
+		echo '│ '.substr(str_pad($row["status"], 9), 0, 9).'│';
+		if($row["status"]!='active')
+			echo "\033[0m";
+		echo "\n";
+	}
+	echo "└──────────────────────────────────────────────────────────────────────────────────────────────────────┘\n";
+	#	echo "\n";
+}

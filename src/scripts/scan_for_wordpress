@@ -1,0 +1,113 @@
+#!/usr/bin/env php82
+<?php
+if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+if(!is_file(__DIR__.'/../db/reqad.db')) {
+	echo "Missing SQLite Database '".__DIR__."'/../db/reqad.db'\n";
+	exit;
+}
+
+if(isset($argv) && count($argv)>1) {
+	$argp = explode('=', $argv[1]);
+	if($argp[0]=='--help') {
+		echo "Scan for wordpress instalations in public_html and subfolders\n";
+		echo "Usage: ".$argv[0]." [--help]\n";
+		exit;
+	}
+}
+
+$db = new SQLite3('/usr/local/reqad/db/reqad.db');
+
+$results = $db->query('SELECT count(*) as nb FROM accounts');
+$row = $results->fetchArray();
+$nb_accounts = (int)($row["nb"]);
+if($nb_accounts == 0) {
+	echo "There are no accounts created on this server.\n";
+ 	exit;
+}
+
+// Collect all wp-config.php paths from locate (fast, uses mlocate db)
+// Format: /home/<user>/public_html[/<subpath>]/wp-config.php
+$locate_output = shell_exec('locate wp-config.php 2>/dev/null | grep -E "^/home/[^/]+/public_html"');
+$locate_paths = [];
+if($locate_output) {
+    foreach(explode("\n", trim($locate_output)) as $p) {
+        $p = trim($p);
+        if($p !== '') $locate_paths[] = $p;
+    }
+}
+
+$results = $db->query('SELECT * FROM accounts');
+$i = 0;
+echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+echo "│ \033[97m   #   Domain                           WP Version    Title                            Path          Status\033[0m   │\n";
+echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤\n";
+
+while ($row = $results->fetchArray()) {
+    $user   = $row['user'];
+    $domain = $row['domain'];
+    $public_html = '/home/'.$user.'/public_html';
+
+    // Build list of wp-config.php files for this user
+    $wp_paths = [];
+
+    // Root install
+    if(is_file($public_html.'/wp-config.php')) {
+        $wp_paths[] = $public_html.'/wp-config.php';
+    }
+
+    // Subfolder installs from locate
+    foreach($locate_paths as $lp) {
+        if(strpos($lp, '/home/'.$user.'/public_html/') === 0 && $lp !== $public_html.'/wp-config.php') {
+            $wp_paths[] = $lp;
+        }
+    }
+
+    foreach($wp_paths as $wp_config) {
+        $wp_dir = dirname($wp_config);
+
+        // Relative path from public_html ('' for root install)
+        $rel_path = ($wp_dir === $public_html) ? '' : ltrim(substr($wp_dir, strlen($public_html)), '/');
+
+        $wp_version = trim(shell_exec('/usr/local/bin/wp core version --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
+        if($wp_version == '' || strpos($wp_version, 'Error:') === 0) continue;
+
+        $title = trim(shell_exec('/usr/local/bin/wp option get blogname --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
+
+        $i++;
+        echo '│ '.substr(str_pad($i.' ', 5, ' ', STR_PAD_LEFT), 0, 5);
+        echo '│ '.substr(str_pad($domain, 31), 0, 31);
+        echo '│ '.substr(str_pad($wp_version, 12), 0, 12);
+        echo '│ '.substr(str_pad($title, 32), 0, 32);
+        echo '│ '.substr(str_pad($rel_path === '' ? '/' : $rel_path, 14), 0, 14);
+        echo '│ '.substr(str_pad($row["status"], 9), 0, 9).'│';
+        echo "\n";
+
+        // Upsert: match on domain + path
+        $stmt = $db->prepare('SELECT id FROM wordpress WHERE domain=:domain AND path=:path');
+        $stmt->bindValue(':domain', $domain, SQLITE3_TEXT);
+        $stmt->bindValue(':path', $rel_path, SQLITE3_TEXT);
+        $res2 = $stmt->execute();
+        if($row2 = $res2->fetchArray()) {
+            $upd = $db->prepare('UPDATE wordpress SET wp_version=:v, title=:t, status=:s WHERE id=:id');
+            $upd->bindValue(':v', $wp_version, SQLITE3_TEXT);
+            $upd->bindValue(':t', $title, SQLITE3_TEXT);
+            $upd->bindValue(':s', $row['status'], SQLITE3_TEXT);
+            $upd->bindValue(':id', $row2['id'], SQLITE3_INTEGER);
+            $upd->execute();
+        } else {
+            $ins = $db->prepare('INSERT INTO wordpress (user, domain, title, wp_version, path, comments, status, created_at) VALUES (:u, :d, :t, :v, :p, "", :s, datetime("now"))');
+            $ins->bindValue(':u', $user, SQLITE3_TEXT);
+            $ins->bindValue(':d', $domain, SQLITE3_TEXT);
+            $ins->bindValue(':t', $title, SQLITE3_TEXT);
+            $ins->bindValue(':v', $wp_version, SQLITE3_TEXT);
+            $ins->bindValue(':p', $rel_path, SQLITE3_TEXT);
+            $ins->bindValue(':s', $row['status'], SQLITE3_TEXT);
+            $ins->execute();
+        }
+    }
+}
+echo "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n";
+?>

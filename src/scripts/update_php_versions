@@ -1,0 +1,63 @@
+#!/usr/bin/php82
+<?php
+define('_PATH', '/usr/local/reqad');
+#chdir(_PATH.'/etc/');
+$ini = parse_ini_file(_PATH.'/etc/server-software.ini');
+
+#print_r($ini); exit;
+
+$php_version_default = trim(`php -v | head -n 1 | awk {'print $2'} | awk -F. {'print $1"."$2'}`);
+
+$php_versions = array();
+$output = `rpm -qa | grep '\-php-fpm' | awk -F- {'print \$4'} | awk -F. {'print $1"."$2'}`;
+$php_versions = array_map('trim', explode("\n", trim($output)));
+$php_versions[] = $php_version_default;
+sort($php_versions);
+$php_versions = array_unique($php_versions);
+
+$services = array_map('trim', explode(',', $ini['services']));
+sort($services);
+
+#print_r($services); exit;
+$services_orig = implode(', ', $services);
+
+foreach($services as $k => $s) {
+	if(substr($s,0,3)=='php' && substr($s,-7,7)=='php-fpm')
+		unset($services[$k]);
+}
+
+foreach($php_versions as $phpv) {
+	if($phpv == $php_version_default) 
+		$services[] = 'php-fpm';
+	else
+		$services[] = 'php'.str_replace('.', '', $phpv).'-php-fpm';
+}
+
+sort($services);
+$services = array_unique($services);
+#print_r($services); exit;
+
+$php_versions = implode(', ', $php_versions);
+$services = implode(', ', $services);
+
+#echo '#'.$ini['php_versions'].'#'.$php_versions."\n";
+
+if(!isset($ini['php_versions']) || $ini['php_versions'] != $php_versions) {
+	echo date('Y-m-d H:i')." - Updating php versions\n";
+	shell_exec("sed -i '/^php_versions=/d' "._PATH."/etc/server-software.ini");
+	shell_exec("sed -i '/^php_versions =/d' "._PATH."/etc/server-software.ini");
+	shell_exec("sed -i '/\[web\]/a\php_versions=".$php_versions."' "._PATH."/etc/server-software.ini");
+}
+
+if(!isset($ini['php']) || $ini['php'] != $php_version_default) {
+	echo date('Y-m-d H:i')." - Updating default php version\n";
+	shell_exec("sed -i '/^php=/d' "._PATH."/etc/server-software.ini");
+	shell_exec("sed -i '/^php =/d' "._PATH."/etc/server-software.ini");
+	shell_exec("sed -i '/\[web\]/a\php=".$php_version_default."' "._PATH."/etc/server-software.ini");
+}
+
+if($services != $services_orig) {
+	shell_exec("sed -i '/^services=/d' "._PATH."/etc/server-software.ini");
+	shell_exec("sed -i '/^services =/d' "._PATH."/etc/server-software.ini");
+	shell_exec("sed -i '/\[systemd\]/a\services=".$services."' "._PATH."/etc/server-software.ini");
+}

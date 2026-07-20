@@ -1,0 +1,39 @@
+#!/usr/bin/php82
+<?php
+if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+if(!is_file(__DIR__.'/../db/reqad.db')) {
+	echo "Missing SQLite Database '".__DIR__."'/../db/reqad.db'\n";
+	exit;
+}
+
+$db = new SQLite3(__DIR__.'/../db/reqad.db');
+
+$results = $db->query('SELECT count(*) as nb FROM accounts');
+$row = $results->fetchArray();
+$nb_accounts = (int)($row["nb"]);
+if($nb_accounts == 0) {
+	echo "There are no accounts created on this server.\n";
+ 	exit;
+} else {
+    $template_ssl = file_get_contents(__DIR__.'/templates/apache-ssl.conf');
+    $template     = file_get_contents(__DIR__.'/templates/apache.conf');
+	$results = $db->query('SELECT * FROM accounts');
+	$i=0;
+	while ($row = $results->fetchArray()) {
+		$i++;
+        $file = '/etc/httpd/conf.d/'.$row["domain"].'.conf';
+        if(!is_file($file) || (isset($argv[1]) && $argv[1]=='--force')) {
+            if(is_file('/etc/letsencrypt/live/'.$row["domain"].'/cert.pem')) {
+                $file_contents = str_replace('%DOMAIN%', $row["domain"], str_replace('%USER%', $row["user"], $template_ssl));
+            } else {
+                $file_contents = str_replace('%DOMAIN%', $row["domain"], str_replace('%USER%', $row["user"], $template));
+            }
+            file_put_contents($file, $file_contents);
+            echo $file."\n";
+        }
+	}
+    shell_exec('systemctl restart httpd');
+}

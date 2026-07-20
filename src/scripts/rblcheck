@@ -1,0 +1,89 @@
+#!/usr/bin/php82 -c ""
+<?php
+#$debug = true;
+$debug = false;
+
+$resolver['local'] 			= '85.9.27.3';
+$resolver['Cloudflare DNS'] = '1.1.1.1';
+$resolver['Google DNS'] 	= '8.8.8.8';
+$resolver['OpenDNS'] 		= '208.67.222.222';
+
+$WHITE="\033[1;37m";
+$RED="\033[0;31m";
+$GREEN="\033[0;32m";
+$YELLOW="\033[0;33m";
+$BLUE="\033[0;34m";
+$GREY="\033[1;30m";
+$NC="\033[0m"; # No Color
+
+$OK = "[ ".$GREEN."OK".$NC." ] ";
+$WRONG = "[ ".$RED."WRONG".$NC." ] ";
+$NOTE = "[ ".$YELLOW."NOTE".$NC." ] ";
+
+if(php_sapi_name() != "cli") {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+
+if(!isset($argc) || $argc==1) {
+    echo "Check IP in RBL.\n";
+    echo "Usage: ".$argv[0]." 127.0.0.1\n";
+    exit;
+}
+
+function run($s) {
+	global $debug;
+	if($debug === true)
+		echo "COMMAND ".$s."\n";
+	$out = shell_exec($s);
+#	if($return_value != 0)
+#		exit;
+	if($debug === true)
+		echo "OUTPUT\n".$out."\n";
+	return $out;
+}
+
+$ip = trim($argv[1]);
+
+if(filter_var($ip, FILTER_VALIDATE_IP) === false) {
+    echo  "$WRONG Error: IP is wrong, please check what you typed.\n";
+	exit;
+}
+
+$bl = array (
+    'b.barracudacentral.org',
+#    'cbl.abuseat.org',
+    'xbl.spamhaus.org',
+    'bl.tracking.ro',
+    'rbl.abuse.ro',
+	'netscan.rbl.blockedservers.com',
+	'black.dnsbl.brukalai.lt',
+	'dnsbl.beetjevreemd.nl',
+	'bl.fmb.la',
+	'bl.rbl.polspam.pl',
+	'all.s5h.net',
+	'all.spamrats.com',
+	'dnsbl.spfbl.net',
+	'dnsbl.threatint.zone',
+	'free.v4bl.org',
+	'f13af40fb445544fb2d1748b55567b96.combined.mail.abusix.zone',
+);
+
+function rev($ip) {
+    $ipr = explode('.', $ip);
+    return $ipr[3].'.'.$ipr[2].'.'.$ipr[1].'.'.$ipr[0];
+}
+
+foreach ($bl as $b) {
+    #$res = @dns_get_record(rev($ip).'.'.$b);
+    $res = trim(run("dig +short +answer ".rev($ip).'.'.$b));
+	$b = str_replace('f13af40fb445544fb2d1748b55567b96.', '', $b);
+    #if(is_array($res) && count($res)>0) {
+    if($res!='') {
+    	echo  "$WRONG listed in $b $NC\n";
+	} else {
+    	echo  "$OK    not listed in $b $NC\n";
+	}
+}
+		
+

@@ -1,0 +1,91 @@
+#!/usr/bin/php82
+<?php
+chdir("/usr/local/reqad/scripts/");
+if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+if(!is_file(__DIR__.'/../db/reqad.db')) {
+	echo "Missing SQLite Database '".__DIR__."'/../db/reqad.db'\n";
+	exit;
+}
+
+if(isset($argv) && count($argv)>1) {
+	$argp = explode('=', $argv[1]);
+	if($argp[0]=='--help') {
+		echo "Update email accounts disk usage\n";
+		echo "Usage: ".$argv[0]." [--help]\n";
+		exit;	
+	}
+}
+
+#$db = new SQLite3(__DIR__.'/../db/reqad.db');
+$db = new SQLite3('/usr/local/reqad/db/reqad.db');
+
+$output = shell_exec('sudo cat /etc/dovecot/users | sort | awk -F\':\' {\'print $1 " " $6\'}');
+$emails = explode("\n", trim($output));
+$nb_accounts = count($emails);
+#echo '<pre>'; print_r($emails); exit;
+
+
+#$results = $db->query('SELECT count(*) as nb FROM emails');
+#$row = $results->fetchArray();
+#$nb_accounts = (int)($row["nb"]);
+if($nb_accounts == 0) {
+	echo "There are no email accounts created on this server.\n";
+ 	exit;
+} else {
+	#$results = $db->query('SELECT * FROM emails');
+	$i=0;
+	echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+	echo "│ \033[97m   #   Email                                      Usage                           Status     Created at\033[0m  │\n";
+	echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────┤\n";
+/*
+	while ($row = $results->fetchArray()) {
+		$i++;
+		if($row["status"]!='active') {
+			echo "\033[41m"; echo "\033[97m"; // white on red
+		}
+		echo '│ '.substr(str_pad($row["id"].' ', 5, ' ', STR_PAD_LEFT), 0, 5);
+		echo '│ '.substr(str_pad($row["email"], 31), 0, 31);
+		echo '│ '.substr(str_pad($row["user"], 18), 0, 18);
+*/
+	foreach($emails as $email) {
+		$email2 = explode(' ', $email);
+		$email = $email2[0];
+		$email_path = $email2[1];
+		if(is_dir($email_path))
+			$disk_usage = shell_exec('du -sm '.$email_path);
+		else 
+			$disk_usage = 0;
+		$disk_usage = (int)($disk_usage);
+
+		$results = $db->query("SELECT * FROM emails WHERE email='$email'");
+		if($results==FALSE) {
+             echo "Error in fetch ".$db->lastErrorMsg();
+			exit;
+        } else {
+		if($row = $results->fetchArray()) {
+			echo '│ '.substr(str_pad($row["id"].' ', 5, ' ', STR_PAD_LEFT), 0, 5);
+			echo '│ '.substr(str_pad($row["email"], 41), 0, 41);
+	
+			if($disk_usage>=1024)
+				echo '│ '.substr(str_pad(number_format((int)($disk_usage/1024),0,'.',"'").' GB ', 30, ' ', STR_PAD_LEFT), 0, 30);
+			else
+				echo '│ '.substr(str_pad(number_format($disk_usage,0,'.',"'").' MB ', 30, ' ', STR_PAD_LEFT), 0, 30);
+
+			$db->query('UPDATE emails SET disk_usage='.$disk_usage.' WHERE email="'.$email.'"');
+			echo '│ '.substr(str_pad($row["status"], 9), 0, 9);
+			echo '│ '.substr(str_pad($row["created_at"], 10), 0, 10).'  │';
+			if($row["status"]!='active')
+				echo "\033[0m";
+			echo "\n";
+		} else {
+			$db->query("INSERT INTO emails VALUES (null, '$email', $disk_usage, null, 'active', DATE())");
+		}
+		}
+	}
+	echo "└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n";
+	#	echo "\n";
+}
+?>

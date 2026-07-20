@@ -1,0 +1,136 @@
+#!/usr/bin/php82
+<?php
+if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+
+if(!isset($argc) || $argc==1) {
+    echo "Create an user and configure the main domain.\n";
+    echo "Usage: ".$argv[0]." --user=USERNAME --domain=EXAMPLE.TLD [--password=PASSWORD] [--quota=1024]\n";
+    exit;
+}
+
+if(!is_file(__DIR__.'/../db/reqad.db')) {
+	echo "Missing __DIR__.'/../db/reqad.db'\n";
+	exit;
+}
+
+$db = new SQLite3(__DIR__.'/../db/reqad.db');
+
+$user       = '';
+$domain     = '';
+$password   = '';
+$disk_quota = 1024;
+$ini = parse_ini_file(__DIR__.'/../etc/server-software.ini');
+
+for($i=1;$i<=($argc+1);$i++) {
+    $argp = explode('=', $argv[$i]);
+    if($argp[0]=='--user')
+        $user = $argp[1]; 
+    if($argp[0]=='--domain')
+        $domain = $argp[1]; 
+    if($argp[0]=='--password')
+        $password = $argp[1]; 
+	if($argp[0]=='--quota')
+        $disk_quota = (int)($argp[1]); 
+}
+// quota disabled, set 0 (unlimited) so on usage will display entire disk
+if($ini["quota"]==0)
+	$disk_quota = 0;
+
+if($user=='' || $domain=='') {
+    echo "Create an user and configure the main domain.\n";
+	if($ini["quota"]==0)
+    	echo "Usage: ".$argv[0]." --user=USERNAME --domain=EXAMPLE.TLD [--password=PASSWORD]\n";
+	else
+    	echo "Usage: ".$argv[0]." --user=USERNAME --domain=EXAMPLE.TLD [--password=PASSWORD] [--quota=1024 MB (default)>]\n";
+    exit;
+}
+
+if($password=='') {
+    readline_callback_handler_install('', function(){});
+    echo "Enter the password: ";
+    $stdin=fopen("php://stdin","r");
+    $char = '';
+    while( $char != PHP_EOL) {
+        $char = fread($stdin, 1);
+        echo '*';
+        $password .= $char;
+    }
+    $password = substr($password, 0, -1);
+    fclose($stdin);
+    readline_callback_handler_remove ();
+    echo "\n";
+    #echo '|'.$password."|\n";
+}
+#echo $password."\n"; exit;
+
+$errmsg     = '';
+$successmsg = '';
+
+if(preg_match('/[a-z0-9]+[a-z0-9\-\.]+[a-z0-9]+\.[a-z]{2,}/', $domain)!==false) {
+    $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
+    if ($row = $results->fetchArray()) {
+        $errmsg = "Error: Domain name already exists on this server, assigned to user ".$row["user"].".";
+    }
+} else {
+    $errmsg =  "Error: Domain name is wrong, please check what you typed.";
+}
+
+if($errmsg == '') {
+    if(in_array($user, array('root', 'reqad', 'test', 'bin', 'daemon', 'adm', 'lp', 'sync', 'shutdown', 'halt', 'mail', 'operator', 'games', 'ftp', 'nobody', 'systemd-network', 'dbus', 'polkitd', 'sshd', 'postfix', 'chrony', 'reqad', 'apache', 'cjdns', 'vnstat', 'postgres', 'redis', 'awx', 'nginx', 'tss'))) {
+        $errmsg =  "Error: Username already exists. Please choose a distinct one.";
+    } else if(preg_match('/[a-z]+[a-z0-9]{1,7}/', $user)!==false) {
+        $results = $db->query('SELECT * FROM accounts WHERE user="'.$user.'"');
+        if ($row = $results->fetchArray()) {
+            $errmsg =  "Error: Username already exists (UID=".$row["id"]."). Please choose a different one.";
+        } else {
+            $USER_EXISTS = `(id $user) > /dev/null 2>&1; echo $?`;
+            if((int)($USER_EXISTS) == 0) {
+                $errmsg =  "Error: Username already exists on server. Please choose a different one.";
+            }
+        }
+    } else {
+        $errmsg =  "Error: Username should contain only lowercase letters and numbers.";
+    }
+}
+
+if($errmsg == '') {
+    // TODO check password strength
+    if(strlen($password)<8) {
+        $errmsg =  "Error: Password should be at least 8 characters long.";
+    }
+}
+
+if($errmsg == '') {
+	include(__DIR__.'/add_dns_zone.php');
+}
+
+if($errmsg == '') {
+    // All ok, create account. FInally!
+    error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 4)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." create account $user\n", 3, '../log/route_log');
+    #$output = shell_exec("/usr/local/reqad/scripts/create_user.sh $user");
+    $output = shell_exec("sudo useradd $user 2>&1");
+    if(!is_null($output)) {
+        $errmsg =  "Error: ".$output;
+    } else {
+        $uid = `id -u $user`;
+        $uid = (int)($uid);
+        error_log(date("Y-m-d H:i.s").substr((string)microtime(), 1, 4)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER'].' INSERT INTO accounts VALUES ('.$uid.', "'.$user.'", "'.$domain.'", 0, '.$disk_quota.', "active", datetime("now"))'."\n", 3, '../log/debug_log');
+        $db->query('INSERT INTO accounts VALUES ('.$uid.', "'.$user.'", "'.$domain.'", 0, '.$disk_quota.', "active", datetime("now"))');
+		shell_exec('sudo su - '.$user.' -c "mkdir public_html && ln -s public_html www" >> ../log/debug_log');
+        require_once('templates/'.$ini["template"].'.php');
+    }
+}
+
+if($errmsg == '') {
+    $successmsg =  "Account $user successfully created.";
+    echo $successmsg."\n";
+    exit(0);
+//    header("Location: ".$_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/accounts/');
+//    exit;
+} else {
+    echo $errmsg."\n";
+    exit(1);
+}

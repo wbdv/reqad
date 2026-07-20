@@ -1,0 +1,290 @@
+#!/usr/bin/php82 -c ""
+<?php
+#$debug = true;
+$debug = false;
+
+$resolver['local'] 			= '85.9.27.3';
+$resolver['Cloudflare DNS'] = '1.1.1.1';
+$resolver['Google DNS'] 	= '8.8.8.8';
+$resolver['OpenDNS'] 		= '208.67.222.222';
+$resolver['OpenNIC'] 		= '134.195.4.2';
+$resolver['resolver1'] 		= '85.9.27.3';
+$resolver['resolver2'] 		= '85.120.61.3';
+$resolver['GTS Telecom'] 	= '85.9.32.234';
+
+$WHITE="\033[1;37m";
+$RED="\033[0;31m";
+$GREEN="\033[0;32m";
+$YELLOW="\033[0;33m";
+$BLUE="\033[0;34m";
+$GREY="\033[1;30m";
+$NC="\033[0m"; # No Color
+
+$OK = "[ ".$GREEN."OK".$NC." ] ";
+$WRONG = "[ ".$RED."WRONG".$NC." ] ";
+$NOTE = "[ ".$YELLOW."NOTE".$NC." ] ";
+
+if(php_sapi_name() != "cli") {
+    echo "You can only run this script as root from cli.\n";
+    exit;
+}
+
+if(!isset($argc) || $argc==1) {
+    echo "Check domain in DNS.\n";
+    echo "Usage: ".$argv[0]." EXAMPLE.TLD\n";
+    exit;
+}
+
+function run($s) {
+	global $debug;
+	if($debug === true)
+		echo "COMMAND ".$s."\n";
+	$out = shell_exec($s);
+#	if($return_value != 0)
+#		exit;
+	if($debug === true)
+		echo "OUTPUT\n".$out."\n";
+	return $out;
+}
+
+$d = trim($argv[1]);
+$d = preg_replace('/[^a-z0-9\-\.]+/', '', $d);
+
+#$d = 'ename.ro';
+
+if(preg_match('/[a-z0-9]+[a-z0-9\-\.]+[a-z0-9]+\.[a-z]{2,}/', $d)===false) {
+    $errmsg =  "$WRONG Error: Domain name is wrong, please check what you typed.\n";
+	echo $errmsg."\n";
+	exit;
+}
+
+echo $GREY.mb_substr("━━━━━━━━━━ $YELLOW".$d."$GREY ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$NC", 0,120)."$NC\n";
+
+if(substr($d,-3)=='.ro') {
+	$whois = explode("\n", trim(run("whois $d | grep -ve '^%' | grep -ve '^$'")));
+	#$whois = explode("\n", trim(file_get_contents('whois2.txt')));
+	$w_status = 'Unknown';
+	$w_expires = '';
+	$w_registrar = '';
+	$w_ns = array();
+	foreach($whois as $w_line) {
+		$w_line = trim($w_line);
+	#	echo $w_line."\n";
+	#	echo '#'.substr($w_line, 0, strlen('Domain Status:'))."#\n";
+		if(substr($w_line, 0, strlen('Domain Status:')) == 'Domain Status:') {
+			$w_status = trim(substr($w_line, strlen('Domain Status:'), 99));
+		} else if(substr($w_line, 0, strlen('Expires On:')) == 'Expires On:') {
+			$w_expires = trim(substr($w_line, strlen('Expires On:'), 99));
+		} else if(substr($w_line, 0, strlen('Registrar:')) == 'Registrar:') {
+			$w_registrar = trim(substr($w_line, strlen('Registrar:'), 99));
+		} else if(substr($w_line, 0, strlen('Referral URL:')) == 'Referral URL:') {
+			$w_registrar .= ' - '. trim(substr($w_line, strlen('Referral URL:'), 99));
+		} else if(substr($w_line, 0, strlen('Nameserver:')) == 'Nameserver:') {
+			$w_ns[] = trim(substr($w_line, strlen('Nameserver:'), 99));
+		}
+	}
+
+	if($w_status != 'OK') {
+	    echo "$WRONG Error: Domain status $w_status\n";
+		if($w_status=='Unknown')
+			echo "$GREY           domain not registered.$NC\n";
+		if($w_expires!='')
+			echo "$GREY           expired on ".$w_expires." ; will be deleted on ".date("Y-m-d", strtotime($w_expires ." + 90 days"))."$NC\n";
+		exit;
+	} else {
+		echo "$OK    Whois domain status check.\n";
+		echo "$GREY           domain registrar: $NC".$w_registrar."\n";
+		echo "$GREY           will expire on ".$w_expires. " (in ".floor((strtotime($w_expires)-strtotime("now"))/86400)." days)$NC\n";
+	}
+
+	if(count($w_ns)==0) {
+	    echo "$WRONG Error: No nameservers defined in whois.\n";
+	}
+}
+
+$tld = substr($d, strrpos($d, '.')+1, 99);
+$tld_ns = trim(run("dig +short NS $tld @".$resolver['local']));
+if($tld_ns == '') {
+	echo "$WRONG No TLD .$tld\n";
+	exit;
+}
+$tld_ns = explode("\n", $tld_ns);
+
+# TODO check all TLD
+#foreach($tld_ns as $ns) {
+#	run("dig +noall +authority $d @$ns");
+#}
+$d_ns_ip = array(); // IPs for child nameservers returned by authoritative NS
+$d_ns = trim(run("dig +noall +authority $d @".$tld_ns[0]." | grep '$d.' | awk {'print $5'} | sed 's/.$//g'"));
+if($d_ns == '') {
+	echo "$WRONG This domain has no NS defined in Autoritative NS $GREY(checked in ".$tld_ns[0].")$NC\n";
+	exit;
+} else {
+	echo "$OK    Nameservers defined in Authoritative NS:\n";
+	$d_ns = explode("\n", $d_ns);
+	sort($d_ns);
+
+	$maxlen = 20;
+	foreach($d_ns as $ns) 
+		$maxlen = max($maxlen, strlen($ns));
+
+	$soa = array();
+	foreach($d_ns as $ns) {
+#		if( substr($ns, -1) == '.')
+# 			$ns = substr($ns, 0, strlen($ns)-1);
+		echo "\t   ".substr(str_pad($ns,30),0,$maxlen);
+
+		if( substr($ns, -1*strlen($d)-1) == '.'.$d ) {
+			// child nameserver
+			$ips = trim(run("dig +noall +additional $ns @".$tld_ns[0]." | grep '$ns.' | awk {'print $5'}"));
+			if( $ips=='' ) {
+				echo "\n$WRONG No IP found for child nameserver $ns $GREY(checked in ".$tld_ns[0].")$NC\n";
+			} else {
+				$ips = explode("\n", $ips);
+				foreach($ips as $ip)
+					if(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4))
+						$d_ns_ip[$ns][] = $ip;
+				$ip_str = implode(', ', $ips);
+				echo  " $ip_str $GREY(child nameserver)"."$NC\n";
+				foreach($ips as $ip)
+					if(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4))
+						$soa[$ip] = trim(run("dig +short SOA $d @$ip | awk {'print $3'}"));
+			}
+		} else {
+			$ips = trim(run("dig +short A $ns @".$resolver['local']));
+			if( $ips=='' ) {
+				echo "\n$WRONG No IP found for $ns $GREY(checked in ".$resolver['local'].")$NC\n";
+			} else {
+				$ips = explode("\n", $ips);
+				$ip_str = implode(', ', $ips);
+				echo  " $ip_str\n";
+				foreach($ips as $ip)
+					if(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+						$d_ns_ip[$ns][] = $ip;
+						$soa[$ip] = trim(run("dig +short SOA $d @$ip | awk {'print $3'}"));
+					}
+			}
+		}
+	}
+
+	if($debug) { echo "\$d_ns_ip\n"; print_r($d_ns_ip); }
+	if($debug) { echo "\$soa\n";     print_r($soa);     }
+	if($debug) { echo "\$d_ns\n";    print_r($d_ns);    }
+
+	if(count(array_unique($soa)) == 1) {
+		$soa = current(array_unique($soa));
+		if($soa=='')
+			echo "$WRONG No SOA found.\n";
+		else {
+			echo "$OK    All nameservers returned the same SOA ".$soa.".\n";
+			foreach($resolver as $resolver_name => $resolver_ip) {
+				$soa1 = trim(run("dig +short SOA $d @$resolver_ip | awk {'print $3'}"));
+				if($soa1 == $soa)
+					echo "$OK    $resolver_name synced (same SOA).\n";
+				else 
+					echo "$WRONG $resolver_name returned a different SOA: $soa1\n";
+			}
+		}
+	} else if(count(array_unique($soa)) > 1) {
+		echo "$WRONG Nameservers returned different SOA:\n";
+		foreach($soa as $ip => $soa1)
+			echo "\t   ".substr(str_pad($ip,30),0,$maxlen)." ".$soa1."\n";
+	}
+
+
+/*
+	// check child nameservers A in all nameservers
+	foreach( $d_ns_ip as $child_ns => $ip ) {
+		echo "$YELLOW"."child ns: ".$child_ns."$NC\n";
+		foreach($d_ns as $ns) {
+			$ns = substr($ns, 0, strlen($ns)-1);
+			echo 'ns: '.$ns."\n";
+			if(array_key_exists($ns, $d_ns_ip)) {
+				echo "exists\n";
+				$ip = $d_ns_ip[$ns][0];
+				#$debug = true;
+	    		echo trim(run("dig +short A $child_ns @$ip"));
+				echo "\n---------------------------\n";
+			}
+		}
+	}
+*/
+
+	// check if nameservers from NS are the same as those from Autoritative DNS
+	sort($d_ns); $all_ok = true;
+	$ns_list = implode(', ', $d_ns);
+	foreach($d_ns as $ns) {
+		if(array_key_exists($ns, $d_ns_ip)) {
+			$ret_ns = trim(run("dig +short NS $d @".$d_ns_ip[$ns][0]." | sed 's/.$//g'"));
+			if($ret_ns == '') {
+				echo "$WRONG Nameserver $ns returned no NS information.\n";
+				$all_ok = false;
+			} else {
+				$ret_ns = explode("\n", $ret_ns);
+				sort($ret_ns);
+				$ret_ns2 = implode(', ', $ret_ns);
+				if($ret_ns2 != $ns_list) {
+					echo "$WRONG Nameserver $ns returned NS $ret_ns2\n";
+					$all_ok = false;
+				}
+			}
+		}
+	}
+	if($all_ok)
+		echo "$OK    All nameservers returned same information for NS.\n";
+
+	$a_ips = array();
+	foreach($d_ns as $ns) {
+		if(array_key_exists($ns, $d_ns_ip)) {
+			$a_ips[] = trim(run("dig +short A $d @".$d_ns_ip[$ns][0]." | head -n 1"));
+		}
+	}
+
+	if(count(array_unique($a_ips)) == 1 && $a_ips[0]=='') {
+		echo "$WRONG No IP address found.\n";
+	} else if(count(array_unique($a_ips)) == 1 && $a_ips[0]!='') {
+		$all_ok=true;
+		echo "$OK    All nameservers returned the same A ".$a_ips[0]
+			.' ['.trim(run("mmdblookup --file /usr/share/GeoIP/GeoLite2-Country.mmdb --ip ".$a_ips[0]." country iso_code | tr -d '\\n' | awk -F\\\" {'print $2'}")).']'."\n";
+		foreach($resolver as $resolver_name => $resolver_ip) {
+			#$ret_ip = explode("\n", trim(run("dig +short A $d @".$resolver_ip)));
+			$ret_ip = trim(run("dig +short A $d @".$resolver_ip." | head -n 1"));
+			if($ret_ip == $a_ips[0])
+				echo "$OK    $resolver_name synced (same A).\n";
+			else {
+				echo "$NOTE  $resolver_name returned a different IP: $ret_ip"
+					.' ['.trim(run("mmdblookup --file /usr/share/GeoIP/GeoLite2-Country.mmdb --ip ".$ret_ip." country iso_code | tr -d '\\n' | awk -F\\\" {'print $2'}")).']'."\n";
+				$all_ok = false;
+			}
+		}
+		if($all_ok === false)
+				echo "$GREY           Is OK for a nameserver to return a different IP for a host if is using Anycast or load-balancer.$NC\n";
+
+	} else {
+		echo "$NOTE  Multiple IPs for A ".implode(', ', $a_ips).".\n";
+	}
+
+	#$mx = trim(run("dig +short MX $d @".$d_ns_ip[$ns][0]));	
+	$mx = trim(run("dig +short MX $d @".$resolver['local']));	
+	$mxs = explode("\n", $mx);
+	if(count(array_unique($mxs)) == 0 || $mxs[0]=='') {
+		echo "$WRONG No MX (mail server) found.\n";
+	} else if(count(array_unique($mxs)) == 1 && $mxs[0]!='') {
+		echo "$OK    Mail server (MX) ".$mxs[0]."\n";
+	} else {
+		sort($mxs, SORT_NATURAL);
+		echo "$OK    Mail Servers (MX)\n";
+		foreach($mxs as $mx) {
+			$mx = substr($mx,0,-1);
+			echo "           $mx\n";
+		}
+	}
+
+	$txt = trim(run("dig +short TXT $d @".$resolver['local']));	
+	$txts = explode("\n", $txt);
+	$spf = '';
+	foreach($txts as $txt)
+		if(substr($txt, 0, 7)=='v=spf1 ' || substr($txt, 0, 8)=='"v=spf1 ')
+			$spf = $txt;
+}
+echo "\n";

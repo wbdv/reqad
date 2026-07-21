@@ -12,7 +12,25 @@
 	$ssh_keys = array();
 
 	$authorized = shell_exec('sudo grep AuthorizedKeysFile /etc/ssh/sshd_config | awk {\'print $2\'}');
-	$pw_auth_raw = trim(shell_exec('sudo grep -i "^PasswordAuthentication" /etc/ssh/sshd_config | awk \'{print $2}\''));
+
+	// `sshd -T` prints the effective config: it resolves Include directives
+	// (EL9 ships one for sshd_config.d/) and fills in defaults, so an unset
+	// Port still reports 22 — grepping sshd_config alone finds nothing.
+	$sshd_effective = (string)shell_exec('sudo sshd -T 2>/dev/null');
+
+	$ssh_ports = array();
+	if(preg_match_all('/^port\s+(\d+)/mi', $sshd_effective, $m))
+		$ssh_ports = array_values(array_unique($m[1]));
+	if(empty($ssh_ports)) {
+		// sshd -T unavailable (older sshd, or it refused to parse) — fall back
+		$raw = trim((string)shell_exec('sudo grep -iE "^[[:space:]]*Port[[:space:]]+[0-9]+" /etc/ssh/sshd_config | awk \'{print $2}\''));
+		$ssh_ports = ($raw !== '') ? array_values(array_unique(preg_split('/\s+/', $raw))) : array('22');
+	}
+
+	if(preg_match('/^passwordauthentication\s+(\S+)/mi', $sshd_effective, $m))
+		$pw_auth_raw = $m[1];
+	else
+		$pw_auth_raw = trim(shell_exec('sudo grep -i "^PasswordAuthentication" /etc/ssh/sshd_config | awk \'{print $2}\''));
 	$pw_auth_enabled = ($pw_auth_raw === '' || strtolower($pw_auth_raw) === 'yes');
 	$root_access = isset($ini['root_access']) ? (int)$ini['root_access'] : 1;
 
@@ -60,6 +78,9 @@
 						<? } else { ?>
 						<span class="badge bg-success text-white">disabled</span>
 						<? } ?>
+						&nbsp;&middot;&nbsp;
+						SSH <?=(count($ssh_ports) > 1 ? 'ports' : 'port');?>
+						<span class="badge bg-green-lt border"><?=clean(implode(', ', $ssh_ports));?></span>
 					</div>
               	</div>
               	<div class="col-auto ms-auto d-print-none">

@@ -239,7 +239,8 @@ function feature_enabled($ini, $flag) {
 }
 
 // ini flag(s) a route requires. A route is allowed only if ALL are enabled.
-// terminal needs both terminal=1 AND root_access=1 (it grants a root shell).
+// terminal only needs terminal=1 — with root_access=0 the page still works, it
+// just drops root from the user picker (see templates/terminal.php).
 function route_required_features($route) {
 	$map = array(
 		'email-accounts'       => array('email'),
@@ -250,7 +251,7 @@ function route_required_features($route) {
 		'wp-toolkit'           => array('wptoolkit'),
 		'backup'               => array('backup'),
 		'backupdb'             => array('backupdb'),
-		'terminal'             => array('terminal', 'root_access'),
+		'terminal'             => array('terminal'),
 		'transfer-tool'        => array('transfer'),
 	);
 	if (isset($map[$route]))
@@ -294,6 +295,7 @@ function ajax_required_feature($action) {
 		'ajax-fm-compress'        => 'filemanager',
 		'ajax-fm-extract'         => 'filemanager',
 		'ajax-fm-download'        => 'filemanager',
+		'ajax-terminal-target'    => 'terminal',
 	);
 	if (isset($map[$action]))
 		return $map[$action];
@@ -899,5 +901,77 @@ function apply_account_config($ini, $user, $domain, $which, $content) {
 	shell_exec('sudo systemctl reload '.$t['service'].' >> '._PATH.'/log/debug_log 2>&1');
 	log_debug('[config] '.$which.' '.$domain.' saved + reloaded '.$t['service']);
 	return array('error' => '', 'success' => $t['label'].' saved and reloaded.');
+}
+
+/**
+ * State of wetty, the browser terminal behind the Terminal page.
+ *
+ * wetty is a Node app, not an RPM dependency, so it can legitimately be absent
+ * or stopped on a working server. The Terminal page has no way to tell — the
+ * iframe just renders blank — so check here and report something actionable.
+ *
+ * Returns:
+ *   ok      bool    true only when wetty is running and accepting connections
+ *   state   string  ok | no-unit | no-build | stopped | unreachable
+ *   title   string  short headline for the alert
+ *   message string  what is wrong, in plain language
+ *   hint    string  the command that fixes it ('' when there is none)
+ *   detail  string  service output, when there is any worth showing
+ */
+function wetty_status() {
+	$installer = _PATH.'/scripts/install/install-wetty.sh';
+	$out = array('ok' => false, 'state' => '', 'title' => '', 'message' => '', 'hint' => '', 'detail' => '');
+
+	// 1. Is there a service at all?
+	if(!file_exists('/usr/lib/systemd/system/wetty.service') && !file_exists('/etc/systemd/system/wetty.service')) {
+		$out['state']   = 'no-unit';
+		$out['title']   = 'The terminal is not installed';
+		$out['message'] = 'wetty, the browser terminal this page embeds, is not set up on this server.';
+		$out['hint']    = 'sudo '.$installer;
+		return $out;
+	}
+
+	// 2. wetty ships as TypeScript source — without a build there is nothing to run.
+	if(!file_exists('/root/wetty/build/main.js')) {
+		$out['state']   = 'no-build';
+		$out['title']   = 'The terminal is not built';
+		$out['message'] = 'wetty is present but has not been built, so the service cannot start.';
+		$out['hint']    = 'sudo '.$installer;
+		return $out;
+	}
+
+	// 3. Running?
+	$active = trim((string)shell_exec('sudo systemctl is-active wetty 2>&1'));
+	if($active !== 'active') {
+		$out['state']   = 'stopped';
+		$out['title']   = 'The terminal service is not running';
+		$out['message'] = 'wetty.service reports "'.$active.'".';
+		$out['hint']    = 'sudo systemctl start wetty';
+		$out['detail']  = trim((string)shell_exec('sudo systemctl status wetty --no-pager -n 8 2>&1'));
+		return $out;
+	}
+
+	// 4. Active but actually accepting connections? A crash-looping or
+	//    misconfigured wetty can report active while nothing is listening.
+	// Read the merged ExecStart, not `systemctl cat` — cat prints the base unit
+	// and every drop-in, so a drop-in that overrides the port would be missed.
+	$port = 3000;
+	if(preg_match('/--port\s+(\d+)/', (string)shell_exec('sudo systemctl show wetty -p ExecStart --value 2>/dev/null'), $m))
+		$port = (int)$m[1];
+
+	$sock = @fsockopen('127.0.0.1', $port, $errno, $errstr, 2);
+	if(!$sock) {
+		$out['state']   = 'unreachable';
+		$out['title']   = 'The terminal is not responding';
+		$out['message'] = 'wetty.service is running but nothing is listening on 127.0.0.1:'.$port.'.';
+		$out['hint']    = 'sudo systemctl restart wetty';
+		$out['detail']  = trim((string)shell_exec('sudo systemctl status wetty --no-pager -n 8 2>&1'));
+		return $out;
+	}
+	fclose($sock);
+
+	$out['ok']    = true;
+	$out['state'] = 'ok';
+	return $out;
 }
 ?>

@@ -4,6 +4,18 @@
 
 INI="/usr/local/reqad/etc/server-software.ini"
 
+# The ini is not shipped by the RPM (packaging it produces a .rpmnew on every
+# update) — seed it from the template if it is missing.
+if [ ! -f "$INI" ]; then
+    if [ -f "$INI.default" ]; then
+        cp -a "$INI.default" "$INI"
+        echo "Created $INI from template"
+    else
+        echo "ERROR: $INI is missing and no $INI.default template found" >&2
+        exit 1
+    fi
+fi
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 # Add key=value after the [section] block if the key is absent

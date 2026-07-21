@@ -1,0 +1,24 @@
+[reqad]
+template=nginx_php-fpm
+;template=apache_modphp
+email=0
+quota=0
+accounts=100
+wptoolkit=1
+backup=1
+backupdb=0
+terminal=0
+transfer=0
+root_access=1
+filemanager=1
+
+[web]
+php_versions=8.3
+php=8.3
+nginx=1.30
+mariaddb=10.6
+
+[systemd]
+services=crond, dovecot, exim, lfd, mariadb, monit, nginx, pdns, php-fpm, reqad, spamassassin, sshd, vnstat, reqad-php-fpm
+timers=certbot-renew, dnf-automatic, fstrim, sysstat-collect, sysstat-summary
+

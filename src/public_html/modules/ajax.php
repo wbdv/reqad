@@ -558,6 +558,21 @@
         exit;
     }
 
+    /* ===================== Terminal =====================
+       wetty is started with a fixed command and gets no per-request context,
+       so the target user is handed off through a one-shot root-owned file.
+       scripts/terminal_target.sh re-validates the user (accounts table, plus
+       root_access for root), so this endpoint only forwards the request. */
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-terminal-target' && isset($_POST["user"])) {
+        header('Content-Type: application/json');
+        $u = trim($_POST["user"]);
+        if(!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/', $u)) { echo json_encode(array('error' => 'Invalid user.')); exit; }
+        $out = trim((string)shell_exec('sudo '._PATH.'/scripts/terminal_target.sh set '.escapeshellarg($u).' 2>&1'));
+        if($out !== 'OK') { echo json_encode(array('error' => str_replace('Error: ', '', $out))); exit; }
+        echo json_encode(array('ok' => true));
+        exit;
+    }
+
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-database' && isset($_POST["dbname"])) {
         $dbname = trim($_POST["dbname"]);
         if(preg_match('/[a-z0-9]+[a-z0-9\-\.]+[a-z0-9]+\.[a-z]{2,}/', $dbname)) {

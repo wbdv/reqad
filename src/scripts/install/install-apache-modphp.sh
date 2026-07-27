@@ -257,4 +257,4 @@ if [ "${TEMPLATE}" != "apache_modphp" ]; then
 		sed -i -E 's/^services=(.*)nginx, (.*)/services=\1httpd, \2/' /usr/local/reqad/etc/server-software.ini
     ) >> ./install_reqad.log 2>&1
     echo -e "[ ${GREEN}OK${NC} ]"
-f_i
+fi

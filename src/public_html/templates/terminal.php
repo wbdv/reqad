@@ -65,18 +65,18 @@
 					<svg xmlns="http://www.w3.org/2000/svg" class="icon mb-2 text-danger icon-md" width="48" height="48" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><path d="M12 9v2m0 4v.01"></path><path d="M5 19h14a2 2 0 0 0 1.84 -2.75l-7.1 -12.25a2 2 0 0 0 -3.5 0l-7.1 12.25a2 2 0 0 0 1.75 2.75"></path></svg>
 				</div>
 				<div class="flex-fill">
-					<h3 class="text-danger" style="margin-top:6px;margin-bottom:4px;"><?=clean($wetty['title']);?></h3>
-					<div><?=clean($wetty['message']);?></div>
+					<h3 class="text-danger" style="margin-top:6px;margin-bottom:4px;"><?=htmlspecialchars($wetty['title'], ENT_QUOTES, 'UTF-8');?></h3>
+					<div><?=htmlspecialchars($wetty['message'], ENT_QUOTES, 'UTF-8');?></div>
 					<? if($wetty['hint'] != '') { ?>
 					<div style="margin-top:10px;">
-						Run this on the server:
-						<pre style="color:black;margin-top:4px;margin-bottom:0;"><?=clean($wetty['hint']);?></pre>
+						Run this on the server as root:
+						<pre style="color:black;margin-top:4px;margin-bottom:0;"><?=htmlspecialchars($wetty['hint'], ENT_QUOTES, 'UTF-8');?></pre>
 					</div>
 					<? } ?>
 					<? if($wetty['detail'] != '') { ?>
 					<div style="margin-top:10px;">
 						<a href="#" onclick="jQuery('#wetty-detail').toggle();return false;">Show service status</a>
-						<pre id="wetty-detail" style="color:black;display:none;margin-top:4px;margin-bottom:0;"><?=clean($wetty['detail']);?></pre>
+						<pre id="wetty-detail" style="color:black;display:none;margin-top:4px;margin-bottom:0;"><?=htmlspecialchars($wetty['detail'], ENT_QUOTES, 'UTF-8');?></pre>
 					</div>
 					<? } ?>
 				</div>

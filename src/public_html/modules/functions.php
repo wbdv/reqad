@@ -927,31 +927,41 @@ function wetty_status() {
 		$out['state']   = 'no-unit';
 		$out['title']   = 'The terminal is not installed';
 		$out['message'] = 'wetty, the browser terminal this page embeds, is not set up on this server.';
-		$out['hint']    = 'sudo '.$installer;
+		$out['hint']    = $installer;
 		return $out;
 	}
 
-	// 2. wetty ships as TypeScript source — without a build there is nothing to run.
-	if(!file_exists('/root/wetty/build/main.js')) {
-		$out['state']   = 'no-build';
-		$out['title']   = 'The terminal is not built';
-		$out['message'] = 'wetty is present but has not been built, so the service cannot start.';
-		$out['hint']    = 'sudo '.$installer;
-		return $out;
-	}
-
-	// 3. Running?
+	// 2. Running? Ask systemd before looking at the checkout: wetty is built and
+	//    run out of /root, which the panel user cannot even traverse on a stock
+	//    Rocky box (/root is 0550), so any stat of the build from here answers
+	//    "missing" on a perfectly healthy install. A running unit is proof
+	//    enough that there is something to run.
 	$active = trim((string)shell_exec('sudo systemctl is-active wetty 2>&1'));
 	if($active !== 'active') {
+		// Only now is the checkout worth inspecting — and only through sudo, for
+		// the reason above. The build sits next to the unit's WorkingDirectory
+		// (ExecStart runs ./build/main.js relative to it).
+		$dir = trim((string)shell_exec('sudo systemctl show wetty -p WorkingDirectory --value 2>/dev/null'));
+		if($dir == '') $dir = '/root/wetty';
+		$built = trim((string)shell_exec('sudo test -f '.escapeshellarg($dir.'/build/main.js').' && echo 1'));
+
+		if($built !== '1') {
+			$out['state']   = 'no-build';
+			$out['title']   = 'The terminal is not built';
+			$out['message'] = 'wetty is present but has not been built, so the service cannot start.';
+			$out['hint']    = $installer;
+			return $out;
+		}
+
 		$out['state']   = 'stopped';
 		$out['title']   = 'The terminal service is not running';
 		$out['message'] = 'wetty.service reports "'.$active.'".';
-		$out['hint']    = 'sudo systemctl start wetty';
+		$out['hint']    = 'systemctl start wetty';
 		$out['detail']  = trim((string)shell_exec('sudo systemctl status wetty --no-pager -n 8 2>&1'));
 		return $out;
 	}
 
-	// 4. Active but actually accepting connections? A crash-looping or
+	// 3. Active but actually accepting connections? A crash-looping or
 	//    misconfigured wetty can report active while nothing is listening.
 	// Read the merged ExecStart, not `systemctl cat` — cat prints the base unit
 	// and every drop-in, so a drop-in that overrides the port would be missed.
@@ -964,7 +974,7 @@ function wetty_status() {
 		$out['state']   = 'unreachable';
 		$out['title']   = 'The terminal is not responding';
 		$out['message'] = 'wetty.service is running but nothing is listening on 127.0.0.1:'.$port.'.';
-		$out['hint']    = 'sudo systemctl restart wetty';
+		$out['hint']    = 'systemctl restart wetty';
 		$out['detail']  = trim((string)shell_exec('sudo systemctl status wetty --no-pager -n 8 2>&1'));
 		return $out;
 	}
@@ -973,5 +983,429 @@ function wetty_status() {
 	$out['ok']    = true;
 	$out['state'] = 'ok';
 	return $out;
+}
+
+/* ==========================================================================
+   WP Toolkit — per-site "Manage" options
+   --------------------------------------------------------------------------
+   Two live, toggleable options, driven from the Manage modal on wp-toolkit:
+     1. Nginx FastCGI microcache (+ ngx_cache_purge purge endpoint + the
+        matching WordPress purge plugin)
+     2. Disable WP-Cron (DISABLE_WP_CRON constant + a real every-2-minutes system cron)
+
+   State is NOT stored in the DB — it is derived from the live system on every
+   status read (config markers, wp-config constant, crontab line), so the modal
+   always mirrors reality even if the admin changed things by hand.
+   ========================================================================== */
+
+/* The server's primary public IPv4 — used to allow the WP purge plugin (which
+   calls /purge over the public hostname) through the purge location's ACL. */
+function reqad_server_ip() {
+	return trim(shell_exec("/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print \$2'} | awk -F/ {'print \$1'}"));
+}
+
+/* Is the panel serving sites with nginx (vs apache)? Nginx cache only applies then. */
+function wp_is_nginx($ini) {
+	return substr(trim($ini['template'] ?? ''), 0, 7) != 'apache_';
+}
+
+/* Sanitised zone/prefix for an account — used for the cache zone, cache dir and
+   the map variable names. Account users are already [a-z][a-z0-9]{1,11}; this is
+   defence in depth so nothing untrusted reaches an nginx identifier. */
+function wp_cache_zone($user) {
+	return preg_replace('/[^a-z0-9]/', '', strtolower((string)$user));
+}
+
+/* Absolute docroot for a tracked WordPress install (honours the subdir `path`). */
+function wp_site_docroot($user, $path = '') {
+	$base = '/home/'.$user.'/public_html';
+	$path = trim((string)$path, '/');
+	return $path === '' ? $base : $base.'/'.$path;
+}
+
+/* nginx vhost path for a domain (only meaningful when wp_is_nginx()). */
+function wp_nginx_conf_path($domain) {
+	return '/etc/nginx/conf.d/'.$domain.'.conf';
+}
+
+/* --- Nginx FastCGI cache ------------------------------------------------- */
+
+/* Build the three marker-delimited config fragments for a site.
+   Returns array('http' => ..., 'purge' => ..., 'fcgi' => ...). Uses nowdoc so
+   nginx '$' variables survive verbatim; only %ZONE% / %IP% are substituted. */
+function wp_nginx_cache_fragments($zone, $ip) {
+	$http = <<<'EOT'
+# BEGIN reqad-nginx-cache
+# FastCGI microcache — managed by the Reqad WP Toolkit "Manage" panel.
+# Do NOT edit between the BEGIN/END markers; toggling the option rewrites them.
+fastcgi_cache_path /var/cache/nginx/fcgi-%ZONE% levels=1:2 keys_zone=%ZONE%:100m
+                   inactive=12h max_size=512m;
+
+map $http_cookie $%ZONE%_nc_cookie {
+    default                     0;
+    ~*wordpress_logged_in       1;
+    ~*wp-postpass               1;
+    ~*comment_author            1;
+    ~*wordpress_no_cache        1;
+    ~*woocommerce_items_in_cart 1;
+    ~*woocommerce_cart_hash     1;
+    ~*wp_woocommerce_session    1;
+}
+
+map $request_uri $%ZONE%_nc_uri {
+    default                          0;
+    ~*^/wp-admin                     1;
+    ~*^/wp-login\.php                1;
+    ~*^/wp-cron\.php                 1;
+    ~*^/xmlrpc\.php                  1;
+    ~*^/wp-json                      1;
+    ~*^/feed                         1;
+    ~*^/sitemap.*\.xml               1;
+    ~*^/purge                        1;
+    ~*^/(cart|checkout|my-account)   1;
+    ~*^/wc-api                       1;
+    ~*^/store-api                    1;
+}
+
+map $request_method $%ZONE%_nc_method {
+    default 1;
+    GET     0;
+    HEAD    0;
+}
+
+map $query_string $%ZONE%_nc_query {
+    default 1;
+    ""      0;
+}
+
+map "$%ZONE%_nc_cookie$%ZONE%_nc_uri$%ZONE%_nc_method$%ZONE%_nc_query" $%ZONE%_skip_cache {
+    default 1;
+    "0000"  0;
+}
+# END reqad-nginx-cache
+
+EOT;
+
+	$purge = <<<'EOT'
+	# BEGIN reqad-nginx-cache-purge
+	add_header X-FastCGI-Cache $upstream_cache_status always;
+	add_header X-Cache-Skip    $%ZONE%_skip_cache      always;
+
+	# Purge endpoint for the WordPress reqad-cache-purger plugin. The plugin calls
+	# it over the public hostname, so the request arrives from this server's own
+	# public IP — hence the allow below. The key must match fastcgi_cache_key.
+	location ~ ^/purge(/.*) {
+	    allow 127.0.0.1;
+	    allow ::1;
+	    allow %IP%;
+	    deny  all;
+
+	    cache_purge_response_type json;
+	    fastcgi_cache_purge %ZONE% "$scheme$host$1";
+	}
+	# END reqad-nginx-cache-purge
+
+EOT;
+
+	$fcgi = <<<'EOT'
+            # BEGIN reqad-nginx-cache-fcgi
+            # $request_uri (not $uri): try_files rewrites $uri to /index.php, which
+            # would collapse every page onto one cache entry. Query strings are never
+            # cached (see the %ZONE%_nc_query map) so the key stays a clean path.
+            open_file_cache             off;
+            fastcgi_cache               %ZONE%;
+            fastcgi_cache_key           "$scheme$host$request_uri";
+            fastcgi_cache_methods       GET;
+            fastcgi_cache_valid         200 301 302 12h;
+            fastcgi_cache_valid         404 1m;
+            fastcgi_cache_lock          on;
+            fastcgi_cache_revalidate    on;
+            fastcgi_cache_use_stale     error timeout updating invalid_header http_500 http_503;
+            fastcgi_cache_background_update on;
+            fastcgi_ignore_headers      Cache-Control Expires;
+            fastcgi_cache_bypass        $%ZONE%_skip_cache;
+            fastcgi_no_cache            $%ZONE%_skip_cache;
+            # END reqad-nginx-cache-fcgi
+
+EOT;
+
+	$sub = function($s) use ($zone, $ip) {
+		return str_replace(array('%ZONE%', '%IP%'), array($zone, $ip), $s);
+	};
+	return array('http' => $sub($http), 'purge' => $sub($purge), 'fcgi' => $sub($fcgi));
+}
+
+/* Read a vhost via sudo (root-owned files are common in conf.d). */
+function wp_read_conf($path) {
+	return (string)shell_exec('sudo cat '.escapeshellarg($path).' 2>/dev/null');
+}
+
+/* Atomically replace a vhost's content via a temp file + sudo cp. */
+function wp_write_conf($path, $content) {
+	$tmp = tempnam('/tmp', 'reqadwp');
+	file_put_contents($tmp, $content);
+	shell_exec('sudo cp '.escapeshellarg($tmp).' '.escapeshellarg($path));
+	@unlink($tmp);
+}
+
+/* Live state of the nginx cache option for a domain: 'on' | 'off' | 'na'. */
+function wp_nginx_cache_state($ini, $domain) {
+	if(!wp_is_nginx($ini)) return 'na';
+	$path = wp_nginx_conf_path($domain);
+	$c = wp_read_conf($path);
+	if($c === '') return 'off';
+	return (strpos($c, '# BEGIN reqad-nginx-cache') !== false) ? 'on' : 'off';
+}
+
+/* Canonical plugin slug/folder for the WordPress purge plugin. */
+define('WP_CACHE_PURGER_SLUG', 'reqad-cache-purger');
+
+/* Resolve the download URL of the latest reqad-cache-purger GitHub release.
+   Returns '' when the API cannot be reached or has no .zip asset. The release
+   asset (unlike a source archive) unpacks to a clean 'reqad-cache-purger/'
+   folder, so wp-cli derives the canonical plugin slug from it. */
+function wp_cache_purger_release_url() {
+	$json = (string)shell_exec('curl -sfL --max-time 15 -H '.escapeshellarg('Accept: application/vnd.github+json')
+		.' https://api.github.com/repos/wbdv/'.WP_CACHE_PURGER_SLUG.'/releases/latest 2>/dev/null');
+	$d = @json_decode($json, true);
+	if(empty($d['assets']) || !is_array($d['assets'])) return '';
+	foreach($d['assets'] as $a) {
+		$u = $a['browser_download_url'] ?? '';
+		if($u !== '' && strtolower(substr($u, -4)) === '.zip') return $u;
+	}
+	return '';
+}
+
+/* Install (if missing) and activate the reqad-cache-purger WordPress plugin.
+   It is not on wordpress.org, so wp-cli installs it straight from the latest
+   GitHub *release* zip. Returns a log string; safe to call repeatedly. */
+function wp_install_cache_purger($user, $docroot) {
+	$slug   = WP_CACHE_PURGER_SLUG;
+	$asuser = 'sudo -u '.escapeshellarg($user).' ';
+	$log    = '';
+
+	$is = trim((string)shell_exec($asuser.'/usr/local/bin/wp plugin is-installed '.$slug
+		.' --path='.escapeshellarg($docroot).' 2>/dev/null; echo $?'));
+
+	if(substr($is, -1) !== '0') {
+		$url = wp_cache_purger_release_url();
+		if($url === '')
+			return "Error: could not determine the latest ".$slug." release from GitHub.\n";
+		$log .= "Installing ".$slug." from ".$url."\n";
+		// --activate installs and enables in one step.
+		$log .= (string)shell_exec($asuser.'/usr/local/bin/wp plugin install '.escapeshellarg($url)
+			.' --force --activate --path='.escapeshellarg($docroot).' 2>&1');
+	} else {
+		$log .= $slug." already installed.\n";
+		$log .= (string)shell_exec($asuser.'/usr/local/bin/wp plugin activate '.$slug
+			.' --path='.escapeshellarg($docroot).' 2>&1');
+	}
+	return $log;
+}
+
+/* Enable the nginx FastCGI cache for a site: inject the three fragments into the
+   vhost, create the cache dir, install+activate the purge plugin, test & reload.
+   Reverts the vhost on a failed `nginx -t`. Returns array(error, success, log). */
+function wp_nginx_cache_enable($ini, $user, $domain, $docroot) {
+	$log = '';
+	if(!wp_is_nginx($ini))
+		return array('error' => 'This server does not use nginx, so the FastCGI cache is not available.', 'success' => '', 'log' => '');
+
+	$path = wp_nginx_conf_path($domain);
+	$orig = wp_read_conf($path);
+	if(trim($orig) === '')
+		return array('error' => 'nginx vhost not found: '.$path, 'success' => '', 'log' => '');
+	if(strpos($orig, '# BEGIN reqad-nginx-cache') !== false)
+		return array('error' => '', 'success' => 'Nginx cache is already enabled.', 'log' => '');
+
+	$zone = wp_cache_zone($user);
+	$ip   = reqad_server_ip();
+	$frag = wp_nginx_cache_fragments($zone, $ip);
+
+	// 1) http-context block at the very top of the file (conf.d is http context).
+	$new = $frag['http']."\n".$orig;
+
+	// 2) purge block: after the server-level `index ...;` line (443 vhost only).
+	$lines = explode("\n", $new);
+	$out = array(); $did_purge = false;
+	foreach($lines as $ln) {
+		$out[] = $ln;
+		if(!$did_purge && preg_match('/^\s*index\s+/', $ln)) {
+			$out[] = rtrim($frag['purge'], "\n");
+			$did_purge = true;
+		}
+	}
+	if(!$did_purge)
+		return array('error' => 'Could not locate an `index` directive in the vhost to anchor the purge block.', 'success' => '', 'log' => '');
+	$new = implode("\n", $out);
+
+	// 3) fcgi cache directives: right after the `fastcgi_pass php-fpm-<user>;` line.
+	$lines = explode("\n", $new);
+	$out = array(); $did_fcgi = false;
+	foreach($lines as $ln) {
+		$out[] = $ln;
+		if(!$did_fcgi && strpos($ln, 'fastcgi_pass') !== false && strpos($ln, 'php-fpm') !== false) {
+			$out[] = rtrim($frag['fcgi'], "\n");
+			$did_fcgi = true;
+		}
+	}
+	if(!$did_fcgi)
+		return array('error' => 'Could not locate the `fastcgi_pass` line in the vhost to anchor the cache directives.', 'success' => '', 'log' => '');
+	$new = implode("\n", $out);
+
+	// Cache dir (nginx creates sublevels itself, but needs the root to exist+own).
+	shell_exec('sudo mkdir -p /var/cache/nginx/fcgi-'.escapeshellarg($zone));
+	shell_exec('sudo chown nginx:nginx /var/cache/nginx/fcgi-'.$zone.' 2>/dev/null');
+
+	// Snapshot the pre-change vhost into the Advanced Config version history so the
+	// admin can roll back the cache injection from that panel's "Version history".
+	save_config_backup($user, 'nginx', $path, $orig);
+
+	// Write, test, revert on failure.
+	wp_write_conf($path, $new);
+	$test = (string)shell_exec('sudo nginx -t 2>&1');
+	$log .= $test;
+	if(stripos($test, 'test is successful') === false) {
+		wp_write_conf($path, $orig);   // revert
+		return array('error' => 'nginx config test failed; reverted. '.trim(preg_replace('/\s+/', ' ', $test)), 'success' => '', 'log' => $log);
+	}
+	shell_exec('sudo systemctl reload nginx 2>&1');
+
+	// Install + activate the WordPress purge plugin (idempotent). Not on
+	// wordpress.org, so wp-cli pulls the latest GitHub release zip.
+	$log .= "\n".wp_install_cache_purger($user, $docroot);
+
+	log_debug('[wp-manage] nginx-cache enabled for '.$domain.' ('.$user.')');
+	return array('error' => '', 'success' => 'Nginx FastCGI cache enabled and nginx reloaded.', 'log' => $log);
+}
+
+/* Disable the nginx cache: strip the three marker blocks, test & reload, empty
+   the cache dir and deactivate the purge plugin. Returns array(error, success, log). */
+function wp_nginx_cache_disable($ini, $user, $domain, $docroot) {
+	$log = '';
+	if(!wp_is_nginx($ini))
+		return array('error' => 'This server does not use nginx.', 'success' => '', 'log' => '');
+
+	$path = wp_nginx_conf_path($domain);
+	$orig = wp_read_conf($path);
+	if(trim($orig) === '')
+		return array('error' => 'nginx vhost not found: '.$path, 'success' => '', 'log' => '');
+	if(strpos($orig, '# BEGIN reqad-nginx-cache') === false)
+		return array('error' => '', 'success' => 'Nginx cache is already disabled.', 'log' => '');
+
+	// Remove each marker block (and the blank line that follows it, if any).
+	$new = $orig;
+	foreach(array('reqad-nginx-cache-purge', 'reqad-nginx-cache-fcgi', 'reqad-nginx-cache') as $mk) {
+		$new = preg_replace('/[ \t]*# BEGIN '.$mk.'\b.*?# END '.$mk.'[^\n]*\n?\n?/s', '', $new);
+	}
+
+	// Snapshot the pre-change (cached) vhost into the Advanced Config version
+	// history before stripping the cache, so it can be restored from that panel.
+	save_config_backup($user, 'nginx', $path, $orig);
+
+	wp_write_conf($path, $new);
+	$test = (string)shell_exec('sudo nginx -t 2>&1');
+	$log .= $test;
+	if(stripos($test, 'test is successful') === false) {
+		wp_write_conf($path, $orig);   // revert
+		return array('error' => 'nginx config test failed after removal; reverted. '.trim(preg_replace('/\s+/', ' ', $test)), 'success' => '', 'log' => $log);
+	}
+	shell_exec('sudo systemctl reload nginx 2>&1');
+
+	// Clear the cache store and deactivate the plugin (leave it installed).
+	$zone = wp_cache_zone($user);
+	if($zone !== '')
+		shell_exec('sudo rm -rf /var/cache/nginx/fcgi-'.escapeshellarg($zone).'/* 2>/dev/null');
+	// Deactivate the canonical slug, plus any branch-suffixed copy left behind by
+	// an install that went through the GitHub archive (reqad-cache-purger-main).
+	foreach(array(WP_CACHE_PURGER_SLUG, WP_CACHE_PURGER_SLUG.'-main', WP_CACHE_PURGER_SLUG.'-master') as $pslug) {
+		$is = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp plugin is-installed '.$pslug.' --path='.escapeshellarg($docroot).' 2>/dev/null; echo $?'));
+		if(substr($is, -1) === '0')
+			$log .= "\n".(string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp plugin deactivate '.$pslug.' --path='.escapeshellarg($docroot).' 2>&1');
+	}
+
+	log_debug('[wp-manage] nginx-cache disabled for '.$domain.' ('.$user.')');
+	return array('error' => '', 'success' => 'Nginx FastCGI cache disabled and nginx reloaded.', 'log' => $log);
+}
+
+/* --- Disable WP-Cron ----------------------------------------------------- */
+
+/* Marker appended to the crontab line so we can find/remove exactly our entry. */
+function wp_cron_marker($user) {
+	return '# reqad-wpcron-'.wp_cache_zone($user);
+}
+
+/* Live state of the "Disable WP-Cron" option: 'on' | 'off'. Considered ON only
+   when BOTH the DISABLE_WP_CRON constant is true AND our system cron is present. */
+function wp_wpcron_state($user, $docroot) {
+	$has = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config get DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>/dev/null'));
+	$const_on = in_array(strtolower($has), array('1', 'true'), true);
+	$cron_on  = ((int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg(wp_cron_marker($user)).' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null'))) > 0;
+	return ($const_on && $cron_on) ? 'on' : 'off';
+}
+
+/* Enable "Disable WP-Cron": set the constant and install an every-2-minutes system
+   cron that runs due events via wp-cli. Both steps are idempotent. */
+function wp_wpcron_enable($user, $docroot) {
+	$log = '';
+	// 1) Constant. `wp config set` updates in place if it already exists.
+	$has = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config has DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>/dev/null; echo $?'));
+	if(substr($has, -1) === '0')
+		$log .= "DISABLE_WP_CRON already present in wp-config.php.\n";
+	$set = (string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config set DISABLE_WP_CRON true --raw --type=constant --path='.escapeshellarg($docroot).' 2>&1');
+	$log .= $set."\n";
+	if(stripos($set, 'Error') === 0 || stripos($set, 'Error:') !== false)
+		return array('error' => 'Could not update wp-config.php: '.trim($set), 'success' => '', 'log' => $log);
+
+	// 2) System cron (per-user spool). Skip if our marked line already exists.
+	$marker = wp_cron_marker($user);
+	$exists = (int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg($marker).' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null'));
+	if($exists === 0) {
+		$line = '*/2 * * * * /usr/local/bin/wp cron event run --due-now --path='.$docroot.' >/dev/null 2>&1 '.$marker;
+		shell_exec('echo '.escapeshellarg($line).' | sudo tee --append /var/spool/cron/'.escapeshellarg($user).' > /dev/null');
+		shell_exec('sudo chown '.escapeshellarg($user).': /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null');
+		shell_exec('sudo chmod 600 /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null');
+		$log .= "Installed */2 wp-cron system cron.\n";
+	} else {
+		$log .= "System cron already present.\n";
+	}
+
+	log_debug('[wp-manage] wp-cron disabled (system cron installed) for '.$user);
+	return array('error' => '', 'success' => 'WP-Cron disabled — a system cron now runs due events every 2 minutes.', 'log' => $log);
+}
+
+/* Disable the option again: remove the constant and our system cron line. */
+function wp_wpcron_disable($user, $docroot) {
+	$log = '';
+	$has = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config has DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>/dev/null; echo $?'));
+	if(substr($has, -1) === '0') {
+		$del = (string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config delete DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>&1');
+		$log .= $del."\n";
+	}
+	// Remove our marked crontab line. Match the bare marker slug (no '#', no
+	// slashes) so '/'-delimited sed is safe.
+	$slug = 'reqad-wpcron-'.wp_cache_zone($user);
+	shell_exec('sudo sed -i '.escapeshellarg('/'.$slug.'/d').' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null');
+	$log .= "Removed system cron.\n";
+
+	log_debug('[wp-manage] wp-cron re-enabled (system cron removed) for '.$user);
+	return array('error' => '', 'success' => 'WP-Cron re-enabled — the system cron was removed.', 'log' => $log);
+}
+
+/* Combined status for the Manage modal. Looks the account up in `wordpress` by
+   user, so the caller only supplies a (validated) username. Returns null if the
+   user is not a tracked WordPress install. */
+function wp_manage_status($db, $ini, $user) {
+	$res = $db->query('SELECT user, domain, path FROM wordpress WHERE user="'.$db->escapeString($user).'"');
+	$row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+	if(!$row) return null;
+	$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
+	return array(
+		'user'        => $row['user'],
+		'domain'      => $row['domain'],
+		'is_nginx'    => wp_is_nginx($ini),
+		'nginx_cache' => wp_nginx_cache_state($ini, $row['domain']),
+		'wp_cron'     => wp_wpcron_state($row['user'], $docroot),
+	);
 }
 ?>

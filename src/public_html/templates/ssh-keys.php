@@ -80,7 +80,7 @@
 						<? } ?>
 						&nbsp;&middot;&nbsp;
 						SSH <?=(count($ssh_ports) > 1 ? 'ports' : 'port');?>
-						<span class="badge bg-green-lt border"><?=clean(implode(', ', $ssh_ports));?></span>
+						<span class="badge bg-green-lt border"><?=htmlspecialchars(implode(', ', $ssh_ports), ENT_QUOTES, 'UTF-8');?></span>
 					</div>
               	</div>
               	<div class="col-auto ms-auto d-print-none">

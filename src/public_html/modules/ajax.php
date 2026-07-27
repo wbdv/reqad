@@ -916,6 +916,50 @@
 		exit;
 	}
 
+	// WP Toolkit "Manage" modal — current state of the toggleable options.
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-manage-status' && isset($_POST["user"])) {
+		header('Content-Type: application/json');
+		$user = preg_replace('/[^a-z0-9]/', '', trim($_POST["user"]));
+		$st = wp_manage_status($db, $ini, $user);
+		if($st === null) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
+		echo json_encode(array('ok' => true, 'status' => $st));
+		exit;
+	}
+
+	// WP Toolkit "Manage" modal — enable/disable one option for one site.
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-manage-toggle' && isset($_POST["user"]) && isset($_POST["option"])) {
+		header('Content-Type: application/json');
+		$user   = preg_replace('/[^a-z0-9]/', '', trim($_POST["user"]));
+		$option = trim($_POST["option"]);
+		$enable = (isset($_POST["enable"]) && ($_POST["enable"] === '1' || $_POST["enable"] === 'true'));
+
+		// Resolve the site server-side (never trust a client-supplied domain/path).
+		$res = $db->query('SELECT user, domain, path FROM wordpress WHERE user="'.$db->escapeString($user).'"');
+		$row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+		if(!$row) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
+		$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
+
+		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-manage-toggle $option=".($enable?'on':'off')." user=$user\n", 3, '../log/route_log');
+
+		if($option === 'nginx_cache')
+			$r = $enable ? wp_nginx_cache_enable($ini, $row['user'], $row['domain'], $docroot)
+			             : wp_nginx_cache_disable($ini, $row['user'], $row['domain'], $docroot);
+		elseif($option === 'wp_cron')
+			$r = $enable ? wp_wpcron_enable($row['user'], $docroot)
+			             : wp_wpcron_disable($row['user'], $docroot);
+		else { echo json_encode(array('error' => 'Unknown option.')); exit; }
+
+		$st = wp_manage_status($db, $ini, $user);
+		echo json_encode(array(
+			'ok'      => ($r['error'] === ''),
+			'error'   => $r['error'],
+			'success' => $r['success'],
+			'log'     => $r['log'] ?? '',
+			'status'  => $st,
+		));
+		exit;
+	}
+
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mysqltuner') {
 		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ajax-mysqltuner\n", 3, '../log/debug_log');
 		#shell_exec("sudo /root//mysqltuner.pl | /usr/local/bin/terminal-to-html > /usr/local/reqad/reports/mysqltuner.html 2>&1");

@@ -82,7 +82,9 @@
           </div>
 		<? } ?>
 
+<?php /*
 		<div id="progress" class="alert alert-info" role="alert" style="background:#EEF0FF;display:none;"></div>
+*/ ?>
 
 		<div class="col-12">
             <div class="card">
@@ -186,11 +188,12 @@
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
+                            <a href="#" class="btn btn-white btn-md wp-manage-btn" data-bs-toggle="modal" data-bs-target="#modal-wp-manage" data-bs-user="<?=htmlspecialchars($row["user"], ENT_QUOTES);?>" data-bs-domain="<?=htmlspecialchars($row["domain"], ENT_QUOTES);?>">Manage</a>
                             <form method="post" action="./wp-toolkit/" target="_blank" style="display:inline;margin:0;">
                             <input type="hidden" name="action" value="wp-auto-login">
                             <input type="hidden" name="user" value="<?=htmlspecialchars($row["user"], ENT_QUOTES);?>">
-                            <button type="submit" class="btn btn-primary">Login</button></form>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-wp-scan" data-bs-user="<?=$row["user"];?>">Scan</a>
+                            <button type="submit" class="btn btn-white btn-md">Login</button></form>
+<? /*                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-wp-scan" data-bs-user="<?=$row["user"];?>">Scan</a> */ ?>
 <? /*                            <a href="#" class="btn btn-white disabled" data-bs-toggle="modal" data-bs-target="#modal-wp-clone" data-bs-user="<?=$row["user"];?>">Clone</a> */ ?>
                           </div>
                         </td>
@@ -312,9 +315,71 @@
 	  	</div>
     	</div>
 <? /*		</form> */ ?>
+		</div><!-- /#modal-wp-scan : close the outer .modal wrapper (its </form> closer above is commented out, leaving it open) -->
+
+		<!-- Manage WordPress site options -->
+		<div class="modal modal-blur fade" id="modal-wp-manage" tabindex="-1" role="dialog" aria-hidden="true">
+		<div class="modal-dialog modal-lg" role="document">
+		<div class="modal-content">
+			<div class="modal-header">
+				<h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Manage <span id="wp-manage-domain"></span></h5>
+				<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+			</div>
+			<div class="modal-body">
+				<p class="text-muted">Enable or disable performance options for this WordPress site. Changes are applied to the live server immediately.</p>
+
+				<div id="wp-manage-alert" class="alert" role="alert" style="display:none;"></div>
+
+				<!-- Option: Nginx cache -->
+				<div class="card mb-3">
+					<div class="card-body">
+						<label class="form-check form-switch form-switch-lg mb-1">
+							<input class="form-check-input wp-manage-toggle" type="checkbox" data-option="nginx_cache">
+							<span class="form-check-label form-check-label-on"></span>
+							<span class="h3 mb-0 ms-2">Nginx cache</span>
+							<span class="wp-manage-spinner spinner-border spinner-border-sm ms-2" role="status" style="display:none;"></span>
+						</label>
+						<div class="text-muted">
+							Serves cached pages straight from nginx (FastCGI microcache) instead of hitting PHP/WordPress on
+							every request &mdash; a large speed-up for anonymous traffic. Logged-in users, the cart/checkout and
+							admin are never cached. Enabling injects the cache config into the vhost, reloads nginx, and installs
+							the <a href="https://github.com/wbdv/reqad-cache-purger" target="_blank">reqad-cache-purger</a> plugin so
+							WordPress clears the cache when content changes.
+							<div class="wp-manage-na text-red mt-1" data-option="nginx_cache" style="display:none;">
+								Unavailable: this server does not use nginx as its web server.
+							</div>
+						</div>
+					</div>
+				</div>
+
+				<!-- Option: Disable WP cron -->
+				<div class="card mb-3">
+					<div class="card-body">
+						<label class="form-check form-switch form-switch-lg mb-1">
+							<input class="form-check-input wp-manage-toggle" type="checkbox" data-option="wp_cron">
+							<span class="form-check-label form-check-label-on"></span>
+							<span class="h3 mb-0 ms-2">Disable WP cron</span>
+							<span class="wp-manage-spinner spinner-border spinner-border-sm ms-2" role="status" style="display:none;"></span>
+						</label>
+						<div class="text-muted">
+							WordPress&rsquo; built-in cron runs on page visits, which is unreliable and adds latency. Enabling this
+							sets the <code>DISABLE_WP_CRON</code> constant in <code>wp-config.php</code> and installs a real system
+							cron that runs due tasks every 2 minutes &mdash; more reliable and faster page loads.
+						</div>
+					</div>
+				</div>
+
+				<pre id="wp-manage-log" style="display:none;background:#222;color:#ccc;padding:10px 14px;max-height:220px;overflow:auto;font-size:11px;border-radius:4px;"></pre>
+			</div>
+			<div class="modal-footer">
+				<a href="#" class="btn btn-link link-secondary" data-bs-dismiss="modal">Close</a>
+			</div>
+		</div>
+		</div>
+		</div>
 
 	<?php
-    include('templates/footer.php'); 
+    include('templates/footer.php');
 ?>
 <script>
 jQuery(document).ready(function () {
@@ -611,6 +676,91 @@ jQuery(document).ready(function () {
 		//}.bind(this), 2000);
 	});
 */ ?>
+
+	/* ---- Manage modal: per-site options -------------------------------- */
+	var wpManageUser = '';
+
+	function wpManageAlert(type, html) {
+		var $a = $('#wp-manage-alert');
+		if(!html) { $a.hide(); return; }
+		$a.removeClass('alert-success alert-danger alert-info')
+		  .addClass(type === 'error' ? 'alert-danger' : (type === 'info' ? 'alert-info' : 'alert-success'))
+		  .html(html).show();
+	}
+
+	// Reflect a status object onto the switches.
+	function wpManageRender(st) {
+		$('.wp-manage-toggle').each(function () {
+			var opt = $(this).data('option');
+			var state = st[opt];               // 'on' | 'off' | 'na'
+			var na = (state === 'na');
+			$(this).prop('checked', state === 'on').prop('disabled', na);
+			$('.wp-manage-na[data-option="'+opt+'"]').toggle(na);
+		});
+	}
+
+	// Populate the modal when it opens.
+	$('#modal-wp-manage').on('show.bs.modal', function (event) {
+		var button = event.relatedTarget;
+		wpManageUser = button ? button.getAttribute('data-bs-user') : '';
+		var domain  = button ? button.getAttribute('data-bs-domain') : '';
+		$('#wp-manage-domain').text(domain || '');
+		wpManageAlert('', '');
+		$('#wp-manage-log').hide().text('');
+		$('.wp-manage-toggle').prop('disabled', true);
+
+		jQuery.ajax({
+			method: "POST",
+			url: "./ajax-wp-manage-status/",
+			data: { action: 'ajax-wp-manage-status', user: wpManageUser }
+		}).done(function (resp) {
+			if(resp && resp.ok) {
+				wpManageRender(resp.status);
+			} else {
+				wpManageAlert('error', (resp && resp.error) ? resp.error : 'Could not load site status.');
+			}
+		}).fail(function () {
+			wpManageAlert('error', 'Could not load site status.');
+		});
+	});
+
+	// Toggle an option on/off.
+	$('.wp-manage-toggle').on('change', function () {
+		var $cb    = $(this);
+		var option = $cb.data('option');
+		var enable = $cb.is(':checked');
+		var $spin  = $cb.closest('label').find('.wp-manage-spinner');
+
+		$('.wp-manage-toggle').prop('disabled', true);
+		$spin.show();
+		wpManageAlert('info', (enable ? 'Enabling' : 'Disabling') + ' &hellip; this can take a few seconds.');
+		$('#wp-manage-log').hide().text('');
+
+		jQuery.ajax({
+			method: "POST",
+			url: "./ajax-wp-manage-toggle/",
+			data: { action: 'ajax-wp-manage-toggle', user: wpManageUser, option: option, enable: enable ? '1' : '0' }
+		}).done(function (resp) {
+			$spin.hide();
+			if(resp && resp.status) wpManageRender(resp.status);
+			else $('.wp-manage-toggle').prop('disabled', false);
+
+			if(resp && resp.ok) {
+				wpManageAlert('success', resp.success || 'Done.');
+			} else {
+				wpManageAlert('error', (resp && resp.error) ? resp.error : 'Operation failed.');
+			}
+			if(resp && resp.log && resp.log.trim() !== '') {
+				$('#wp-manage-log').text(resp.log.trim()).show();
+			}
+		}).fail(function () {
+			$spin.hide();
+			$('.wp-manage-toggle').prop('disabled', false);
+			// Revert the visual state on transport failure.
+			$cb.prop('checked', !enable);
+			wpManageAlert('error', 'Request failed. No change was applied.');
+		});
+	});
 });
 </script>
 </>

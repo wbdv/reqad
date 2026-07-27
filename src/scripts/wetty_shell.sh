@@ -14,7 +14,13 @@ if [ -z "$user" ]; then
 fi
 
 if [ "$user" = "root" ]; then
-	cd && exec bash
+	# systemd gives the unit no HOME, so a bare "cd" fails with "HOME not set"
+	# and bash would also skip ~/.bashrc. Take it from passwd and export it.
+	# -l for parity with the su - below: both branches get a login shell.
+	HOME=$(getent passwd root | cut -d: -f6)
+	export HOME="${HOME:-/root}"
+	cd "$HOME" || cd /
+	exec bash -l
 fi
 
 # hosting accounts often have /sbin/nologin as their shell

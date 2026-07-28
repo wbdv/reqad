@@ -33,7 +33,9 @@ on a single VPS, with predictable costs.
 
 ## Requirements
 
-- **OS:** Rocky Linux, AlmaLinux or RHEL 8 / 9
+- **OS:** Rocky Linux, AlmaLinux or RHEL 8 / 9 - a fresh, clean install
+- **Architecture:** x86_64
+- **Access:** root over SSH
 - **A reqad.com account** - free registration at [reqad.com](https://www.reqad.com/)
 
 **Stack it manages:** Nginx / Apache · MariaDB · Exim / Dovecot · PHP / Roundcube ·
@@ -41,20 +43,70 @@ PowerDNS / Cloudflare · Let's Encrypt · WordPress · Monit · CSF firewall.
 
 ## Installation
 
-One command on a fresh EL8/EL9 server - sets up the webstack, MariaDB, mail and SSL
-automatically:
+One command on a fresh EL8 or EL9 server - the same command for both, it detects which
+one you are on:
 
 ```bash
-export SSH_PORT=1922
-export TIMEZONE='Europe/Bucharest'
-export TEMPLATE='nginx_php-fpm'   # or: apache_modphp
-export PHP_VERSION='8.3'          # 7.4, 8.2, 8.3, 8.4 or 8.5
-export WITH_EMAIL=true            # omit to skip exim/dovecot
-bash <(curl -sSL https://repo.reqad.net/install-el8.sh)
+bash <(curl -sSL https://repo.reqad.net/install.sh)
 ```
 
-On EL9, use `install-el9.sh`.
+It checks the server, then opens a terminal UI to choose the web server, PHP version,
+whether to install the mail stack, the SSH port and the timezone:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Rocky Linux 9.4 (Blue Onyx) · x86_64                     │
+│ srv1.example.com   203.0.113.10   4 vCPU   7.8G RAM      │
+├──────────────────────────────────────────────────────────┤
+│ ▸ Web server    [ nginx + php-fpm ] [ apache + mod_php ] │
+│   PHP version   [ 7.4 ] [ 8.2 ] [ 8.3 ] [ 8.4 ] [ 8.5 ]  │
+│   Email stack   [ no ] [ yes ]                           │
+│   SSH port      22                                       │
+│   Timezone      Europe/Bucharest                         │
+├──────────────────────────────────────────────────────────┤
+│                    Start installation                    │
+└──────────────────────────────────────────────────────────┘
+  ↑↓ move · ←→ change · ⏎ select · q quit
+```
+
+Pick **Start installation** and it sets up the web stack, MariaDB, SSL and - if you asked
+for it - the mail stack. A log of the run is kept at
+`/var/tmp/reqad-install/install_reqad.log`.
+
+### Unattended
+
+Pass any option and the UI is skipped, using the defaults for anything you leave out:
+
+```bash
+bash <(curl -sSL https://repo.reqad.net/install.sh) \
+  --template nginx_php-fpm \
+  --php 8.4 \
+  --email \
+  --ssh-port 1922 \
+  --timezone 'Europe/Bucharest'
+```
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--template` | `nginx_php-fpm` | Web server stack: `nginx_php-fpm` or `apache_modphp` |
+| `--php` | `8.3` | PHP version: `7.4`, `8.2`, `8.3`, `8.4` or `8.5` |
+| `--email` / `--no-email` | *off* | Install Exim, Dovecot and Roundcube |
+| `--ssh-port` | `22` | Moves SSH to another port and disables password auth |
+| `--timezone` | *server's current* | Sets the server clock, e.g. `Europe/Bucharest` |
+| `--skip-update` | — | Skips the initial system update and package install |
+| `-y`, `--yes` | — | Runs with every default, no UI |
+| `--dry-run` | — | Prints what would be installed and changes nothing |
+| `--help` | — | Lists every option |
+
+> **Note.** The installer does not read environment variables. The older
+> `install-el8.sh` / `install-el9.sh` scripts, and the `SSH_PORT` / `TIMEZONE` /
+> `TEMPLATE` / `PHP_VERSION` / `WITH_EMAIL` variables they used, are replaced by the
+> single `install.sh` and the options above.
+
+During early access the package repository is access-controlled: register at
+[reqad.com](https://www.reqad.com/) and send the server's public IP so it can be
+allow-listed before running the installer.
 
 ## License
 
-[GPL-3.0](LICENSE). 
+[GPL-3.0](LICENSE).

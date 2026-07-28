@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.0.2 - May 29, 2026'
+VERSION='0.0.3 - Jul 28, 2026'
 
 WHITE='\033[1;37m'
 RED='\033[0;31m'
@@ -43,7 +43,7 @@ if [ "$(systemctl is-active monit)" == "inactive" ]; then
     echo -n "Installing monit                  "
         (
                 dnf -y install monit
-                curl -s -o /etc/monit.d/custom https://repo.reqad.net/monit.txt
+                cat /usr/local/reqad/scripts/install/config/monit.txt > /etc/monit.d/custom
                 SHORTHOST=$(hostname -s)
                 sed -i "s/\$HOST/${SHORTHOST}/" /etc/monit.d/custom
                 #sed -i 's/^set httpd port/#set httpd port/' /etc/monitrc

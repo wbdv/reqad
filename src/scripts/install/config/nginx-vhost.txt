@@ -1,0 +1,63 @@
+server {
+  listen 80;
+  access_log off;
+  error_log off;
+  server_name domain.dom;
+  return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    access_log off;
+    error_log off;
+    server_name domain.dom;
+    ssl_certificate /etc/letsencrypt/live/domain.dom/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/domain.dom/privkey.pem; # managed by Certbot
+
+    if ($http_user_agent ~* (AhrefsBot|AhrefsSiteAudit|SeznamBot|SEOkicks|vip0|Re-re|dataforseo|ClaudeBot|Semrush|Rogerbot|mj12bot|Webmeup|SeekportBot|serpstatbot|FriendlyCrawler) ) {
+       return 444;
+    }
+
+    location ~*.*\.(3gp|gif|jpg|jpeg|png|ico|wmv|avi|asf|asx|mpg|mpeg|mp4|pls|mp3|mid|wav|swf|flv|html|htm|txt|js|css|exe|zip|tar|rar|gz|tgz|bz2|uha|7z|doc|docx|xls|xlsx|pdf|iso|webp)$ {
+   		  # expires 1M;
+          try_files $uri @backend;
+    }
+    location @backend {
+        internal;
+        proxy_pass http://10.0.0.2:6081;
+        proxy_set_header X-Real-IP  $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header Host $host;
+    }
+
+   location / {
+      proxy_pass http://10.0.0.2:6081;
+      proxy_set_header X-Real-IP  $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto https;
+      proxy_set_header X-Forwarded-Port 443;
+      proxy_set_header Host $host;
+   }
+
+}
+
+upstream fastcgi_backend {
+    server   unix:/run/php-fpm/linuxuser.sock;
+}
+
+server {
+  listen 10.0.0.4:8080;
+  set_real_ip_from  10.0.0.2;
+  real_ip_header    X-Forwarded-For;
+  real_ip_recursive on;
+
+  server_name domain.dom;
+  access_log /var/log/nginx/domain.dom_log;
+  error_log /var/log/nginx/domain.dom_log;
+
+  set $MAGE_ROOT /home/linuxuser/public_html;
+  include /home/linuxuser/public_html/nginx.conf.sample;
+}

@@ -1,0 +1,193 @@
+#load_module modules/ngx_http_modsecurity_module.so;
+#load_module modules/ngx_http_geoip2_module.so;
+#load_module modules/ngx_http_headers_more_filter_module.so;
+
+user  nginx;
+worker_processes  auto;
+worker_rlimit_nofile 65535;
+
+error_log  /var/log/nginx/error.log notice;
+pid        /var/run/nginx.pid;
+
+events {
+    multi_accept on;
+    use epoll;
+    worker_connections 65535;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+#    geoip2 /usr/share/GeoIP/GeoLite2-Country.mmdb {
+#        $geoip2_data_country_code default=US source=$remote_addr country iso_code;
+#    }
+#
+#    log_format  main  '$remote_addr $geoip2_data_country_code - $remote_user [$time_local] $request '
+#                      '$status $body_bytes_sent $http_referer '
+#                      '$http_user_agent $http_x_forwarded_for';
+
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile                       on;
+
+    keepalive_timeout              65;
+
+    fastcgi_buffer_size            1024k;
+    fastcgi_buffers                1024 4k;
+
+    fastcgi_connect_timeout        600s;
+    fastcgi_send_timeout           600s;
+    fastcgi_read_timeout           600s;
+
+    proxy_buffer_size              512k;
+    proxy_buffers                  8 1024k;
+    proxy_busy_buffers_size        1024k;
+
+    proxy_connect_timeout          3600;
+    proxy_send_timeout             3600;
+    proxy_read_timeout             3600;
+    send_timeout                   3600;
+
+    open_file_cache                max=200000 inactive=20s;
+    open_file_cache_errors         on;
+    open_file_cache_min_uses       2;
+    open_file_cache_valid          30s;
+    port_in_redirect               off;
+    reset_timedout_connection      on;
+    server_name_in_redirect        off;
+    server_names_hash_bucket_size  1024;
+    server_names_hash_max_size     1024;
+    tcp_nodelay                    on;
+    tcp_nopush                     on;
+    types_hash_max_size            2048;
+
+	client_max_body_size 		   64m;
+
+    # Hide the nginx version in the Server header and error pages.
+    # (Fully removing the Server header needs the headers-more module, whose
+    #  load_module line is commented out in this file, so we only mask the
+    #  version here.)
+    server_tokens                  off;
+
+    ## Real IP Forwarding — restore the true client IP behind Cloudflare ##
+    # Only Cloudflare ranges and localhost are trusted, so a directly-connected
+    # client cannot spoof X-Forwarded-For. Refresh this list periodically from
+    # https://www.cloudflare.com/ips/
+    set_real_ip_from 127.0.0.1;
+
+    # CloudFlare IPs — https://www.cloudflare.com/ips-v4
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 104.16.0.0/12;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 131.0.72.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    # https://www.cloudflare.com/ips-v6
+    set_real_ip_from 2400:cb00::/32;
+    set_real_ip_from 2405:8100::/32;
+    set_real_ip_from 2405:b500::/32;
+    set_real_ip_from 2606:4700::/32;
+    set_real_ip_from 2803:f800::/32;
+    set_real_ip_from 2c0f:f248::/32;
+    set_real_ip_from 2a06:98c0::/29;
+
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    gzip on;
+    gzip_min_length 1100;
+    gzip_buffers 16 8k;
+    gzip_comp_level 5;
+    gzip_disable "msie6";
+    gzip_proxied any;
+
+    gzip_types
+        application/atom+xml
+        application/javascript
+        application/json
+        application/ld+json
+        application/manifest+json
+        application/rss+xml
+        application/vnd.geo+json
+        application/vnd.ms-fontobject
+        application/x-font-ttf
+        application/x-javascript
+        application/x-web-app-manifest+json
+        application/xhtml+xml
+        application/xml
+        font/opentype
+        image/bmp
+        image/svg+xml
+        image/x-icon
+        text/cache-manifest
+        text/css
+        text/javascript
+        text/plain
+        text/vcard
+        text/vnd.rim.location.xloc
+        text/vtt
+        text/x-component
+        text/x-cross-domain-policy
+        text/x-js
+        text/xml;
+    gzip_vary on;
+
+    brotli on;
+    brotli_static on;
+    brotli_buffers 16 8k;
+    brotli_comp_level 6;
+    brotli_types
+        text/css
+        text/javascript
+        text/xml
+        text/plain
+        text/x-component
+        application/javascript
+        application/x-javascript
+        application/json
+        application/xml
+        application/rss+xml
+        application/vnd.ms-fontobject
+        font/truetype
+        font/opentype
+        image/svg+xml;
+
+
+    # Security Headers
+    add_header        X-XSS-Protection "1; mode=block" always;
+    add_header        X-Content-Type-Options "nosniff" always;
+    add_header        X-Nginx-Upstream-Cache-Status $upstream_cache_status;
+
+    # Proxy Cache Settings
+    # proxy_cache_path  /var/cache/nginx/dynamic  levels=1:2 keys_zone=dynamic:512m max_size=4g inactive=12h use_temp_path=off;
+    # proxy_cache_path  /var/cache/nginx/static   levels=1:2 keys_zone=static:512m  max_size=4g inactive=12h use_temp_path=off;
+    # proxy_temp_path   /var/cache/nginx/temp;
+
+	#upstream php-fpm {
+    #	server   unix:/run/php-fpm.sock;
+	#}
+
+    ssl_session_cache    shared:SSL:50m;
+    ssl_session_timeout  24h;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384';
+    ssl_prefer_server_ciphers  on;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+    resolver_timeout 30s;
+
+    include /etc/nginx/conf.d/*.conf;
+}

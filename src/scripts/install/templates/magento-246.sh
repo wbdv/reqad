@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.0.5 - Aug 13, 2024'
+VERSION='0.0.6 - Jul 28, 2026'
 
 WHITE='\033[1;37m'
 RED='\033[0;31m'
@@ -75,9 +75,9 @@ gpgcheck=0' > /etc/yum.repos.d/reqad.repo
 	sed -i 's/\/var\/log\/nginx\/\*\.log/\/var\/log\/nginx\/\*log/' /etc/logrotate.d/nginx
 	truncate -s 0 /etc/nginx/conf.d/default*
 	curl -s https://ssl-config.mozilla.org/ffdhe2048.txt > /etc/nginx/dhparams.pem
-	curl -s https://repo.reqad.net/nginx.txt > /etc/nginx/nginx.conf
-	curl -s https://repo.reqad.net/nginx-vhost.txt > /etc/nginx/conf.d/domain.dom.conf.template
-	#curl -s https://repo.reqad.net/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
+	cat /usr/local/reqad/scripts/install/config/nginx.txt > /etc/nginx/nginx.conf
+	cat /usr/local/reqad/scripts/install/config/nginx-vhost.txt > /etc/nginx/conf.d/domain.dom.conf.template
+	#cat /usr/local/reqad/scripts/install/config/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
 	(systemctl enable nginx --now) >> ./install_reqad.log 2>&1
 
 	if systemctl is-active --quiet nginx; then

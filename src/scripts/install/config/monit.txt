@@ -1,0 +1,99 @@
+set mailserver localhost
+set mail-format {
+    subject: [$HOST] $EVENT
+}
+set alert root@localhost
+
+#set httpd port 2812 and
+#    use address 0.0.0.0
+#    allow 127.0.0.1
+#    allow 86.126.137.70
+#    #allow admin:monit      # require user 'admin' with password 'monit'
+#    with ssl {            # enable SSL/TLS and set path to server certificate
+#        pemfile: /etc/ssl/certs/monit.pem
+#    }
+
+check process crond with pidfile /var/run/crond.pid 
+    start program = "/usr/bin/systemctl start crond"
+    stop program  = "/usr/bin/systemctl stop crond"
+    if 3 restarts within 5 cycles then timeout
+
+check process reqad with pidfile /run/reqad.pid
+    start program = "/usr/bin/systemctl start reqad"
+    stop program  = "/usr/bin/systemctl stop reqad"
+    if failed host localhost port 2087 protocol https for 2 cycles then restart
+    if 3 restarts within 5 cycles then timeout
+
+check process reqad-php-fpm with pidfile /run/reqad-php-fpm.pid 
+    start program = "/usr/bin/systemctl start reqad-php-fpm" with timeout 60 seconds
+    stop program  = "/usr/bin/systemctl stop reqad-php-fpm"
+    if failed unixsocket /run/reqad-php-fpm.sock then restart
+    if 3 restarts within 5 cycles then timeout
+
+check process nginx with pidfile /var/run/nginx.pid
+	group web-server
+    start program = "/usr/bin/systemctl start nginx"
+    stop program  = "/usr/bin/systemctl stop nginx"
+    if failed host localhost port 80 protocol http for 2 cycles then restart
+    if 3 restarts within 5 cycles then timeout
+
+check process php-fpm with pidfile /run/php-fpm/php-fpm.pid
+	group web-server
+    start program = "/usr/bin/systemctl start php-fpm" with timeout 60 seconds
+    stop program  = "/usr/bin/systemctl stop php-fpm"
+    if failed unixsocket /run/php-fpm.sock then restart
+    if 3 restarts within 5 cycles then timeout
+
+check process php82-php-fpm with pidfile /var/opt/remi/php82/run/php-fpm/php-fpm.pid 
+	group web-server
+    start program = "/usr/bin/systemctl start php82-php-fpm" with timeout 60 seconds
+    stop program  = "/usr/bin/systemctl stop php82-php-fpm"
+    if failed unixsocket /run/php-fpm-default_php82.sock then restart
+    if 3 restarts within 5 cycles then timeout
+
+#check process mysql with pidfile /var/lib/mysql/hostname.pid 
+#    group database-server
+#    start program = "/usr/bin/systemctl start mariadb"
+#    stop program = "/usr/bin/systemctl stop mariadb" timeout 120 s
+#    if failed host 127.0.0.1 port 3306 protocol mysql username "monit" password "" then restart
+#    if 3 restarts within 5 cycles then timeout
+
+#check process redis with pidfile /var/run/redis/redis.pid
+#	group database-server
+#    start program = "/usr/bin/systemctl start redis"
+#    stop program = "/usr/bin/systemctl stop redis" timeout 120 s
+#    if failed host localhost port 6379 protocol redis then restart
+#    if 3 restarts within 5 cycles then timeout
+
+#check process pure-ftpd with pidfile /var/run/pure-ftpd.pid
+#    start program = "/usr/bin/systemctl start pure-ftpd"
+#    stop program = "/usr/bin/systemctl stop pure-ftpd" timeout 120 s
+#    if failed host localhost port 21 protocol ftp then restart
+#    if 3 restarts within 5 cycles then timeout
+
+#check process exim with pidfile /var/run/exim.pid
+#   group mail-server
+#   start program = "/usr/bin/systemctl start exim"
+#   stop  program = "/usr/bin/systemctl stop exim"
+#   if failed port 25 protocol smtp then restart
+#   if 3 restarts within 5 cycles then timeout
+
+#check process dovecot with pidfile /var/run/dovecot/master.pid
+#   group mail-server
+#   start program = "/usr/bin/systemctl start dovecot"
+#   stop  program = "/usr/bin/systemctl stop dovecot"
+#   if failed port 993 type tcpssl sslauto then restart
+#   if failed port 143 type tcp protocol imap then restart
+#   if 3 restarts within 5 cycles then timeout
+
+
+check system localhost
+    if loadavg (1min) per core > 2 for 5 cycles then alert
+    if loadavg (5min) per core > 1.5 for 10 cycles then alert
+    if cpu usage > 95% for 10 cycles then alert
+    if memory usage > 95% then alert
+    if swap usage > 25% then alert
+
+check filesystem disk with path /
+    if space usage > 90% then alert
+

@@ -1,0 +1,44 @@
+upstream php-fpm-nginx {
+    server unix:/run/php-fpm.sock;
+}
+
+server {
+    listen 80;
+    server_name  %HOSTNAME%;
+    access_log /var/log/nginx/%HOSTNAME%_log;
+    error_log /var/log/nginx/%HOSTNAME%_log;
+        return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name  %HOSTNAME%;
+    access_log /var/log/nginx/%HOSTNAME%_log;
+    error_log /var/log/nginx/%HOSTNAME%_log;
+    ssl_certificate /etc/letsencrypt/live/%HOSTNAME%/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/%HOSTNAME%/privkey.pem; # managed by Certbot
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+
+        location ~ [^/]\.php(/|$) {
+            fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+            if (!-f $document_root$fastcgi_script_name) {
+                return 404;
+            }
+
+            fastcgi_pass php-fpm-nginx;
+            fastcgi_index index.php;
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_keep_conn on;
+        }
+
+        location ~ /\.ht {
+            deny all;
+        }
+    }
+}

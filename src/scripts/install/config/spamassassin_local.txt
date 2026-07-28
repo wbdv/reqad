@@ -1,0 +1,444 @@
+# This is the right place to customize your installation of SpamAssassin.
+#
+# See 'perldoc Mail::SpamAssassin::Conf' for details of what can be
+# tweaked.
+#
+# Only a small subset of options are listed below
+#
+###########################################################################
+
+#    A 'contact address' users should contact for more info. (replaces
+#    _CONTACTADDRESS_ in the report template)
+# report_contact youremailaddress@domain.tld
+
+
+#   Add *****SPAM***** to the Subject header of spam e-mails
+#
+# rewrite_header Subject *****SPAM*****
+
+
+#   Save spam messages as a message/rfc822 MIME attachment instead of
+#   modifying the original message (0: off, 2: use text/plain instead)
+#
+# report_safe 1
+
+
+#   Set which networks or hosts are considered 'trusted' by your mail
+#   server (i.e. not spammers)
+#
+
+internal_networks 85.9.27.0/24 85.120.61.0/24
+
+trusted_networks 85.9.27.0/24 85.120.61.0/24 13.107.128.0/22 13.107.18.10/31 13.107.19.10/31 13.107.6.152/31 13.107.9.152/31 20.47.149.138/32 23.103.160.0/20 23.103.224.0/19 23.249.208.0/20 23.251.224.0/19 27.123.204.0/24 27.123.206.0/24 35.190.247.0/24 35.191.0.0/16 37.251.171.105 40.104.0.0/15 40.107.0.0/16 40.112.0.0/13 40.120.0.0/14 40.124.0.0/16 40.125.0.0/17 40.74.0.0/15 40.76.0.0/14 40.80.0.0/12 40.96.0.0/12 46.228.36.0/24 46.228.37.0/24 46.228.38.0/24 46.228.39.0/24 51.4.72.0/24 51.4.80.0/27 51.5.72.0/24 51.5.80.0/27 52.100.0.0/14 52.238.78.88 52.82.172.0/22 52.96.0.0/14 54.240.0.0/18 54.240.64.0/19 54.240.96.0/19 62.149.128.209 64.233.160.0/19 65.54.121.120/29 65.54.190.0/24 65.54.241.0/24 65.54.51.64/26 65.54.61.64/26 65.55.111.0/24 65.55.113.64/26 65.55.116.0/25 65.55.126.0/25 65.55.174.0/25 65.55.178.128/27 65.55.234.192/26 65.55.238.129/26 65.55.33.64/28 65.55.34.0/24 65.55.52.224/27 65.55.78.128/25 65.55.81.48/28 65.55.90.0/24 65.55.94.0/25 66.102.0.0/20 66.163.160.0/19 66.218.64.0/19 66.249.80.0/20 67.195.0.0/16 68.142.230.0/24 68.232.128.0/19 69.147.84.227/32 69.169.224.0/20 70.37.151.128/25 72.14.192.0/18 72.30.0.0/16 74.125.0.0/16 74.6.0.0/16 76.223.128.0/19 76.223.176.0/20 77.238.176.0/21 77.36.71.2 80.96.26.84 81.181.193.17 82.150.225.79 86.125.56.240 86.126.128.142 86.126.157.219 87.248.110.0/24 89.42.16.47 89.42.222.100 89.42.222.102 89.42.222.105 93.113.129.115 94.245.112.0/27 98.136.0.0/14 104.47.0.0/17 106.10.128.0/18 108.177.8.0/21 108.177.96.0/19 111.221.112.0/21 111.221.23.128/25 111.221.26.0/27 111.221.66.0/25 111.221.69.128/25 130.211.0.0/22 131.253.33.215/32 132.245.0.0/16 134.170.68.0/23 150.171.32.0/22 157.55.0.192/26 157.55.11.0/25 157.55.1.128/26 157.55.157.128/25 157.55.2.0/25 157.55.225.0/25 157.55.49.0/25 157.55.61.0/24 157.55.9.128/25 157.56.106.128/28 157.56.232.0/21 157.56.240.0/20 157.56.24.0/25 157.56.96.16/28 157.56.96.224/28 167.89.0.0/17 172.217.0.0/19 172.217.128.0/19 172.217.160.0/20 172.217.192.0/19 172.217.32.0/20 172.253.112.0/20 172.253.56.0/21 173.194.0.0/16 191.232.96.0/19 191.234.140.0/22 191.234.224.0/22 191.234.6.152 194.102.108.50 199.127.232.0/22 199.255.192.0/22 204.79.197.215 206.191.224.0/19 207.46.116.128/29 207.46.117.0/24 207.46.132.128/27 207.46.150.128/25 207.46.198.0/25 207.46.200.0/27 207.46.203.128/26 207.46.4.128/25 207.46.50.192/26 207.46.58.128/25 207.68.169.173/30 207.68.176.0/26 207.68.176.96/27 209.85.128.0/17 213.199.161.128/27 213.199.177.0/26 213.233.64.138 216.239.32.0/19 216.39.48.0/20 216.58.192.0/19 217.156.103.28 
+
+
+#   Set file-locking method (flock is not safe over NFS, but is faster)
+#
+# lock_method flock
+
+
+#   Set the threshold at which a message is considered spam (default: 5.0)
+#
+# required_score 5.0
+
+
+#   Use Bayesian classifier (default: 1)
+#
+# use_bayes 1
+
+
+#   Bayesian classifier auto-learning (default: 1)
+#
+# bayes_auto_learn 1
+
+
+#   Set headers which may provide inappropriate cues to the Bayesian
+#   classifier
+#
+# bayes_ignore_header X-Bogosity
+# bayes_ignore_header X-Spam-Flag
+# bayes_ignore_header X-Spam-Status
+
+
+#   Whether to decode non- UTF-8 and non-ASCII textual parts and recode
+#   them to UTF-8 before the text is given over to rules processing.
+#
+# normalize_charset 1
+
+#   Textual body scan limit    (default: 50000)
+#
+#   Amount of data per email text/* mimepart, that will be run through body
+#   rules.  This enables safer and faster scanning of large messages,
+#   perhaps having very large textual attachments.  There should be no need
+#   to change this well tested default.
+#
+# body_part_scan_size 50000
+
+#   Textual rawbody data scan limit    (default: 500000)
+#
+#   Amount of data per email text/* mimepart, that will be run through
+#   rawbody rules.
+#
+# rawbody_part_scan_size 500000
+
+#   Some shortcircuiting, if the plugin is enabled
+# 
+ifplugin Mail::SpamAssassin::Plugin::Shortcircuit
+#
+#   default: strongly-welcomelisted mails are *really* welcomelisted now, if
+#   the shortcircuiting plugin is active, causing early exit to save CPU
+#   load.  Uncomment to turn this on
+#
+#   SpamAssassin tries hard not to launch DNS queries before priority -100. 
+#   If you want to shortcircuit without launching unneeded queries, make
+#   sure such rule priority is below -100. These examples are already:
+#
+# shortcircuit USER_IN_WELCOMELIST       on
+# shortcircuit USER_IN_DEF_WELCOMELIST   on
+# shortcircuit USER_IN_ALL_SPAM_TO     on
+
+#   the opposite; blocklisted mails can also save CPU
+#
+# shortcircuit USER_IN_BLOCKLIST       on
+# shortcircuit USER_IN_BLOCKLIST_TO    on
+
+#   if you have taken the time to correctly specify your "trusted_networks",
+#   this is another good way to save CPU
+#
+# shortcircuit ALL_TRUSTED             on
+
+#   and a well-trained bayes DB can save running rules, too
+#
+# shortcircuit BAYES_99                spam
+# shortcircuit BAYES_00                ham
+
+endif # Mail::SpamAssassin::Plugin::Shortcircuit
+
+loadplugin Mail::SpamAssassin::Plugin::ResourceLimits
+resource_limit_mem 536870912
+
+dns_available yes # Autoconfigured by cPanel - comment out this line or set to no to avoid future updates
+
+pyzor_options --homedir /etc/mail/spamassassin # Autoconfigured by cPanel - comment out this line to avoid future updates
+
+dns_server 85.9.27.3 
+
+score           DKIM_INVALID 2
+score           RCVD_IN_SORBS_SPAM 1
+
+score           RCVD_IN_SORBS_BLOCK 0 # n=0 n=1 n=2 n=3
+score           RCVD_IN_SORBS_DUL 0 0.001 0 0.001 # n=0 n=2
+score           RCVD_IN_SORBS_HTTP 0 2.499 0 0.001 # n=0 n=2
+score           RCVD_IN_SORBS_MISC 0 # n=0 n=1 n=2 n=3
+score           RCVD_IN_SORBS_SMTP 0 # n=0 n=1 n=2 n=3
+score           RCVD_IN_SORBS_SOCKS 0 2.443 0 1.927 # n=0 n=2
+score           RCVD_IN_SORBS_WEB  0 1.5 0 1.5
+
+header          RCVD_IN_MSPIKE_BL eval:check_rbl('mspike-lastexternal', 'bl.mailspike.net.')
+tflags          RCVD_IN_MSPIKE_BL net
+score           RCVD_IN_MSPIKE_BL 2.5
+
+header          RCVD_IN_MSPIKE_WL eval:check_rbl('mspike-lastexternal', 'wl.mailspike.net.')
+tflags          RCVD_IN_MSPIKE_WL net
+score           RCVD_IN_MSPIKE_WL -1.5
+
+# https://spfbl.net/en/dnsbl/
+header          RCVD_IN_SPFBL       eval:check_rbl('spfblnet-lastexternal', 'dnsbl.spfbl.net', '127.0.0.2')
+describe        RCVD_IN_SPFBL       Listed on dnsbl.spfbl.net
+score           RCVD_IN_SPFBL       3
+
+# https://polspam.pl/rbll.php
+urirhssub		BL_POLSPAM_RHSBL_PL	rhsbl.rbl.polspam.pl.		A	127.1.1.1
+body			BL_POLSPAM_RHSBL_PL	eval:check_uridnsbl('BL_POLSPAM_RHSBL_PL')
+describe		BL_POLSPAM_RHSBL_PL	Listed on rhsbl.rbl.polspam.pl
+tflags			BL_POLSPAM_RHSBL_PL	net autolearn autolearn_force domains_only
+score			BL_POLSPAM_RHSBL_PL 0.5		# downgrade, list all .ru domains
+
+header			BL_0_POLSPAM_PL		eval:check_rbl('polspam-lastexternal', 'bl.rbl.polspam.pl.')
+describe		BL_0_POLSPAM_PL		Listed on bl.rbl.polspam.pl
+score			BL_0_POLSPAM_PL		2	
+header			BL_1_POLSPAM_PL		eval:check_rbl('polspam-lastexternal', 'bl-h1.rbl.polspam.pl.')
+describe		BL_1_POLSPAM_PL		Listed on bl-h1.rbl.polspam.pl
+score			BL_1_POLSPAM_PL		0.9
+header			BL_2_POLSPAM_PL		eval:check_rbl('polspam-lastexternal', 'bl-h2.rbl.polspam.pl.')
+describe		BL_2_POLSPAM_PL		Listed on bl-h2.rbl.polspam.pl
+score			BL_2_POLSPAM_PL		0.6
+header			BL_3_POLSPAM_PL		eval:check_rbl('polspam-lastexternal', 'bl-h3.rbl.polspam.pl.')
+describe		BL_3_POLSPAM_PL		Listed on bl-h3.rbl.polspam.pl
+score			BL_3_POLSPAM_PL		0.5
+header			BL_4_POLSPAM_PL		eval:check_rbl('polspam-lastexternal', 'bl-h4.rbl.polspam.pl.')
+describe		BL_4_POLSPAM_PL		Listed on bl-h4.rbl.polspam.pl
+score			BL_4_POLSPAM_PL		0.2
+header			BL_6_POLSPAM_PL		eval:check_rbl('polspam-lastexternal', 'bl6.rbl.polspam.pl.')
+describe		BL_6_POLSPAM_PL		Listed on bl6.rbl.polspam.pl
+score			BL_6_POLSPAM_PL		1.1
+
+header          BL_BACKSCATTERER    eval:check_rbl('backscattererorg-lastexternal', 'ips.backscatterer.org', '127.0.0.2')
+describe        BL_BACKSCATTERER    Listed on ips.backscatterer.org
+score           BL_BACKSCATTERER    3
+
+# https://mxrbl.com
+header          RCVD_IN_MXRBL       eval:check_rbl('mxrblcom-lastexternal', 'bl.mxrbl.com','127.0.0.2')
+describe        RCVD_IN_MXRBL       Listed in mxrbl.com
+score           RCVD_IN_MXRBL       1
+
+urirhssub       RO_URIBL_BLACK  uribl.abuse.ro.        A   2
+body            RO_URIBL_BLACK  eval:check_uridnsbl('RO_URIBL_BLACK')
+describe        RO_URIBL_BLACK  URL listed in RO_URIBL blacklist
+tflags          RO_URIBL_BLACK  net
+score           RO_URIBL_BLACK  2.0
+
+header          RCVD_IN_ABUSERO   eval:check_rbl('abusero-lastexternal', 'bl.abuse.ro.', '127.0.0.2')
+describe        RCVD_IN_ABUSERO   Received via a relay in Abuse.ro BL
+tflags          RCVD_IN_ABUSERO   net
+score           RCVD_IN_ABUSERO   2.0
+
+urirhssub       TRKRO_URIBL_BLACK  uribl.tracking.ro.        A   2
+body            TRKRO_URIBL_BLACK  eval:check_uridnsbl('TRKRO_URIBL_BLACK')
+describe        TRKRO_URIBL_BLACK  URL listed in tracking.ro blacklist
+tflags          TRKRO_URIBL_BLACK  net
+score           TRKRO_URIBL_BLACK  2.0
+
+header          RCVD_IN_TRACKINGRO   eval:check_rbl('trackingro-lastexternal', 'bl.tracking.ro.', '127.0.0.2')
+describe        RCVD_IN_TRACKINGRO   Received via a host listed in tracking.ro
+tflags          RCVD_IN_TRACKINGRO   net
+score           RCVD_IN_TRACKINGRO   2.0
+
+header          RCVD_IN_ABUSEIPDB   eval:check_rbl('abuseipdb-lastexternal', 'abuseipdb.tracking.ro.', '127.0.0.2')
+describe        RCVD_IN_ABUSEIPDB   Received via a host listed in abuseipdb.com
+tflags          RCVD_IN_ABUSEIPDB   net
+score           RCVD_IN_ABUSEIPDB   2.0
+
+header          RCVD_IN_RECENTSORBS   eval:check_rbl('recentsorbs-lastexternal', 'recent.spam.dnsbl.sorbs.net.', '127.0.0.6')
+describe        RCVD_IN_RECENTSORBS   Received via a host listed in recent.spam.dnsbl.sorbs.net
+tflags          RCVD_IN_RECENTSORBS   net
+score           RCVD_IN_RECENTSORBS   2.0
+
+header          RCVD_IN_VIRUSFREEBAD  eval:check_rbl('virusfreebad-lastexternal', 'bad.virusfree.cz.', '127.0.0.2')
+describe        RCVD_IN_VIRUSFREEBAD  Received via a host listed in bad.virusfree.cz
+tflags          RCVD_IN_VIRUSFREEBAD  net
+score           RCVD_IN_VIRUSFREEBAD  2.0
+
+header          RCVD_IN_RBLDNSRU   eval:check_rbl('rbldbsru-lastexternal', 'rbl.rbldns.ru.', '127.0.0.2')
+describe        RCVD_IN_RBLDNSRU   Received via a host listed in rbldns.ru
+tflags          RCVD_IN_RBLDNSRU   net
+score           RCVD_IN_RBLDNSRU   1.0
+
+header          RCVD_IN_TRUNCATEGBUDB   eval:check_rbl('truncategbudb-lastexternal', 'truncate.gbudb.net.', '127.0.0.2')
+describe        RCVD_IN_TRUNCATEGBUDB   Received via a host listed in truncate.gbudb.net
+tflags          RCVD_IN_TRUNCATEGBUDB   net
+score           RCVD_IN_TRUNCATEGBUDB   3.0
+
+header          VIRUS_DOCBT Subject =~ /FW: Document - Banca Transilvania/
+describe        VIRUS_DOCBT Virus Document Banca Transilvania
+score           VIRUS_DOCBT 5
+
+header          SPAM_KEMO1 Subject =~ /Re: Probleme website/
+describe        SPAM_KEMO1 Spam kemo.ro@ccir.email
+score           SPAM_KEMO1 2
+
+header          SPAM_KEMO2 Subject =~ /Promovare online pentru produse si servicii/
+describe        SPAM_KEMO2 kemo.ro@ccir.email
+score           SPAM_KEMO2 3
+
+header          SPAM_BILENOTO Subject =~ /Notificare mesaj nelivrat/
+describe        SPAM_BILENOTO phishing from servis@bilenoto.com.tr 222.231.11.103
+score           SPAM_BILENOTO 4
+
+header          SPAM_ROMARGPHISHING Subject =~ /Abonamentul t\304\203u se \303\256ncheie ast\304\203zi/
+describe        SPAM_ROMARGPHISHING Phishing Romarg
+score           SPAM_ROMARGPHISHING 20
+
+header          SPAM_ROMARGPHISHING2 Subject =~ /nnoirea domeniului/
+describe        SPAM_ROMARGPHISHING2 Phishing Romarg 2
+score           SPAM_ROMARGPHISHING2 20
+
+body            SPAM_ROMARGPHISHING3 /Rg4D3dcz8o/
+describe        SPAM_ROMARGPHISHING3 Phishing Romarg 3
+score           SPAM_ROMARGPHISHING3 20
+
+header          SPAM_LICENTE24 ALL =~ licente24.ro
+describe		SPAM_LICENTE24 Spam licente24.ro
+score			SPAM_LICENTE24 20
+
+header			SPAM_CABANOVA ALL =~ /cabanovasoftwaresrl/
+describe		SPAM_CABANOVA Spam Cabanova
+score			SPAM_CABANOVA 9 
+
+header			SPAM_MAILCHANNELS ALL =~ /mailchannels\.net/
+describe		SPAM_MAILCHANNELS Spam mailchannels.net
+score			SPAM_MAILCHANNELS 5
+
+header			SPAM_STEREOMAG ALL =~ /stereomag\.ro/
+describe		SPAM_STEREOMAG Spam stereomag.ro
+score			SPAM_STEREOMAG 9
+
+header			SPAM_COSURICADOU ALL =~ /cosuri\-cadou\.email/
+describe		SPAM_COSURICADOU Spam cosuri-cadou.email
+score			SPAM_COSURICADOU 9
+
+header			SPAM_RISCO From =~ /marketing@risco\.ro/
+describe		SPAM_RISCO Spam marketing@risco.ro
+score			SPAM_RISCO 5
+
+
+#header          SPAM_MAGENTORESETPSW Subject =~ /Confirmare resetare parola pt /
+#describe        SPAM_MAGENTORESETPSW Spam Magento 2 Reset Password Form 
+#score           SPAM_MAGENTORESETPSW 20
+
+urirhsbl  		URIBL_AMI_DBLACK    6ee7d68f592aa44954dbfa4d7c35fd7d.dblack.combined.mail.abusix.zone. A
+body      		URIBL_AMI_DBLACK    eval:check_uridnsbl('URIBL_AMI_DBLACK')
+describe  		URIBL_AMI_DBLACK    Contains a spam URL listed in the Abusix Mail Intelligence domain blocklist
+score     		URIBL_AMI_DBLACK    3.0
+tflags    		URIBL_AMI_DBLACK    net
+
+header      	RCVD_IN_ABUSIX      eval:check_rbl('abusix-lastexternal', '6ee7d68f592aa44954dbfa4d7c35fd7d.combined.mail.abusix.zone')
+describe    	RCVD_IN_ABUSIX      Relay is listed in Abusix (combined.mail.abusix.zone)
+tflags      	RCVD_IN_ABUSIX      net
+score       	RCVD_IN_ABUSIX      3.0
+
+
+# updated feb 2024
+# spam.dnsbl.anonmails.de
+header 		RCVD_IN_ANONMAILS      	eval:check_rbl('anonmails-lastexternal', 'spam.dnsbl.anonmails.de.')
+describe 	RCVD_IN_ANONMAILS      	Relay is listed in spam.dnsbl.anonmails.de
+tflags 		RCVD_IN_ANONMAILS      	net
+score 		RCVD_IN_ANONMAILS      	3.0
+
+header		RCVD_IN_DNSBL_ASCAMS 	eval:check_rbl('ascams-lastexternal','superblock.ascams.com.')
+describe	RCVD_IN_DNSBL_ASCAMS 	Received via a relay in superblock.ascams.com. DNSBL
+tflags		RCVD_IN_DNSBL_ASCAMS 	net
+score		RCVD_IN_DNSBL_ASCAMS 	1.0
+
+header 		RCVD_IN_DNSBL_CBL_ABUSEAT eval:check_rbl('cblabuseat-lastexternal','cbl.abuseat.org.')
+describe 	RCVD_IN_DNSBL_CBL_ABUSEAT Received via a relay in cbl.abuseat.org. DNSBL
+tflags 		RCVD_IN_DNSBL_CBL_ABUSEAT net
+score 		RCVD_IN_DNSBL_CBL_ABUSEAT 1.0
+
+header 		RCVD_IN_DNSBL_JUSTSPAM eval:check_rbl('justspam-lastexternal','dnsbl.justspam.org.')
+describe 	RCVD_IN_DNSBL_JUSTSPAM Received via a relay in dnsbl.justspam.org. DNSBL
+tflags 		RCVD_IN_DNSBL_JUSTSPAM net
+score 		RCVD_IN_DNSBL_JUSTSPAM 1.0
+
+header 		RCVD_IN_DNSBL_MCAFEE eval:check_rbl('mcafee-lastexternal','cidr.bl.mcafee.com.')
+describe 	RCVD_IN_DNSBL_MCAFEE Received via a relay in cidr.bl.mcafee.com. DNSBL
+tflags 		RCVD_IN_DNSBL_MCAFEE net
+score 		RCVD_IN_DNSBL_MCAFEE 1.0
+
+header 		RCVD_IN_DNSBL_S5H eval:check_rbl('s5h-lastexternal','all.s5h.net.')
+describe 	RCVD_IN_DNSBL_S5H Received via a relay in all.s5h.net. DNSBL
+tflags 		RCVD_IN_DNSBL_S5H net
+score 		RCVD_IN_DNSBL_S5H 1.0
+
+header 		RCVD_IN_DNSBL_SINGULAR eval:check_rbl('singular-lastexternal','singular.ttk.pte.hu.')
+describe 	RCVD_IN_DNSBL_SINGULAR Received via a relay in singular.ttk.pte.hu. DNSBL
+tflags 		RCVD_IN_DNSBL_SINGULAR net
+score 		RCVD_IN_DNSBL_SINGULAR 1.0
+
+header 		RCVD_IN_DNSBL_SPAMCANNIBAL eval:check_rbl('spamcannibal-lastexternal','bl.spamcannibal.org.')
+describe 	RCVD_IN_DNSBL_SPAMCANNIBAL Received via a relay in bl.spamcannibal.org. DNSBL
+tflags 		RCVD_IN_DNSBL_SPAMCANNIBAL net
+score 		RCVD_IN_DNSBL_SPAMCANNIBAL 1.0
+
+header 		RCVD_IN_DNSBL_UCEPROTECT eval:check_rbl('uceprotect1-lastexternal','dnsbl-1.uceprotect.net.')
+describe 	RCVD_IN_DNSBL_UCEPROTECT Received via a relay in dnsbl-1.uceprotect.net. DNSBL
+tflags 		RCVD_IN_DNSBL_UCEPROTECT net
+score 		RCVD_IN_DNSBL_UCEPROTECT 1.0
+
+header 		RCVD_IN_DNSBL_JUNKEMAILFILTER eval:check_rbl('junkemailfilter-lastexternal','hostkarma.junkemailfilter.com.', '127.0.0.2')
+describe 	RCVD_IN_DNSBL_JUNKEMAILFILTER Received via a relay in hostkarma.junkemailfilter.com. DNSBL
+tflags 		RCVD_IN_DNSBL_JUNKEMAILFILTER net
+score 		RCVD_IN_DNSBL_JUNKEMAILFILTER 1.0
+
+header 		RCVD_IN_DNSBL_JUNKEMAILFILTER2 eval:check_rbl('junkemailfilter-lastexternal','black.junkemailfilter.com.', '127.0.0.2')
+describe 	RCVD_IN_DNSBL_JUNKEMAILFILTER2 Received via a relay in black.junkemailfilter.com. DNSBL
+tflags 		RCVD_IN_DNSBL_JUNKEMAILFILTER2 net
+score 		RCVD_IN_DNSBL_JUNKEMAILFILTER2 1.0
+
+header 		RCVD_IN_DNSBL_INPS_DE eval:check_rbl('inpsde-lastexternal','dnsbl.inps.de.')
+describe 	RCVD_IN_DNSBL_INPS_DE Received via a relay in inps.de DNSBL
+tflags 		RCVD_IN_DNSBL_INPS_DE net
+score 		RCVD_IN_DNSBL_INPS_DE 1.0
+
+header 		RCVD_IN_DNSBL_MAILCLEANER eval:check_rbl('mailcleaner-lastexternal','iprbl.mailcleaner.net.')
+describe 	RCVD_IN_DNSBL_MAILCLEANER Received via a relay in iprbl.mailcleaner.net DNSBL
+tflags 		RCVD_IN_DNSBL_MAILCLEANER net
+score 		RCVD_IN_DNSBL_MAILCLEANER 1.0
+
+header 		RCVD_IN_DNSBL_MAILCLEANER_NL eval:check_rbl('mailcleaner-lastexternal','niprbl.mailcleaner.net.')
+describe 	RCVD_IN_DNSBL_MAILCLEANER_NL Received via a relay in niprbl.mailcleaner.net DNSBL
+tflags 		RCVD_IN_DNSBL_MAILCLEANER_NL net
+score 		RCVD_IN_DNSBL_MAILCLEANER_NL 1.0
+
+header      RCVD_IN_DNSBL_VGREMLIN eval:check_rbl('votegremlin-lastexternal','vote.drbl.gremlin.ru.')
+describe    RCVD_IN_DNSBL_VGREMLIN Received via a relay in vote.drbl.gremlin.ru DNSBL
+tflags      RCVD_IN_DNSBL_VGREMLIN net
+score       RCVD_IN_DNSBL_VGREMLIN 0.5 
+
+header      RCVD_IN_DNSBL_WGREMLIN eval:check_rbl('workgremlin-lastexternal','work.drbl.gremlin.ru.')
+describe    RCVD_IN_DNSBL_WGREMLIN Received via a relay in work.drbl.gremlin.ru DNSBL
+tflags      RCVD_IN_DNSBL_WGREMLIN net
+score       RCVD_IN_DNSBL_WGREMLIN 0.5
+
+# spamrats
+header 		__RCVD_IN_SPAMRATS       eval:check_rbl('spamrats-lastexternal', 'all.spamrats.com.')
+describe 	__RCVD_IN_SPAMRATS     	 SPAMRATS: sender is listed in SpamRats
+tflags 		__RCVD_IN_SPAMRATS       net
+score  		__RCVD_IN_SPAMRATS	     1.0
+
+header 		RCVD_IN_SPAMRATS_DYNA    eval:check_rbl_sub('spamrats-lastexternal', '127.0.0.36')
+describe 	RCVD_IN_SPAMRATS_DYNA  	 RATS-Dyna: sent directly from dynamic IP address
+tflags 		RCVD_IN_SPAMRATS_DYNA    net
+score  		RCVD_IN_SPAMRATS_DYNA    1.0
+
+header 		RCVD_IN_SPAMRATS_NOPTR   eval:check_rbl_sub('spamrats-lastexternal', '127.0.0.37')
+describe 	RCVD_IN_SPAMRATS_NOPTR   RATS-NoPtr: sender has no reverse DNS
+tflags 		RCVD_IN_SPAMRATS_NOPTR   net
+score  		RCVD_IN_SPAMRATS_NOPTR   1.0
+
+header 		RCVD_IN_SPAMRATS_SPAM    eval:check_rbl_sub('spamrats-lastexternal', '127.0.0.38')
+describe 	RCVD_IN_SPAMRATS_SPAM    RATS-Spam: sender is a spam source
+tflags 		RCVD_IN_SPAMRATS_SPAM    net
+score  		RCVD_IN_SPAMRATS_SPAM    2.0
+
+header 		RCVD_IN_BRUKALAI_BLACK   eval:check_rbl('brukalai-lastexternal', 'black.dnsbl.brukalai.lt.')
+describe 	RCVD_IN_BRUKALAI_BLACK 	 Blacklisted at Brukalai.lt DNSBL
+tflags 		RCVD_IN_BRUKALAI_BLACK   net
+score 		RCVD_IN_BRUKALAI_BLACK   2.0
+
+header 		RCVD_IN_FMB_LA   eval:check_rbl('fmbla-lastexternal', 'bl.fmb.la.')
+describe 	RCVD_IN_FMB_LA 	 Blacklisted at fmb.la DNSBL
+tflags 		RCVD_IN_FMB_LA   net
+score 		RCVD_IN_FMB_LA   2.0
+
+header 		RCVD_IN_THREATINT  eval:check_rbl('threatint-lastexternal', 'dnsbl.threatint.zone.')
+describe 	RCVD_IN_THREATINT  Blacklisted at dnsbl.threatint.zone DNSBL
+tflags 		RCVD_IN_THREATINT  net
+score 		RCVD_IN_THREATINT  2.0
+
+score 		RCVD_IN_XBL 3.0
+score 		RCVD_IN_BRBL_LASTEXT 3.0
+
+header		ENAME_RO	From =~ /@ename\.ro/
+describe	ENAME_RO	Whitelist ename.ro mail for internal usage
+score		ENAME_RO	-5
+
+header		SAMEDAY_RO	From =~ /@sameday\.ro/
+describe	SAMEDAY_RO	Whitelist sameday.ro
+score		SAMEDAY_RO	-5
+
+score 		RCVD_IN_DNSWL_LOW   -1
+score 		RCVD_IN_DNSWL_MED   -5
+score 		RCVD_IN_DNSWL_HI    -10
+
+ifplugin Mail::SpamAssassin::Plugin::Tagmatch
+tagmatch __TAGMATCH_RDNS_MAILGUN _LASTEXTERNALRDNS_ =~ /\.mailgun\.net\.$/
+meta LOCAL_MAILGUN __TAGMATCH_RDNS_MAILGUN
+score LOCAL_MAILGUN 6
+describe LOCAL_MAILGUN Last rDNS mailgun.net
+endif
+
+header      RCVD_IN_DEBACOM  eval:check_rbl('debacom-lastexternal', 'bl.rbl.debacom.pl.')
+describe    RCVD_IN_DEBACOM  Blacklisted at bl.rbl.debacom.pl DNSBL
+tflags      RCVD_IN_DEBACOM  net
+score       RCVD_IN_DEBACOM  2.0

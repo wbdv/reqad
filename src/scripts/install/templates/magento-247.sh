@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.0.1 - Aug 13, 2024'
+VERSION='0.0.2 - Jul 28, 2026'
 
 WHITE='\033[1;37m'
 RED='\033[0;31m'
@@ -73,9 +73,9 @@ gpgcheck=0' > /etc/yum.repos.d/reqad.repo
 	sed -i 's/\/var\/log\/nginx\/\*\.log/\/var\/log\/nginx\/\*log/' /etc/logrotate.d/nginx
 	truncate -s 0 /etc/nginx/conf.d/default*
 	curl -s https://ssl-config.mozilla.org/ffdhe2048.txt > /etc/nginx/dhparams.pem
-	curl -s https://repo.reqad.net/nginx.txt > /etc/nginx/nginx.conf
-	curl -s https://repo.reqad.net/nginx-vhost.txt > /etc/nginx/conf.d/domain.dom.conf.template
-	#curl -s https://repo.reqad.net/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
+	cat /usr/local/reqad/scripts/install/config/nginx.txt > /etc/nginx/nginx.conf
+	cat /usr/local/reqad/scripts/install/config/nginx-vhost.txt > /etc/nginx/conf.d/domain.dom.conf.template
+	#cat /usr/local/reqad/scripts/install/config/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
 	(systemctl enable nginx --now) >> ./install_reqad.log 2>&1
 
 	if systemctl is-active --quiet nginx; then
@@ -275,7 +275,7 @@ if ! systemctl is-active --quiet varnish; then
 	(curl -s https://packagecloud.io/install/repositories/varnishcache/varnish75/script.rpm.sh | sudo bash) >> ./install_reqad.log 2>&1
 	(dnf install -y varnish) >> ./install_reqad.log 2>&1
 
-	curl -s https://repo.reqad.net/varnish.txt > /etc/varnish/default.vcl
+	cat /usr/local/reqad/scripts/install/config/varnish.txt > /etc/varnish/default.vcl
 	sed -i 's/10.0.0.x/127.0.0.1/' /etc/varnish/default.vcl
 
 	sed -i 's/-a :6081 \\/-a 127.0.0.1:6081 \\/' /usr/lib/systemd/system/varnish.service

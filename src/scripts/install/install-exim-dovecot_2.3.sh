@@ -1,6 +1,7 @@
 #!/bin/bash
 
-VERSION='0.0.3 - Sep 5, 2025'
+VERSION='0.0.4 - Jul 28, 2026'
+
 ROUNDCUBE_VER='1.6.9'
 
 WHITE='\033[1;37m'
@@ -54,8 +55,8 @@ then
   finish
 endif
 " > /etc/exim/system_filter
-	curl -s https://repo.reqad.net/trustedmailhosts.txt > /etc/exim/trustedmailhosts
-	curl -s https://repo.reqad.net/exim.txt > /etc/exim/exim.conf
+	cat /usr/local/reqad/scripts/install/config/trustedmailhosts.txt > /etc/exim/trustedmailhosts
+	cat /usr/local/reqad/scripts/install/config/exim.txt > /etc/exim/exim.conf
     SRS_SECRET=`head -n 10 /dev/urandom | tr -cd 'a-z0-9' | paste -sd - | sed 's/[\t, ]//g' | cut -b -32`
 	sed -i "s/SRS_SECRET = $/SRS_SECRET = ${SRS_SECRET}/" /etc/exim/exim.conf
 ) >> ./install_reqad.log 2>&1
@@ -104,7 +105,7 @@ if [ "$(systemctl is-active spamassassin)" == "inactive" ]; then
 		mkdir -p /var/lib/spamassassin
 		chown spamd:spamd /var/lib/spamassassin
 		echo 'SPAMDOPTIONS="-c -m5 -H -u spamd"' > /etc/sysconfig/spamassassin
-		curl -s https://repo.reqad.net/spamassassin_local.txt > /etc/mail/spamassassin/local.cf 
+		cat /usr/local/reqad/scripts/install/config/spamassassin_local.txt > /etc/mail/spamassassin/local.cf 
 		/usr/bin/sa-update -v
 	) >> ./install_reqad.log 2>&1
 fi
@@ -160,9 +161,8 @@ enabled=1
         mkdir /etc/dovecot
 		dnf -y install dovecot patch
 		touch /etc/dovecot/users
-		curl -s -o dovecot.patch https://repo.reqad.net/dovecot.patch	
-		patch -d /etc/dovecot -p 1 -ltN < dovecot.patch
-		rm -f dovecot.patch /etc/dovecot/dh.pem
+		patch -d /etc/dovecot -p 1 -ltN < /usr/local/reqad/scripts/install/config/dovecot.patch
+		rm -f /etc/dovecot/dh.pem
 		openssl dhparam -dsaparam -out /etc/dovecot/dh.pem 4096
 		touch /etc/dovecot/sni.conf
 		usermod -G mail,exim,mysyslog dovecot

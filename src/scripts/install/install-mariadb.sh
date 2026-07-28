@@ -1,6 +1,7 @@
 #!/bin/bash
 
-VERSION='0.0.7 - Mar 23, 2026'
+VERSION='0.0.8 - Jul 28, 2026'
+
 MARIADB_VERSION='10.6'
 PHPMYADMIN_VERSION='5.2.3'
 
@@ -92,7 +93,7 @@ sed -i "s/LimitNOFILE=32768/LimitNOFILE=512231/" /usr/lib/systemd/system/mariadb
 			rm -f phpMyAdmin-${PHPMYADMIN_VERSION}-english.tar.gz
 			chown -R reqad:reqad phpMyAdmin-${PHPMYADMIN_VERSION}-english
 			mv phpMyAdmin-${PHPMYADMIN_VERSION}-english /usr/local/reqad/public_html/phpmyadmin
-	    	curl -s https://repo.reqad.net/phpmyadmin_config.txt > /usr/local/reqad/public_html/phpmyadmin/config.inc.php
+	    	cat /usr/local/reqad/scripts/install/config/phpmyadmin_config.txt > /usr/local/reqad/public_html/phpmyadmin/config.inc.php
 			BLOWFISH=`head -n 10 /dev/urandom | tr -cd 'a-z0-9' | paste -sd - | sed 's/[\t, ]//g' | cut -b -32`
 			sed -i "s/\$cfg\['blowfish_secret'\] = ''/\$cfg['blowfish_secret'] = '${BLOWFISH}'/" /usr/local/reqad/public_html/phpmyadmin/config.inc.php
 			PASSWORD=$(echo "${PASSWORD}" | sed 's"/"\\\/"g')

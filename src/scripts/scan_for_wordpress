@@ -42,7 +42,7 @@ if($locate_output) {
 $results = $db->query('SELECT * FROM accounts');
 $i = 0;
 echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
-echo "│ \033[97m   #   Domain                           WP Version    Title                            Path          Status\033[0m   │\n";
+echo "│ \033[97m   #   Domain                           WP Version    Title                            Path             Status\033[0m   │\n";
 echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤\n";
 
 while ($row = $results->fetchArray()) {
@@ -71,10 +71,10 @@ while ($row = $results->fetchArray()) {
         // Relative path from public_html ('' for root install)
         $rel_path = ($wp_dir === $public_html) ? '' : ltrim(substr($wp_dir, strlen($public_html)), '/');
 
-        $wp_version = trim(shell_exec('/usr/local/bin/wp core version --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
+        $wp_version = trim(shell_exec('/usr/bin/wp core version --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
         if($wp_version == '' || strpos($wp_version, 'Error:') === 0) continue;
 
-        $title = trim(shell_exec('/usr/local/bin/wp option get blogname --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
+        $title = trim(shell_exec('/usr/bin/wp option get blogname --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
 
         $i++;
         echo '│ '.substr(str_pad($i.' ', 5, ' ', STR_PAD_LEFT), 0, 5);

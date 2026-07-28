@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.0.6 - Jul 17, 2026'
+VERSION='0.0.7 - Jul 28, 2026'
 
 # Default php version
 if [ "$PHP_VERSION" == "" ]
@@ -68,10 +68,10 @@ if ! systemctl is-active --quiet nginx; then
 		sed -i 's/\/var\/log\/nginx\/\*\.log/\/var\/log\/nginx\/\*log/' /etc/logrotate.d/nginx
 	    truncate -s 0 /etc/nginx/conf.d/default*
 	    curl -s https://ssl-config.mozilla.org/ffdhe2048.txt > /etc/nginx/dhparams.pem
-	    curl -s https://repo.reqad.net/nginx.txt > /etc/nginx/nginx.conf
-	    #curl -s https://repo.reqad.net/nginx-vhost.txt > /etc/nginx/conf.d/domain.dom.conf.template
-	    #curl -s https://repo.reqad.net/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
-	    curl -s https://repo.reqad.net/nginx-hostname.txt > /etc/nginx/conf.d/${HOSTNAME}.conf
+	    cat /usr/local/reqad/scripts/install/config/nginx.txt > /etc/nginx/nginx.conf
+	    #cat /usr/local/reqad/scripts/install/config/nginx-vhost.txt > /etc/nginx/conf.d/domain.dom.conf.template
+	    #cat /usr/local/reqad/scripts/install/config/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
+	    cat /usr/local/reqad/scripts/install/config/nginx-hostname.txt > /etc/nginx/conf.d/${HOSTNAME}.conf
 		sed -i "s/%HOSTNAME%/${HOSTNAME}/" /etc/nginx/conf.d/${HOSTNAME}.conf
 	) >> ./install_reqad.log 2>&1
     (systemctl enable nginx --now) >> ./install_reqad.log 2>&1
@@ -90,8 +90,8 @@ else
 			sed -i 's/\/var\/log\/nginx\/\*\.log/\/var\/log\/nginx\/\*log/' /etc/logrotate.d/nginx
 	    	truncate -s 0 /etc/nginx/conf.d/default*
 		    curl -s https://ssl-config.mozilla.org/ffdhe2048.txt > /etc/nginx/dhparams.pem
-		    curl -s https://repo.reqad.net/nginx.txt > /etc/nginx/nginx.conf
-		    curl -s https://repo.reqad.net/nginx-hostname.txt > /etc/nginx/conf.d/${HOSTNAME}.conf
+		    cat /usr/local/reqad/scripts/install/config/nginx.txt > /etc/nginx/nginx.conf
+		    cat /usr/local/reqad/scripts/install/config/nginx-hostname.txt > /etc/nginx/conf.d/${HOSTNAME}.conf
 			sed -i "s/%HOSTNAME%/${HOSTNAME}/" /etc/nginx/conf.d/${HOSTNAME}.conf
 			nginx -t
 		) >> ./install_reqad.log 2>&1

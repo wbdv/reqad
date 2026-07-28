@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.0.2 - Jul 17, 2026'
+VERSION='0.0.3 - Jul 28, 2026'
 
 # Default php version
 if [ "$PHP_VERSION" == "" ]
@@ -66,7 +66,7 @@ if ! systemctl is-active --quiet httpd; then
 		dnf -y install httpd mod_ssl mod_ruid2 python3-certbot-apache
 
         if [ ! -f "/etc/letsencrypt/options-ssl-apache.conf" ]; then
-            curl -s https://repo.reqad.net/options-ssl-apache.txt > /etc/letsencrypt/options-ssl-apache.conf
+            cat /usr/local/reqad/scripts/install/config/options-ssl-apache.txt > /etc/letsencrypt/options-ssl-apache.conf
         fi
 
 		if [ "$(grep 'SetHandler server-status' /etc/httpd/conf/httpd.conf | awk {'print $2'})" != "server-status" ]; then

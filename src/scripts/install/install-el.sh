@@ -100,6 +100,20 @@ echo -ne "${NC}"
 if [ "$1" == "--skip-update" ]; then
     echo -e "  ~~~ skip dnf update and packages install ~~~\n";
 else
+	# linux-firmware is a few hundred MB of driver blobs for physical hardware.
+	# A guest (KVM, Xen, VMware, LXC, ...) never loads any of it, so exclude it
+	# from dnf on a VPS: it is the single slowest part of the initial update.
+	VIRT=$(systemd-detect-virt 2>/dev/null || echo none)
+	if [ "${VIRT}" != "none" ] && ! grep -q '^exclude=.*linux-firmware' /etc/dnf/dnf.conf; then
+	    echo -n "Virtual machine (${VIRT}), exclude linux-firmware ";
+	    if grep -q '^exclude=' /etc/dnf/dnf.conf; then
+	        sed -i 's/^exclude=.*/&,linux-firmware/' /etc/dnf/dnf.conf
+	    else
+	        echo "exclude=linux-firmware" >> /etc/dnf/dnf.conf
+	    fi
+	    echo -e "[ ${GREEN}DONE${NC} ]"
+	fi
+
     echo -n "Updating linux rpm                  ";
 	(dnf clean all) >> ./install_reqad.log 2>&1
 	(dnf --refresh makecache && dnf -y update) >> ./install_reqad.log 2>&1
@@ -218,7 +232,15 @@ echo "Note: SSH port changed to ${SSH_PORT} and password authentication is disab
 #=[ csf ]=============================================================================================================
 if [ ! -d "/etc/csf/" ]; then
 echo -n "Install Configserver Firewall (csf) "
-(dnf -y install ipset perl-libwww-perl perl-Net-SSLeay perl-IO-Socket-SSL perl-LWP-Protocol-https perl-GDGraph perl-Math-BigInt perl-Crypt-SSLeay perl-File-Copy perl-File-Find) >> ./install_reqad.log 
+# File::Copy and File::Find have no standalone RPM in EL8's default perl:5.26
+# module stream (they come with perl-interpreter); asking for them there fails
+# with "All matches were filtered out by modular filtering". EL9 ships them as
+# real packages.
+CSF_PERL="ipset perl-libwww-perl perl-Net-SSLeay perl-IO-Socket-SSL perl-LWP-Protocol-https perl-GDGraph perl-Math-BigInt perl-Crypt-SSLeay"
+if [ "${EL}" -ge 9 ]; then
+    CSF_PERL="${CSF_PERL} perl-File-Copy perl-File-Find"
+fi
+(dnf -y install ${CSF_PERL}) >> ./install_reqad.log
 (wget -q https://repo.reqad.net/csf.tgz) >> ./install_reqad.log 2>&1
 (tar xzf csf.tgz) >> ./install_reqad.log 2>&1
 cd csf

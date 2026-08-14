@@ -10,6 +10,29 @@ function log_debug($message) {
 }
 
 /*
+ * The system timezone, as systemd sees it (/etc/localtime symlink target).
+ * PHP falls back to UTC when date.timezone is unset in php.ini, which made the
+ * panel render server times in UTC while systemd (shutdown -r 23:00, cron, ...)
+ * works in local time. Read the real zone instead of trusting php.ini.
+ */
+function system_timezone() {
+	static $tz = null;
+	if($tz !== null) return $tz;
+
+	$link = @readlink('/etc/localtime');                 // ../usr/share/zoneinfo/Europe/Bucharest
+	if($link !== false && ($p = strpos($link, 'zoneinfo/')) !== false) {
+		$tz = substr($link, $p + strlen('zoneinfo/'));
+	} elseif(is_readable('/etc/timezone')) {             // debian-ism, harmless to support
+		$tz = trim(file_get_contents('/etc/timezone'));
+	}
+
+	if(!$tz || !in_array($tz, timezone_identifiers_list())) {
+		$tz = date_default_timezone_get();
+	}
+	return $tz;
+}
+
+/*
  * Sanitize user input. Moved here from defines.php so it lives with the other
  * general helpers. The function_exists() guard avoids a fatal redeclaration on
  * installs whose un-migrated defines.php still defines clean().

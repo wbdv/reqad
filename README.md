@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-EL%208%20%C2%B7%209-2ea043)](https://www.reqad.com/)
-[![Version](https://img.shields.io/badge/version-1.0.43-blue)](https://www.reqad.com/)
+[![Version](https://img.shields.io/badge/version-1.0.44-blue)](https://www.reqad.com/)
 
 **Open source & self-hosted.** Reqad is a free control panel for Rocky Linux, AlmaLinux
 and RHEL - manage hosting, email, DNS, SSL, WordPress and multiple PHP versions from one
@@ -30,6 +30,11 @@ on a single VPS, with predictable costs.
 - **File manager** - account-level, with CodeMirror editor, bulk operations, chmod and
   archive support
 - **More tools** - browser terminal, SSH keys, cron jobs, backups and service control
+
+## Demo
+
+Try Reqad without installing anything - a live demo panel is available at
+[reqad.com/demo](https://reqad.com/demo).
 
 ## Requirements
 

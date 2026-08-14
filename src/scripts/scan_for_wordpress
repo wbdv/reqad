@@ -28,9 +28,12 @@ if($nb_accounts == 0) {
  	exit;
 }
 
-// Collect all wp-config.php paths from locate (fast, uses mlocate db)
+// Collect all wp-config.php paths.
+// Uses find instead of locate: the mlocate db is only as fresh as the last
+// updatedb run (new installs would be invisible for up to a day), and locate
+// is setgid slocate so it filters results by directory readability.
 // Format: /home/<user>/public_html[/<subpath>]/wp-config.php
-$locate_output = shell_exec('locate wp-config.php 2>/dev/null | grep -E "^/home/[^/]+/public_html"');
+$locate_output = shell_exec('find /home/*/public_html -maxdepth 4 -type f -name wp-config.php 2>/dev/null');
 $locate_paths = [];
 if($locate_output) {
     foreach(explode("\n", trim($locate_output)) as $p) {
@@ -71,10 +74,10 @@ while ($row = $results->fetchArray()) {
         // Relative path from public_html ('' for root install)
         $rel_path = ($wp_dir === $public_html) ? '' : ltrim(substr($wp_dir, strlen($public_html)), '/');
 
-        $wp_version = trim(shell_exec('/usr/bin/wp core version --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
+        $wp_version = trim(shell_exec('/usr/local/bin/wp core version --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
         if($wp_version == '' || strpos($wp_version, 'Error:') === 0) continue;
 
-        $title = trim(shell_exec('/usr/bin/wp option get blogname --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
+        $title = trim(shell_exec('/usr/local/bin/wp option get blogname --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
 
         $i++;
         echo '│ '.substr(str_pad($i.' ', 5, ' ', STR_PAD_LEFT), 0, 5);

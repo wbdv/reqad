@@ -66,7 +66,7 @@
               </div>
               <div>
                 <h4 class="alert-title">Reboot Scheduled</h4>
-                <div class="text-muted">Reboot scheduled for <?=date('M j, Y H:i', $reboot_date);?>. Timezone: <?=date('e');?>. You can <a href="/cancel-reboot" style="color:#f76707">click here to cancel</a>.</div>
+                <div class="text-muted">Reboot scheduled for <?=date('M j, Y H:i T', $reboot_date);?>. Timezone: <?=date('e', $reboot_date);?>. You can <a href="/cancel-reboot" style="color:#f76707">click here to cancel</a>.</div>
               </div>
             </div>
           </div>

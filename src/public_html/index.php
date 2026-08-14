@@ -8,6 +8,11 @@
     include('defines.php');
     include('modules/functions.php');
 
+    // Render every date() in the panel in the server's own timezone. php.ini
+    // often has no date.timezone (PHP then assumes UTC), which made scheduled
+    // times display in a different zone than the one systemd acted on.
+    date_default_timezone_set(system_timezone());
+
     // Discover add-on modules (public_html/plugins/*/plugin.php). Must run before
     // ajax.php so plugin ajax handlers are registered when its dispatch tail runs.
     plugins_load();

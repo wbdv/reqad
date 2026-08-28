@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Reqad website & documentation
+    url: https://reqad.com/
+    about: Check the docs and FAQ before opening an issue.
+  - name: Live demo
+    url: https://reqad.com/demo
+    about: Try Reqad in the browser to confirm the behavior before reporting it.

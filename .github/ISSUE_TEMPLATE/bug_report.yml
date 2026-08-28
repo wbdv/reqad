@@ -1,0 +1,109 @@
+name: Bug report
+description: Report something that isn't working as expected in Reqad
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the details below —
+        the more specific you are, the faster this can be diagnosed.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: Tell us what went wrong...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce the issue?
+      placeholder: |
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Paste any relevant output, e.g. from `/var/tmp/reqad-install/install_reqad.log`
+        or the panel's error log. This will be auto-formatted as code, no backticks needed.
+      render: shell
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Rocky Linux 8
+        - Rocky Linux 9
+        - AlmaLinux 8
+        - AlmaLinux 9
+        - RHEL 8
+        - RHEL 9
+        - Other (specify in description)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: webserver
+    attributes:
+      label: Web server template
+      options:
+        - nginx + php-fpm
+        - apache + mod_php
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: php
+    attributes:
+      label: PHP version
+      options:
+        - "7.4"
+        - "8.2"
+        - "8.3"
+        - "8.4"
+        - "8.5"
+        - Not applicable
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mailstack
+    attributes:
+      label: Mail stack installed?
+      options:
+        - "Yes (Exim/Dovecot/Roundcube)"
+        - "No"
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Reqad version
+      description: Shown in the panel footer, or the `version` badge on the repo
+      placeholder: e.g. 1.0.44
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues to make sure this hasn't already been reported
+          required: true
+        - label: I'm running a fresh/clean EL8 or EL9 install (not a modified/hardened server)
+          required: false

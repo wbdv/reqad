@@ -20,9 +20,9 @@ $successmsg = '';
 
 #echo '<pre>'; print_r($_POST); exit;
 
-if(!preg_match('/[A-Za-z0-9\+\-_]{1,16}/', $user)) {
+if(!valid_email_user($user)) {
 	$errmsg = "Error: Email must be unique, 1-64 characters long, contain letters, numbers, dashes and underscores.";
-} else if(!preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+} else if(!valid_domain($domain)) {
 	$errmsg = "Error: Domain name is wrong, please check what you selected.";
 } else {
 	$domains = explode("\n", trim(shell_exec("sudo ls -1 /etc/exim/domains/")));
@@ -51,6 +51,10 @@ if($errmsg == '') {
 	shell_exec('sudo sed -i \'/^'.$email.':/d\' /etc/dovecot/users');
 	shell_exec('sudo sed -i \'/^'.$user.'$/d\' /etc/exim/domains/'.$domain);
 	shell_exec('sudo rm -rf /home/'.$sysuser.'/mail/'.$domain.'/'.$user);
+	/* The personal Sieve script goes with the maildir above; the autoresponder
+	   script and row do not, so they are removed explicitly. */
+	foreach (ef_purge_mailbox($db, $email) as $line)
+		error_log(date("Y-m-d H:i:s")." ".$_SERVER['USER']." delete email $email: $line\n", 3, '../log/route_log');
 	$successmsg = "Email account $email was deleted.";
 }
 

@@ -1,10 +1,20 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 /**
  * Reqad — manage_autoresponders.php
  * Runs every 5 minutes via cron (as root).
  * Activates or deactivates autoresponder filter files based on date_from / date_to.
+ *
+ * The shebang pins Reqad's own php.ini: the stock php82 CLI ini disables exec(),
+ * which ef_helper() needs to reach the privileged Sieve helper.
+ *
+ * This is also what migrates a server off the old exim backend — the rendering
+ * and the placement of the live script are autoresponder_apply()'s business, and
+ * it drops the stale /etc/exim/autoreply file on the way past.
  */
+
+require_once '/usr/local/reqad/public_html/defines.php';
+require_once '/usr/local/reqad/public_html/modules/functions.php';
 
 $db_path = '/usr/local/reqad/db/reqad.db';
 if (!is_file($db_path)) {
@@ -16,47 +26,27 @@ $today = date('Y-m-d');
 
 $results = $db->query('SELECT * FROM autoresponders');
 while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
-    $user      = $row['user'];
-    $domain    = $row['domain'];
-    $subject   = $row['subject'];
-    $message   = $row['message'];
-    $date_from = $row['date_from'];
-    $date_to   = $row['date_to'];
+    $user   = $row['user'];
+    $domain = $row['domain'];
 
-    $msg_file = '/etc/exim/autoreply/' . $domain . '/' . $user;
+    $should_be_active = ($row['date_from'] == '' || $row['date_from'] <= $today)
+                     && ($row['date_to']   == '' || $row['date_to']   >= $today);
 
-    $should_be_active = ($date_from == '' || $date_from <= $today)
-                     && ($date_to   == '' || $date_to   >= $today);
+    $is_active = autoresponder_is_active($user, $domain);
 
-    $is_active = is_file($msg_file);
-
+    /* A mailbox left over from the exim backend counts as inactive above, so
+       the write below happens on the first run after the switch and migrates it. */
     if ($should_be_active && !$is_active) {
-        $msg_dir  = '/etc/exim/autoreply/' . $domain;
-        $tmp_file = tempnam(sys_get_temp_dir(), 'ar_');
-
-        // Sieve vacation filter — dedup handled automatically by Exim via sieve_vacation_directory
-        // File named after local part (no extension) so dsearch can detaint it
-        $subj_escaped = str_replace(['\\', '"'], ['\\\\', '\\"'], $subject);
-        $content  = "# Sieve filter\n";
-        $content .= "require [\"vacation\"];\n";
-        $content .= "vacation :days 1 :subject \"" . $subj_escaped . "\" text:\n";
-        foreach (explode("\n", $message) as $line) {
-            $content .= ($line === '.' ? '..' : $line) . "\n";
-        }
-        $content .= ".\n;\ndiscard;\n";
-
-        file_put_contents($tmp_file, $content);
-        shell_exec('sudo mkdir -p ' . escapeshellarg($msg_dir));
-        shell_exec('sudo chown exim:mail ' . escapeshellarg($msg_dir));
-        shell_exec('sudo chmod 750 ' . escapeshellarg($msg_dir));
-        shell_exec('sudo mv ' . escapeshellarg($tmp_file) . ' ' . escapeshellarg($msg_file));
-        shell_exec('sudo chown exim:mail ' . escapeshellarg($msg_file));
-        shell_exec('sudo chmod 640 ' . escapeshellarg($msg_file));
-        echo date('Y-m-d H:i:s') . " activated autoresponder for $user@$domain\n";
+        $err = autoresponder_apply($user, $domain, $row['subject'], $row['message']);
+        echo date('Y-m-d H:i:s') . ($err === ''
+            ? " activated autoresponder for $user@$domain\n"
+            : " FAILED to activate autoresponder for $user@$domain: $err\n");
 
     } elseif (!$should_be_active && $is_active) {
-        shell_exec('sudo rm -f ' . escapeshellarg($msg_file));
-        echo date('Y-m-d H:i:s') . " deactivated autoresponder for $user@$domain\n";
+        $err = autoresponder_remove($user, $domain);
+        echo date('Y-m-d H:i:s') . ($err === ''
+            ? " deactivated autoresponder for $user@$domain\n"
+            : " FAILED to deactivate autoresponder for $user@$domain: $err\n");
     }
 }
 

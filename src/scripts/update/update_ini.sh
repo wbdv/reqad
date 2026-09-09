@@ -80,6 +80,7 @@ add_key_if_missing "reqad" "root_access" "1"
 add_key_if_missing "reqad" "wptoolkit"   "1"
 add_key_if_missing "reqad" "transfer"    "0"
 add_key_if_missing "reqad" "filemanager" "1"
+add_key_if_missing "reqad" "addon_domains" "0"
 
 # ── [systemd] list entries ────────────────────────────────────────────────────
 

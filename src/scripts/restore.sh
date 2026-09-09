@@ -19,7 +19,7 @@ ARCHIVE="$1"
 TOKEN="$2"
 
 REQAD='/usr/local/reqad'
-SQLITE='/usr/local/bin/sqlite3 -batch -noheader -list'
+SQLITE='/usr/bin/sqlite3 -init /dev/null -batch -noheader -list'
 DB_FILE="${REQAD}/db/reqad.db"
 MSG_DB="${REQAD}/db/messages.db"
 MYSQL='sudo mysql --defaults-extra-file=/root/.my.cnf'
@@ -120,6 +120,19 @@ if [ -d "${R}/databases" ]; then
 		${MYSQL} "${db}" < "${f}"
 	done
 	[ -f "${R}/databases/_grants.sql" ] && ${MYSQL} < "${R}/databases/_grants.sql"
+
+	# backup_remote.sh leaves databases over --db-max-mb out of the archive and
+	# streams their dumps to the backup server instead. The empty database and
+	# its grants have just been recreated above, so only the data is missing —
+	# say so loudly rather than reporting a complete restore.
+	if [ -s "${R}/databases/_streamed_separately.txt" ]; then
+		echo -e "${RED}── databases restored EMPTY (dumps are on the backup server) ──${NC}"
+		while read -r bigdb; do
+			[ -n "${bigdb}" ] || continue
+			echo "  ${bigdb}   import with:  zcat ${bigdb}.sql.gz | mysql ${bigdb}"
+		done < "${R}/databases/_streamed_separately.txt"
+		echo "  (databases/${USER}/<db>.sql.gz in the same dated remote backup dir)"
+	fi
 fi
 
 # ===========================================================================
@@ -177,13 +190,42 @@ if [ -d "${R}/email" ]; then
 		done < "${R}/email/dovecot-users"
 		echo "restored dovecot mailbox auth lines"
 	fi
-	# panel emails rows (email|status|created_at)
-	if [ -s "${R}/email/_email_accounts.txt" ]; then
-		while IFS='|' read -r em st cr; do
-			[ -z "${em}" ] && continue
-			${SQLITE} "${DB_FILE}" "INSERT OR IGNORE INTO emails (email, disk_usage, disk_quota, status, created_at) VALUES ('${em}', 0, 0, '${st:-active}', '${cr}')"
-		done < "${R}/email/_email_accounts.txt"
+
+	# ---- email filters: domain tier ---------------------------------------
+	# Per-account Sieve scripts need nothing here — ~/sieve and ~/.dovecot.sieve
+	# live inside the maildir and came back with homedir/mail/ above.
+	if [ -s "${R}/email/email_filters.sql" ]; then
+		${SQLITE} "${DB_FILE}" < "${R}/email/email_filters.sql" 2>/dev/null
+		echo "restored domain email filter rows"
 	fi
+	# Install the rendered script through ef-helper rather than copying it: the
+	# helper writes it dovecot-owned and recompiles it AT ITS FINAL PATH, which a
+	# .svbin records and a copied binary would get wrong.
+	if [ -s "${R}/email/sieve-domain.sieve" ]; then
+		if sudo "${REQAD}/scripts/email-filters/ef-helper.sh" system-put domain "${DOMAIN}" < "${R}/email/sieve-domain.sieve" >/dev/null 2>&1; then
+			echo "restored domain Sieve filter script"
+		else
+			echo "WARNING: domain Sieve script failed to compile — the filter rows were"
+			echo "         restored, but no script is active. Re-save the filters in the panel."
+		fi
+	fi
+
+	# ---- autoresponders ---------------------------------------------------
+	if [ -s "${R}/email/autoresponders.sql" ]; then
+		${SQLITE} "${DB_FILE}" < "${R}/email/autoresponders.sql" 2>/dev/null
+		# Re-render the live artefact from the rows just restored. This is the same
+		# reconciliation cron runs every 5 minutes, so the autoresponder works
+		# immediately instead of up to 5 minutes later — and it renders for THIS
+		# machine's backend (Pigeonhole vacation or legacy exim), not the source
+		# machine's. Date-scoped responders outside their window stay dormant.
+		sudo "${REQAD}/scripts/manage_autoresponders.php" >/dev/null 2>&1
+		echo "restored autoresponders"
+	fi
+	# The panel's `emails` table is deliberately NOT restored. Since db/1032.sql it
+	# is only a du -skm cache keyed by address, rebuilt on demand from
+	# /etc/dovecot/users — the mailbox auth lines restored just above are the real
+	# inventory. Archives written before 1032 still carry email/_email_accounts.txt;
+	# it is ignored, and its disk_quota/status/created_at columns no longer exist.
 fi
 
 # ===========================================================================

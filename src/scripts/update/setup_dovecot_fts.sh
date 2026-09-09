@@ -182,6 +182,32 @@ fts_autoindex = yes
 # mail work without a manual full reindex.
 fts_search_add_missing = yes
 
+# Never answer a search by reading the messages themselves.
+#
+# The default (yes) is a silent trapdoor: when the index cannot answer a query
+# for ANY reason, Dovecot quietly falls back to opening and scanning every
+# message in the mailbox. Search still returns correct results, so nothing is
+# ever logged and nothing looks broken — it is just slow, and on a mailbox whose
+# old mail has been compressed (scripts/compress_old_mail) every one of those
+# reads is a gunzip. An 11k-message INBOX with a complete, healthy index took
+# tens of seconds per search this way; setting this to 'no' made the same search
+# instant. 'doveadm fts flatcurve stats' cannot detect this — the index is fine,
+# it is the query path that is not using it.
+#
+# With 'no' a failed lookup is an ERROR the user and the log both see, which is
+# the behaviour we want: a broken index gets fixed rather than hidden behind a
+# slow search. In 2.3 this was 'fts_enforced = yes'; that name is a hard config
+# error in 2.4 and Dovecot refuses to start.
+#
+# This pairs with fts_search_add_missing above: a folder that has never been
+# indexed is still indexed at search time rather than failing, so 'no' does not
+# make unindexed mail unsearchable — it only removes the read-through for
+# lookups that actually ERROR. Building the indexes up front is still worth it,
+# so nobody pays for that first search:
+#     doveadm index -A '*'          # blocks until done
+#     doveadm index -A -q '*'       # queues it for the indexer instead
+fts_search_read_fallback = no
+
 # Don't try to index enormous messages — one 200MB attachment would otherwise
 # stall the indexer worker.
 fts_message_max_size = 50M

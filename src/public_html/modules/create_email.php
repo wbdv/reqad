@@ -17,9 +17,9 @@ $successmsg = '';
 
 #echo '<pre>'; print_r($_POST); exit;
 
-if(!preg_match('/[A-Za-z0-9\+\-_]{1,16}/', $user)) {
+if(!valid_email_user($user)) {
 	$errmsg = "Error: Email must be unique, 1-64 characters long, contain letters, numbers, dashes and underscores.";
-} else if(!preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+} else if(!valid_domain($domain)) {
 	$errmsg = "Error: Domain name is wrong, please check what you selected.";
 } else {
 	$domains = explode("\n", trim(shell_exec("sudo ls -1 /etc/exim/domains/")));
@@ -40,16 +40,12 @@ if($errmsg == '') {
 	}
 }
 
-/*
-// TODO save email accounts in sqlite database and check there instead
-
-if($errmsg == '') {
-        $results = $db->query('SELECT * FROM accounts WHERE user="'.$user.'"');
-        if ($row = $results->fetchArray()) {
-            $errmsg =  "Error: Username already exists (UID=".$row["id"]."). Please choose a different one.";
-        }
-}
-*/
+/* The `emails` table is NOT an inventory and this must not become one: it is a
+   per-mailbox disk-usage CACHE (db/1032.sql), refreshed by mailbox_usage_list().
+   The mailbox inventory is /etc/dovecot/users, which is also what delivery and
+   auth read — checking a copy in sqlite could disagree with the file that
+   actually decides whether an address exists. The duplicate checks above read
+   /etc/exim/domains and /etc/dovecot/users for exactly that reason. */
 
 if($errmsg == '') {
     // TODO check password strength

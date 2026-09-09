@@ -15,14 +15,15 @@ CREATE TABLE `accounts` (
     unique (`id`)
 );
 
+-- Cache of the per-mailbox du -skm figure, keyed by address. NOT an inventory:
+-- the list of mailboxes is /etc/dovecot/users (mailbox_list() in functions.php),
+-- so a row for a mailbox that no longer exists is inert. A missing row means
+-- "not measured yet" and the caller measures live and writes back. See
+-- db/1032.sql for why the old id/disk_quota/status/created_at columns went away.
 CREATE TABLE `emails` (
-	`id` integer not null primary key autoincrement,
-	`email` varchar(255) not null,
-	`disk_usage` INTEGER,
-	`disk_quota` INTEGER,
-	`status` varchar(10) NOT NULL,
-    `created_at` datetime not null default CURRENT_TIMESTAMP,
-    unique (`id`)
+    email      TEXT NOT NULL PRIMARY KEY,
+    disk_usage INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME
 );
 
 CREATE TABLE `settings` (
@@ -48,7 +49,6 @@ CREATE TABLE `wordpress` (
 
 CREATE UNIQUE INDEX "accounts_index_2" on "accounts"("user" ASC);
 CREATE UNIQUE INDEX "accounts_index_3" on "accounts"("domain" ASC);
-CREATE UNIQUE INDEX "emails_index_2" on "emails"("email" ASC);
 CREATE UNIQUE INDEX "wordpress_index_2" on "wordpress"("user" ASC);
 CREATE UNIQUE INDEX "wordpress_index_3" on "wordpress"("domain" ASC);
 COMMIT;

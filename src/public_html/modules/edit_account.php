@@ -95,7 +95,7 @@ while ($row = $results->fetchArray()) {
 }
 #echo "<pre>"; print_r($settings);exit;
 
-if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+if(valid_domain($domain)) {
     $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
     if ( !$results->fetchArray()) {
         $errmsg = "Error: Domain name does not exists on server.";
@@ -108,14 +108,14 @@ if($errmsg == '') {
     /* if(in_array($user, array('root', 'reqad', 'test', 'bin', 'daemon', 'adm', 'lp', 'sync', 'shutdown', 'halt', 'mail', 'operator', 'games', 'ftp', 'nobody', 'systemd-network', 'dbus', 'polkitd', 'sshd', 'postfix', 'chrony', 'reqad', 'apache', 'cjdns', 'vnstat', 'postgres', 'redis', 'awx', 'nginx', 'tss'))) {
         $errmsg =  "Error: Username already exists. Please choose a distinct one.";
     } else */
-	if(preg_match('/[a-z]+[a-z0-9]{1,7}/', $user)) {
+	if(valid_username($user)) {
         $results = $db->query('SELECT * FROM accounts WHERE user="'.$user.'"');
         if ($row = $results->fetchArray()) {
         } else {
             $errmsg =  "Error: User does not exists on server.";
         }
     } else {
-		$errmsg =  "Error: Username should contain only lowercase letters and numbers.";
+		$errmsg =  "Error: Username must be 2-16 characters, lowercase letters and numbers only, starting with a letter.";
 	}
 }
 
@@ -123,9 +123,13 @@ if($errmsg == '') {
     // TODO check password strength
     if(strlen($password)<8 && strlen($password)>0) {
         $errmsg =  "Error: Password should be at least 8 characters long.";
-		if(strpos($password, ':') !== false || strpos($password, '"') !== false || strpos($password, "'") !== false) {
-	        $errmsg =  "Error: Password cannot contains : \" or '";
-		}
+    }
+    /* `:` and newlines are the chpasswd record separators, so they are still
+       rejected. Quotes used to be banned too because the password was pasted
+       into a shell string; set_system_password() writes to stdin now, so they
+       are safe and no longer restricted. */
+    else if(strpos($password, ':') !== false || strpos($password, "\n") !== false || strpos($password, "\r") !== false) {
+        $errmsg =  "Error: Password cannot contain a colon (:) or a line break.";
     }
 }
 
@@ -147,7 +151,8 @@ if($errmsg == '') {
     #$password = str_replace('"', '\"', $password);
     #$password = str_replace("'", "\'", $password);
     if(strlen($password)>0) {
-    	$output = shell_exec("echo '$user:$password' | sudo chpasswd");
+    	if(!set_system_password($user, $password))
+			$errmsg = "Error: Failed to set the account password.";
 	}
 
 	// change php version/handler, if needed

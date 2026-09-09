@@ -89,15 +89,10 @@
           </div>
 <? } ?>
 <?
-     $results = $db->query('SELECT domain FROM accounts');
-	 $sslcert = array();
-     while ($row = $results->fetchArray()) {
-		$sslcert[] = $row['domain'];
-	}
-	
-	$hostname = trim(`hostname`);
-	if(!in_array($hostname, $sslcert))
-		$sslcert[] = $hostname;
+	/* Hosting accounts + addon domains + this server's hostname. Addon domains
+	   have no accounts row, so an accounts-only query left them off the page
+	   and out of the add/replace picker below. */
+	$sslcert = ssl_domain_list($db, $ini);
 
 /*		
 	foreach($certbot_certs as $certbot_domain) {
@@ -109,8 +104,6 @@
 	}
 */		
 
-	sort($sslcert);
-	#ksort($sslcert);
 	#echo '<pre>'; print_r($sslcert); exit;
 ?>
 

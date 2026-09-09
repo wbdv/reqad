@@ -3,57 +3,38 @@
 
 	$items = 10;
 
-	$output = shell_exec('sudo cat /etc/dovecot/users | sort | awk -F\':\' {\'print $1 " " $6\'}');
-	$emails = array();
-	if(trim($output)!='')
-   		$emails = explode("\n", trim($output));
-	#echo '<pre>'; print_r($emails); exit;
-	$nb_accounts = count($emails);
+	// Mailbox inventory comes from /etc/dovecot/users; the `emails` table is only
+	// a cache of the du -skm figure and never an inventory (db/1032.sql). Rows
+	// measured within MAILBOX_USAGE_TTL are reused, anything else is measured now
+	// and written back, so the cache warms itself without waiting for the cron.
+	$emails2     = mailbox_usage_list($db);
+	$nb_accounts = count($emails2);
+
+	// Personal Sieve rule count per mailbox, for the Filters column. One helper
+	// call for the whole table (see sieve_user_get_all); a mailbox with no script
+	// is simply absent. null means the script is there but cannot be shown as a
+	// list of rules — the filters page falls back to a raw editor for those.
+	$filter_counts = array();
+	foreach (sieve_user_get_all() as $mb => $src) {
+		$parsed = sieve_parse_script($src, false);
+		$filter_counts[$mb] = ($parsed === false) ? null : count($parsed);
+	}
 
 	include('templates/header.php');
 
+	/* One check for the whole page: each row's Webmail button is only
+	   rendered when the dovecot master user is actually set up. */
+	$webmail_autologin = webmail_autologin_enabled();
 
-#	$results = $db->query('SELECT count(*) as nb FROM emails');
-#	$row = $results->fetchArray();
-#	$nb_accounts = (int)($row["nb"]);
-
-	$disk_usage = array();
-	$results = $db->query('SELECT email, disk_usage FROM emails');
-	while ($row = $results->fetchArray()) {
-		$email = $row['email'];
-		$disk_usage[$email] = $row['disk_usage'];
+	/* Domains offering email, plus each account's total disk usage in MB — the
+	   Usage column shows every mailbox as a share of its own account's total. */
+	$domains     = [];
+	$acct_usage  = [];
+	$res = $db->query("SELECT domain, disk_usage FROM accounts WHERE has_email=1 ORDER BY domain");
+	while ($drow = $res->fetchArray(SQLITE3_ASSOC)) {
+		$domains[] = $drow['domain'];
+		$acct_usage[strtolower($drow['domain'])] = (float)$drow['disk_usage'];
 	}
-	#print_r($disk_usage); exit;
-
-	$emails2 = array();
-	foreach($emails as $email) {
-		$email2 = explode(' ', $email);
-		$email = $email2[0];
-		$email_path = $email2[1];
-		if(isset($disk_usage[$email])) {
-			$disk_usage2 = $disk_usage[$email];
-		} else {
-			$disk_usage2 = trim(shell_exec('sudo du -skm '.$email_path.' | awk {\'print $1\'}'));
-		}
-		$emails2[] = array('email' => $email, 'path' => $email_path, 'disk_usage' => $disk_usage2);
-	}
-
-/* initial data
-	$db->query("DELETE FROM emails");
-	foreach($emails as $email) {
-		$email2 = explode(' ', $email);
-		$email = $email2[0];
-		$email_path = $email2[1];
-		$disk_usage = (int)(trim(shell_exec('sudo du -skm '.$email_path.' | awk {\'print $1\'}')));
-		echo("INSERT INTO emails VALUES (null, '$email', $disk_usage, null, 'active', DATE())<br>");
-		$db->query("INSERT INTO emails VALUES (null, '$email', $disk_usage, null, 'active', DATE())");
-	}
-	exit;
-*/
-
-	$domains = [];
-	$res = $db->query("SELECT domain FROM accounts WHERE has_email=1 ORDER BY domain");
-	while ($drow = $res->fetchArray(SQLITE3_ASSOC)) $domains[] = $drow['domain'];
    	
 ?>
           <!-- Page title -->
@@ -109,6 +90,7 @@
                         <th style="background-color:#DEF;">EMAIL <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' width='16' height='16'><path fill='none' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' stroke-width='1' d='M5 10l3 -3l3 3'/></svg></th>
                         <th class="w-10" style="background-color:#DEF;">Usage</th>
                         <th style="background-color:#DEF;">Status</th>
+                        <th style="background-color:#DEF;">Filters</th>
                         <th class="w-5" style="background-color:#DEF;"></th>
                       </tr>
                       <tr>
@@ -119,7 +101,7 @@
                             <button id="email-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
                           </div>
                         </td>
-                        <td colspan="3" style="padding:4px 8px;"></td>
+                        <td colspan="4" style="padding:4px 8px;"></td>
                       </tr>
                     </thead>
                     <tbody>
@@ -128,7 +110,7 @@
 						foreach($emails2 as $email) {
 							$i++;
                     ?>
-                      <tr class="email-row" data-email="<?=$email['email'];?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?>">
+                      <tr class="email-row" data-email="<?=$email['email'];?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?><?=$email['enabled']===false?'background-color:#FF000015;':'';?>">
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
@@ -145,22 +127,76 @@
                           </div>
                         </td>
                         <td data-label="Usage">
+						<?	$mb_used   = (float)$email['disk_usage'];
+							$dom       = strtolower(substr(strrchr($email['email'], '@'), 1));
+							$acct_tot  = isset($acct_usage[$dom]) ? $acct_usage[$dom] : 0;
+							$mail_pct  = $acct_tot > 0 ? round($mb_used * 100 / $acct_tot, 1) : 0; ?>
                           <div class="d-flex">
-                            <div class="flex-fill">
-								<?=(int)($email['disk_usage'])>0?(int)($email['disk_usage']).' MB':'-';?>
-                            </div>
+                            <div><strong><?=$mb_used>0?human_mb($mb_used):'-';?></strong>
+							<? if($acct_tot > 0) { ?><span class="text-muted">(<?=$mail_pct;?>%)</span><? } ?></div>
+                          </div>
+                          <div class="progress progress-xs">
+                            <div class="progress-bar bg-success" role="progressbar" style="width: <?=min($mail_pct, 100);?>%"></div>
                           </div>
                         </td>
                         <td class="text-muted" data-label="Status">
-                          <? #if($row["status"] == 'active') { ?>
-                          <span class="badge bg-success">Active</span>
-                          <? /* } else if($row["status"] == 'suspended') { ?>
-                          <span class="badge bg-danger">Suspended</span>
-                          <? } */ ?>
+                        <? if($email['enabled']) { ?>
+                          <span class="badge bg-green-lt border">Active</span>
+                        <? } else { ?>
+                          <span class="badge bg-red-lt border" title="Login is disabled: no IMAP/POP3 or SMTP AUTH. Mail is still delivered to this mailbox.">Disabled</span>
+                        <? } ?>
+                        </td>
+                        <td data-label="Filters">
+                          <?	$fc = array_key_exists($email['email'], $filter_counts)
+							      ? $filter_counts[$email['email']] : 0; ?>
+                          <a href="/email-filters/?scope=account&amp;target=<?=urlencode($email['email']);?>"
+                             class="btn btn-white btn-md" title="<?=$fc === null
+                                ? 'This mailbox has a Sieve script Reqad cannot show as a list of rules'
+                                : 'Edit this mailbox\'s own filters';?>">Filters
+                            <? if($fc === null) { ?>
+                              <span class="badge bg-yellow text-yellow-fg ms-2">!</span>
+                            <? } else if($fc > 0) { ?>
+                              <span class="badge bg-blue text-blue-fg ms-2"><?=$fc;?></span>
+                            <? } else { ?>
+                              <span class="badge bg-default text-default-fg ms-2">0</span>
+                            <? } ?>
+                          </a>
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" <? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Change Password</a>
+                            <? if($webmail_autologin) { ?>
+                            <a href="#" class="btn btn-white btn-md wm-login" data-email="<?=$email['email'];?>" title="Open this mailbox in webmail" style="color:#206bc4;border:1px solid #206ac44e">
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#206ac4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-mail-spark">
+	<path stroke="none" d="M0 0h24v24H0z" fill="none" />
+	<path d="M19 22.5a4.75 4.75 0 0 1 3.5 -3.5a4.75 4.75 0 0 1 -3.5 -3.5a4.75 4.75 0 0 1 -3.5 3.5a4.75 4.75 0 0 1 3.5 3.5" />
+	<path d="M11.5 19h-6.5a2 2 0 0 1 -2 -2v-10a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v5" />
+	<path d="M3 7l9 6l9 -6" />
+</svg>
+<?php /* roundcube logo
+                              <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="20" height="20"
+                               viewBox="9.14 141.8 573.65 573.65" aria-hidden="true" focusable="false">
+                                <polygon fill="#37BEFF" fill-rule="evenodd" clip-rule="evenodd" points="582.79,549.77 295.96,384.1 295.96,207.27 582.79,372.95"/>
+                                <polygon fill="#404F54" fill-rule="evenodd" clip-rule="evenodd" points="9.14,549.77 295.96,384.1 295.96,207.27 9.14,372.95"/>
+                                <path fill="#CCCCCC" fill-rule="evenodd" clip-rule="evenodd" d="M295.96,141.8c109.56,0,198.41,88.85,198.41,198.41c0,109.56-88.85,198.41-198.41,198.41 c-109.56,0-198.41-88.85-198.41-198.41C97.55,230.65,186.4,141.8,295.96,141.8"/>
+                                <path fill="#E5E5E5" fill-rule="evenodd" clip-rule="evenodd" d="M295.96,141.8c109.6,0,198.48,88.85,198.48,198.41c0,109.56-88.88,198.41-198.48,198.41 c-62.91-42.34-88.94-127.64-88.94-198.3S233.05,184.22,295.96,141.8"/>
+                                <polygon fill="#37BEFF" fill-rule="evenodd" clip-rule="evenodd" points="582.79,372.95 295.96,538.62 295.96,715.45 582.79,549.77"/>
+                                <polygon fill="#404F54" fill-rule="evenodd" clip-rule="evenodd" points="9.14,372.95 295.96,538.62 295.96,715.45 9.14,549.77"/>
+                              </svg>
+*/ ?> 
+							  Webmail
+                            </a>
+                            <? } ?>
+                            <a href="/?action=ajax-mobileconfig&amp;email=<?=urlencode($email['email']);?>"
+                               class="btn btn-white btn-md" title="Download an Apple Mail setup profile for iPhone, iPad and Mac. It carries no password - the device asks for it on install.">
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-device-mobile">
+	<path stroke="none" d="M0 0h24v24H0z" fill="none" />
+	<path d="M6 5a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-8a2 2 0 0 1 -2 -2v-14z" />
+	<path d="M11 4h2" />
+	<path d="M12 17v.01" />
+</svg>
+							  Apple Profile
+                            </a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" data-bs-enabled="<?=$email['enabled']?1:0;?>">Change Password</a>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-email" data-bs-email="<?=$email['email'];?>">Delete</a>
                           </div>
                         </td>
@@ -286,7 +322,7 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body">
-            <p>You can change the password for this email account.</p>
+            <p>You can change the password for this email account, or disable it.</p>
             <div class="mb-3">
               <label class="form-label">Email address:</label>
               <span id="email-title2" class="input-group-text"></span>
@@ -304,7 +340,7 @@
               <div class="col-lg-6">
                 <div class="mb-3" id="pwd-container2">
                   <label class="form-label">New password:</label>
-                  <input type="text" class="form-control" name="password" id="password2" autocomplete="off" aria-describedby="passwordHelpBlock" required pattern="[^ ]{8,24}" maxlength="24">
+                  <input type="text" class="form-control" name="password" id="password2" autocomplete="off" aria-describedby="passwordHelpBlock" pattern="[^ ]{8,24}" maxlength="24">
                   <div class="pwstrength_viewport_progress"></div>
                 </div>
               </div>
@@ -322,6 +358,20 @@
                 Please enter a password.
               </div>
               </div>
+
+            <div class="mb-1" style="margin-top:20px;">
+              <label class="form-check form-switch d-inline-flex align-items-center mb-0" style="cursor:pointer">
+                <input class="form-check-input" type="checkbox" name="login_enabled" id="login-enabled" value="1" checked style="margin-right:10px;margin-bottom:1px;">
+                <span id="login-enabled-label" class="form-check-label" style="cursor: pointer;line-height:21px;">Email account is</span>
+                <span id="login-enabled-state" class="badge bg-green-lt border ms-2">Active</span>
+              </label>
+              <small class="form-text text-muted" style="display:block;">
+                Set to Disabled to disable the password: the account can no longer be used to
+                read mail from a mail client or webmail, and cannot send mail through the server.
+                Incoming mail is still delivered to the mailbox, and the password is kept -
+                turning it back on restores access.
+              </small>
+            </div>
           </div>
           <div class="modal-footer">
             <a href="#" class="btn btn-link link-secondary" data-bs-dismiss="modal">
@@ -484,12 +534,26 @@ jQuery(document).ready(function () {
 		$('#email-title').html(email);
 		$('#email-title2').html(email);
 		$('#password2').val('');
-	<? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>
-		var disk_quota = button.getAttribute('data-bs-disk-quota')
-		$('#diskquota-edit').val(disk_quota);
-		$('#diskquota-edit').next().html(disk_quota + ' MB');
-	<? } ?>
+		// The toggle reflects what is on file; the password field stays empty and
+		// optional, so the form can be submitted to flip the toggle alone.
+		$('#login-enabled').prop('checked', button.getAttribute('data-bs-enabled') !== '0')
+		                   .trigger('change');
+	// No per-mailbox quota is stored anywhere (the disk_quota block in
+	// edit_email.php is commented out and the column went with db/1032.sql), so
+	// the slider keeps its markup default instead of loading a value that does
+	// not exist. It previously read $row["disk_quota"], which was undefined here.
   	});
+
+	/* The switch is labelled with the object ("Email account"); the word next to
+	   it carries the state, in the same Active/Disabled wording as the Status
+	   column, so the label reads correctly in both positions. */
+	$('#login-enabled').on('change', function() {
+		var on = $(this).is(':checked');
+		$('#login-enabled-state')
+			.text(on ? 'Active' : 'Disabled')
+			.attr('class', 'badge ms-2 ' + (on ? 'bg-green-lt border' : 'bg-red-lt border'));
+		$('#login-enabled-label').attr('class', (on ? '' : 'text-red'));
+	});
 
 	$("#edit-email").submit(function(event) {
 		console.log('submit');
@@ -522,6 +586,51 @@ jQuery(document).ready(function () {
 		$('#submit-btn3').prop('disabled', true);
 		$("#delete-email").unbind('submit').submit();
   	});
+
+	/* Webmail auto-login. The ticket is minted on click and redeemed by the very
+	   next request, so it is fetched here rather than baked into the page: a
+	   token printed at render time would already have expired by the time anyone
+	   clicked it, and would sit in the HTML for every mailbox at once.
+
+	   The token is handed over as a form POST, never in the URL -- a query
+	   string ends up in the nginx access log, the browser history, and any
+	   Referer the webmail page later sends.
+
+	   The target tab is opened SYNCHRONOUSLY inside the click handler and only
+	   then submitted into once the AJAX returns: a window opened from an async
+	   callback has lost the user gesture and is blocked as a popup. */
+	var wmSeq = 0;
+
+	$('#email-tbody, table').on('click', '.wm-login', function (e) {
+		e.preventDefault();
+		var $b = $(this);
+		if ($b.data('busy')) return;
+		$b.data('busy', true);
+
+		var name = 'reqad_webmail_' + (++wmSeq);
+		var win  = window.open('', name);        // still inside the gesture
+
+		$.post('/?ajax=1', { action: 'ajax-webmail-ticket', email: $b.data('email') }, null, 'json')
+			.done(function (res) {
+				$b.data('busy', false);
+				if (!res || res.error || !res.token) {
+					if (win) win.close();
+					alert(res && res.error ? res.error : 'Could not start the webmail session.');
+					return;
+				}
+				$('<form>')
+					.attr({ method: 'post', action: res.url, target: name })
+					.append($('<input>').attr({ type: 'hidden', name: '_reqad_login', value: res.token }))
+					.appendTo(document.body)
+					.submit()
+					.remove();
+			})
+			.fail(function () {
+				$b.data('busy', false);
+				if (win) win.close();
+				alert('Could not start the webmail session. Please try again.');
+			});
+	});
 
 });
 </script>

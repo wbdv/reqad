@@ -31,7 +31,7 @@ if($user == '')
 if($errmsg == '') {
     if(in_array($user, array('root', 'reqad', 'test', 'bin', 'daemon', 'adm', 'lp', 'sync', 'shutdown', 'halt', 'mail', 'operator', 'games', 'ftp', 'nobody', 'systemd-network', 'dbus', 'polkitd', 'sshd', 'postfix', 'chrony', 'reqad', 'apache', 'cjdns', 'vnstat', 'postgres', 'redis', 'awx', 'nginx', 'tss'))) {
         $errmsg =  "Error: You cannot delete a system user.";
-    } else if(preg_match('/[a-z]+[a-z0-9]{1,7}/', $user)) {
+    } else if(valid_username($user)) {
         $results = $db->query('SELECT * FROM accounts WHERE user="'.$user.'"');
         if ($row = $results->fetchArray()) {
 			$domain = $row['domain'];
@@ -40,7 +40,7 @@ if($errmsg == '') {
 			$errmsg =  "Error: Username does not exists in database.";
 		}
 	} else {
-		$errmsg =  "Error: Username should contain only lowercase letters and numbers.";
+		$errmsg =  "Error: Username must be 2-16 characters, lowercase letters and numbers only, starting with a letter.";
    }
 }
 
@@ -49,7 +49,7 @@ if($errmsg == '') {
     error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." delete account $user\n", 3, '../log/route_log');
 	$db->query('DELETE FROM accounts WHERE user="'.$user.'"');
 	$db->query('DELETE FROM wordpress WHERE user="'.$user.'"');
-	$db->query('DELETE FROM emails WHERE email LIKE "%@'.$domain.'"');
+	$db->query('DELETE FROM emails WHERE email LIKE "%@'.$db->escapeString($domain).'"');
 #	$output  = shell_exec('sudo sed -i "s/user  '.$user.';/user  nginx;/" /etc/nginx/nginx.conf');
 	if(substr($TEMPLATE,0,7)=='apache_')
     	$output = shell_exec("sudo rm -f /etc/httpd/conf.d/".$domain.".conf 2>&1");
@@ -79,6 +79,13 @@ if($errmsg == '') {
 		}
 	}
 
+	/* Email filters and autoresponders live in the panel db and under
+	   /var/lib/reqad/sieve — outside the account's home, so `rm -rf /home/$user`
+	   does not touch them. Left behind, they come back to life the moment the
+	   same domain is recreated. */
+	foreach (ef_purge_domain($db, $domain) as $line)
+		error_log(date("Y-m-d H:i:s")." ".$_SERVER['USER']." delete account $user: $line\n", 3, '../log/route_log');
+
     $output .= shell_exec("sudo rm -f /etc/ssl/certs/".$domain.".key 2>&1");
     $output .= shell_exec("sudo rm -f /etc/ssl/certs/".$domain.".crt 2>&1");
     $output .= shell_exec("sudo rm -rf /home/$user 2>&1");
@@ -94,19 +101,15 @@ if($errmsg == '') {
 	// The '_' is escaped as '\_' because in a LIKE pattern a bare '_' matches
 	// ANY single character -- 'foo_%' would also match another account's
 	// 'food_blog'. '\' is MySQL's default LIKE escape character.
-	$mysql_dbs = shell_exec("sudo mysql -N -e \"SHOW DATABASES LIKE '" . $user . "\\_%'\" 2>&1");
-	if ($mysql_dbs) {
-		foreach (explode("\n", trim($mysql_dbs)) as $mysql_db) {
-			if ($mysql_db !== '') shell_exec("sudo mysql -e 'DROP DATABASE IF EXISTS `" . $mysql_db . "`;' 2>&1");
-		}
+	foreach (mysql_rows('SHOW DATABASES LIKE '.mysql_quote($user.'\\_%')) as $mysql_db) {
+		if ($mysql_db !== '' && valid_mysql_identifier($mysql_db))
+			mysql_exec('DROP DATABASE IF EXISTS `'.$mysql_db.'`');
 	}
-	$mysql_users = shell_exec("sudo mysql -N -e \"SELECT User FROM mysql.user WHERE User LIKE '" . $user . "\\_%'\" 2>&1");
-	if ($mysql_users) {
-		foreach (explode("\n", trim($mysql_users)) as $mysql_user) {
-			if ($mysql_user !== '') shell_exec("sudo mysql -e 'DROP USER IF EXISTS `" . $mysql_user . "`@`localhost`;' 2>&1");
-		}
+	foreach (mysql_rows('SELECT User FROM mysql.user WHERE User LIKE '.mysql_quote($user.'\\_%')) as $mysql_user) {
+		if ($mysql_user !== '' && valid_mysql_identifier($mysql_user))
+			mysql_exec('DROP USER IF EXISTS `'.$mysql_user.'`@`localhost`');
 	}
-	shell_exec("sudo mysql -e 'FLUSH PRIVILEGES;' 2>&1");
+	mysql_exec('FLUSH PRIVILEGES');
 #	else
 #	    $errmsg = 'API for '.$settings["dns-provider"].' provider is not implemented!';
 

@@ -83,7 +83,121 @@ PYEOF
     nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
 }
 
+
+# --- Enable the managesieve plugin (Roundcube ⇄ Reqad filter interop) --------
+# Reqad's Email Filters "Per mailbox" tier and Roundcube's Settings → Filters
+# edit the SAME Sieve script, so the script NAME has to match what Reqad reads
+# and writes (ef-helper.sh: SCRIPT_NAME="reqad"). Left at the plugin default
+# ('managesieve') Roundcube would quietly create a second script and the two UIs
+# would disagree about what the filters are.
+#
+# Gated on the server actually speaking ManageSieve: on a box still delivering
+# with exim appendfile there is nothing on :4190, and a Filters tab that only
+# ever errors is worse than no Filters tab.
+#
+# Idempotent, and it never overwrites an existing plugin config — an admin who
+# has tuned it keeps their file.
+enable_managesieve() {
+    local cfg="$INSTALL_DIR/config/config.inc.php"
+    local pcfg="$INSTALL_DIR/plugins/managesieve/config.inc.php"
+
+    [ -f "$cfg" ] || return 0
+    [ -d "$INSTALL_DIR/plugins/managesieve" ] || return 0
+
+    if ! rpm -q dovecot-managesieved >/dev/null 2>&1 \
+       || [ ! -f /etc/dovecot/conf.d/20-managesieve.conf ]; then
+        echo "ManageSieve not set up on this server — leaving the roundcube plugin off."
+        return 0
+    fi
+
+    if [ ! -f "$pcfg" ]; then
+        echo "Writing $pcfg ..."
+        cat > "$pcfg" <<'MSCFG'
+<?php
+/* Managed by Reqad (scripts/update/update_roundcube.sh).
+ *
+ * managesieve_script_name MUST stay 'reqad': it is the script Reqad's Email
+ * Filters page reads and writes, and both UIs have to edit the same one.
+ *
+ * Plain connection on purpose — dovecot's managesieve listener is bound to
+ * loopback and roundcube runs on this same host, so nothing leaves the machine.
+ * Dovecot treats a local connection as secured, so cleartext auth is allowed
+ * without STARTTLS.
+ *
+ * 127.0.0.1, not 'localhost': the listener is IPv4-only (binding ::1 is fatal
+ * to dovecot on a box with IPv6 disabled), and on a dual-stack box 'localhost'
+ * resolves to ::1 first.
+ */
+$config['managesieve_host'] = '127.0.0.1:4190';
+$config['managesieve_script_name'] = 'reqad';
+
+/* Autoresponders are Reqad's, rendered from the autoresponders table into a
+ * separate dovecot "before" script. Roundcube's vacation UI would write a
+ * SECOND vacation rule into the user's own script and the mailbox would
+ * auto-reply twice, so both tabs stay off. */
+$config['managesieve_vacation'] = 0;
+$config['managesieve_forward']  = 0;
+
+/* Same fallback Reqad has: a script the rule parser cannot model is editable as
+ * raw source rather than silently rewritten. */
+$config['managesieve_raw_editor'] = true;
+MSCFG
+        chown reqad:reqad "$pcfg" 2>/dev/null || true
+    fi
+
+    if grep -q "['\"]managesieve['\"]" "$cfg"; then
+        return 0                       # already in the plugin list
+    fi
+
+    echo "Enabling the managesieve plugin in $cfg ..."
+    cp -a "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M%S)"
+    python3 - "$cfg" <<'PYEOF'
+import re, sys
+
+path = sys.argv[1]
+src  = open(path).read()
+
+# Roundcube's config uses either the short array syntax or array(...); match the
+# plugins assignment and append to whatever is already in it. Editing the list
+# in place beats appending a second $config['plugins'] line, which would win and
+# silently drop the plugins that were already enabled.
+m = re.search(r"\$config\['plugins'\]\s*=\s*(\[|array\()", src)
+if not m:
+    sys.exit("no \$config['plugins'] assignment found")
+
+open_ch  = '[' if m.group(1) == '[' else '('
+close_ch = ']' if open_ch == '[' else ')'
+depth, i = 0, m.end() - 1
+while i < len(src):
+    if src[i] == open_ch:
+        depth += 1
+    elif src[i] == close_ch:
+        depth -= 1
+        if depth == 0:
+            break
+    i += 1
+else:
+    sys.exit("unterminated plugins list")
+
+inner = src[m.end():i].rstrip()
+sep   = '' if (inner == '' or inner.endswith(',')) else ','
+addition = (sep + "\n    // Sieve filters, shared with Reqad's Email Filters page (per-mailbox\n"
+            "    // tier). The script name must stay 'reqad' — see\n"
+            "    // plugins/managesieve/config.inc.php\n"
+            "    'managesieve',\n")
+open(path, 'w').write(src[:m.end()] + inner + addition + src[i:])
+PYEOF
+
+    if ! /usr/bin/php82 -l "$cfg" >/dev/null 2>&1; then
+        echo "ERROR: the edited config does not parse — restoring the backup." >&2
+        cp -a "$(ls -t "$cfg".bak-* | head -1)" "$cfg"
+        return 1
+    fi
+    echo "managesieve enabled."
+}
+
 update_nginx_webmail
+enable_managesieve
 
 set -e
 

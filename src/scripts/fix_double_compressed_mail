@@ -1,0 +1,277 @@
+#!/bin/bash
+#
+# fix_double_compressed_mail — find and unwrap maildir messages that were
+# gzipped more than once, and reconcile them with the ",S=" size in the name.
+#
+# The damage this repairs
+# -----------------------
+# The legacy archive-email.sh decided "is this message already compressed?" by
+# looking for a "Z" in the maildir flags. Dovecot rewrites that suffix whenever
+# a flag changes (\Seen, \Answered, a keyword), so a message could lose its Z
+# while its bytes stayed gzipped — and the next archive run gzipped the gzip.
+#
+# Dovecot then decompresses exactly one layer, gets the inner gzip stream, and
+# compares its length to the ",S=" in the filename, which is still the size of
+# the real message:
+#
+#   Error: Mailbox INBOX: UID 12865: Deleting corrupted cache record:
+#   Broken physical size ... Cached message size larger than expected
+#   (101417 > 53299, box=INBOX, UID=12865)
+#
+# 101417 is the true message size from the filename; 53299 is the size of the
+# first-level gzip that Dovecot got instead of the message. The mail is NOT
+# lost — there is simply one gzip layer too many. FETCH fails, the client
+# disconnects, and the cache record is dropped and rebuilt on every attempt,
+# which is why the same three lines repeat for ever.
+#
+# The current scripts/compress_old_mail cannot cause this: it tests the file's
+# first two bytes for the gzip magic instead of trusting the filename, and it
+# writes with "gzip -n". A file with a stored original name and an old
+# timestamp in its gzip header (file(1) prints them) came from the old script.
+#
+# What this does to each file
+# ---------------------------
+# Peels gzip layers until plaintext, then rewrites the file as a SINGLE gzip
+# layer — the state Dovecot's mail_compress plugin expects — using the same
+# technique as compress_old_mail: scratch file in the mailbox's own tmp/, then
+# one atomic rename onto the unchanged filename, so no sync sees a new name and
+# no message gets a second UID. Owner, mode and mtime are preserved
+# (INTERNALDATE comes from the mtime).
+#
+# Before rewriting, the plaintext length is checked against the ",S=" in the
+# filename. If they disagree the file is LEFT ALONE and reported: that is a
+# different fault from this one and unwrapping would not fix it.
+#
+# Singly-compressed and plain files are never touched, so a full-server run is
+# safe and re-running it is a no-op.
+#
+# Usage:
+#   fix_double_compressed_mail --all --dry-run        # survey the damage first
+#   fix_double_compressed_mail --all
+#   fix_double_compressed_mail --mailbox user@dom.tld
+#   fix_double_compressed_mail --maildir /home/acct/mail/dom.tld/user
+#
+# Options:
+#   --all           every mailbox in /etc/dovecot/users
+#   --mailbox ADDR  one mailbox by address (repeatable)
+#   --maildir PATH  one maildir root by path (repeatable)
+#   --dry-run, -n   report only, change nothing
+#   --force         work even while the mailbox has a live IMAP/POP3 session
+#   --verbose, -v   log every file examined, not just the broken ones
+#   --quiet, -q     errors only
+#
+set -uo pipefail
+
+USERS="/etc/dovecot/users"
+LOG="/usr/local/reqad/log/compress_mail.log"
+LOCK="/var/lock/reqad-compress-mail.lock"
+GZIP_LEVEL=6
+MAX_LAYERS=8
+
+DRY_RUN=0; FORCE=0; VERBOSE=0; QUIET=0; ALL=0
+declare -a CLI_MAILBOXES=() CLI_DIRS=()
+
+usage() { sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all)        ALL=1; shift ;;
+        --mailbox)    CLI_MAILBOXES+=("${2:-}"); shift 2 ;;
+        --maildir)    CLI_DIRS+=("${2:-}"); shift 2 ;;
+        --dry-run|-n) DRY_RUN=1; shift ;;
+        --force)      FORCE=1; shift ;;
+        --verbose|-v) VERBOSE=1; shift ;;
+        --quiet|-q)   QUIET=1; shift ;;
+        --help|-h)    usage ;;
+        *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+log() {
+    local msg="$(date '+%Y-%m-%d %H:%M:%S') $*"
+    printf '%s\n' "$msg" >> "$LOG" 2>/dev/null
+    [ "$QUIET" -eq 1 ] || printf '%s\n' "$msg"
+}
+vlog() { [ "$VERBOSE" -eq 1 ] && log "$@"; return 0; }
+err() { log "ERROR: $*"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "  This script must be run as root (it rewrites files in every user's maildir)" >&2
+    exit 1
+fi
+
+if [ "$ALL" -eq 0 ] && [ ${#CLI_MAILBOXES[@]} -eq 0 ] && [ ${#CLI_DIRS[@]} -eq 0 ]; then
+    echo "  Nothing to do: pass --all, --mailbox ADDR or --maildir PATH (try --help)" >&2
+    exit 2
+fi
+
+# Share compress_old_mail's lock: both rewrite the same files, and a cron tick
+# landing in the middle of a repair is exactly what we do not want.
+exec 9>"$LOCK" || exit 1
+if ! flock -n 9; then
+    echo "  compress_old_mail is running (lock held) — try again later" >&2
+    exit 0
+fi
+
+renice -n 19 -p $$ >/dev/null 2>&1
+command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1
+
+mailbox_home() { awk -F: -v u="$1" '$1 == u { print $6; exit }' "$USERS"; }
+all_mailboxes() { awk -F: '/@/ { print $1 }' "$USERS"; }
+
+is_gzip_file() {
+    [ "$(head -c 2 -- "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "1f8b" ]
+}
+
+# Is the DECOMPRESSED content itself gzip? Two bytes answers it, and head
+# closing the pipe stops gzip after the first block — so a healthy 3MB message
+# costs one block, not a full decompress. This is what makes a whole-server
+# --all run take minutes rather than hours: the overwhelming majority of files
+# are fine and never get read past their first block.
+inner_is_gzip() {
+    [ "$( { gzip -dc -- "$1" 2>/dev/null || true; } | head -c 2 | od -An -tx1 | tr -d ' \n')" = "1f8b" ]
+}
+
+has_active_session() {
+    local out
+    out=$(doveadm who -1 "$1" 2>&1) || return 2
+    [ -n "$(printf '%s' "$out" | grep -v '^username')" ]
+}
+
+TOTAL_SEEN=0; TOTAL_BROKEN=0; TOTAL_FIXED=0; TOTAL_ERRORS=0; TOTAL_MISMATCH=0
+
+# Peel one file. Echoes the layer count found; rewrites when it is >1.
+repair_file() {
+    local f="$1" label="$2"
+    local dir root tmpd a b layers plain_size want
+
+    is_gzip_file "$f" || return 0
+    TOTAL_SEEN=$((TOTAL_SEEN + 1))
+
+    # Cheap rejection of the healthy case before any real work.
+    if ! inner_is_gzip "$f"; then
+        vlog "$label: $f is singly compressed — ok"
+        return 0
+    fi
+
+    dir=$(dirname -- "$f"); root=$(dirname -- "$dir"); tmpd="$root/tmp"
+    if [ ! -d "$tmpd" ]; then
+        err "$label: no tmp/ beside $dir — skipping $f"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); return 0
+    fi
+
+    a="$tmpd/reqad-fixdc.$$.a"; b="$tmpd/reqad-fixdc.$$.b"
+    rm -f -- "$a" "$b"
+
+    # Peel until the result is no longer gzip. One layer is the healthy state.
+    if ! gzip -dc -- "$f" > "$a" 2>/dev/null || [ ! -s "$a" ]; then
+        err "$label: cannot decompress $f — leaving it alone"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); rm -f -- "$a"; return 0
+    fi
+    layers=1
+    while is_gzip_file "$a"; do
+        if [ "$layers" -ge "$MAX_LAYERS" ]; then
+            err "$label: more than $MAX_LAYERS gzip layers on $f — leaving it alone"
+            TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); rm -f -- "$a" "$b"; return 0
+        fi
+        if ! gzip -dc -- "$a" > "$b" 2>/dev/null || [ ! -s "$b" ]; then
+            err "$label: layer $((layers + 1)) of $f will not decompress — leaving it alone"
+            TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); rm -f -- "$a" "$b"; return 0
+        fi
+        mv -f -- "$b" "$a"
+        layers=$((layers + 1))
+    done
+
+    if [ "$layers" -eq 1 ]; then
+        vlog "$label: $f is singly compressed — ok"
+        rm -f -- "$a"; return 0
+    fi
+
+    TOTAL_BROKEN=$((TOTAL_BROKEN + 1))
+    plain_size=$(stat -c %s -- "$a" 2>/dev/null)
+
+    # ",S=<n>" is what Dovecot reports as the message size. If the message we
+    # recovered is not that size, this file has a second, different problem and
+    # unwrapping it would just trade one error for another.
+    want=$(printf '%s' "$(basename -- "$f")" | grep -oP ',S=\K[0-9]+' | head -1)
+    if [ -n "$want" ] && [ "$want" != "$plain_size" ]; then
+        err "$label: $f unwrapped to $plain_size bytes but the name says S=$want — LEFT ALONE"
+        TOTAL_MISMATCH=$((TOTAL_MISMATCH + 1))
+        rm -f -- "$a"; return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "$label: would fix $f ($layers gzip layers, message is $plain_size bytes)"
+        rm -f -- "$a"; return 0
+    fi
+
+    # Back to exactly one layer, which is what mail_compress reads.
+    if ! gzip -n -"$GZIP_LEVEL" -c -- "$a" > "$b" 2>/dev/null || [ ! -s "$b" ]; then
+        err "$label: could not re-compress $f"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); rm -f -- "$a" "$b"; return 0
+    fi
+    if ! gzip -t -- "$b" 2>/dev/null; then
+        err "$label: integrity check failed rebuilding $f"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); rm -f -- "$a" "$b"; return 0
+    fi
+
+    chown --reference="$f" -- "$b" 2>/dev/null
+    chmod --reference="$f" -- "$b" 2>/dev/null
+    touch -r "$f" -- "$b" 2>/dev/null
+
+    # Same directory entry, one atomic rename — the filename, and with it the
+    # UID and the ",S=" size, never changes.
+    if ! mv -f -- "$b" "$f" 2>/dev/null; then
+        err "$label: could not move rebuilt copy over $f"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); rm -f -- "$a" "$b"; return 0
+    fi
+    rm -f -- "$a"
+    TOTAL_FIXED=$((TOTAL_FIXED + 1))
+    log "$label: fixed $f ($layers layers -> 1, message $plain_size bytes)"
+}
+
+repair_maildir() {
+    local home="$1" label="$2"
+    if [ ! -d "$home" ]; then
+        err "$label: maildir $home does not exist — skipping"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); return
+    fi
+    # cur/ only, and only names that still carry the size, exactly as
+    # compress_old_mail scopes itself.
+    while IFS= read -r -d '' f; do
+        repair_file "$f" "$label"
+    done < <(find "$home" -type f -path '*/cur/*' -name '*,S=*' -print0 2>/dev/null)
+}
+
+START=$(date +%s)
+log "--- fix_double_compressed_mail start$([ "$DRY_RUN" -eq 1 ] && echo ' (DRY RUN)') ---"
+
+declare -a BOXES=()
+[ "$ALL" -eq 1 ] && while read -r mb; do [ -n "$mb" ] && BOXES+=("$mb"); done < <(all_mailboxes)
+for mb in "${CLI_MAILBOXES[@]:-}"; do [ -n "$mb" ] && BOXES+=("$mb"); done
+
+for mb in "${BOXES[@]:-}"; do
+    [ -n "$mb" ] || continue
+    home=$(mailbox_home "$mb")
+    if [ -z "$home" ]; then
+        err "$mb: not in $USERS — skipping"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1)); continue
+    fi
+    if [ "$FORCE" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        has_active_session "$mb"
+        if [ $? -eq 0 ]; then
+            log "$mb: has an active IMAP/POP3 session — skipping (use --force to override)"
+            continue
+        fi
+    fi
+    repair_maildir "$home" "$mb"
+done
+
+for d in "${CLI_DIRS[@]:-}"; do
+    [ -n "$d" ] && repair_maildir "$d" "$(basename -- "$d")"
+done
+
+log "--- done in $(( $(date +%s) - START ))s: $TOTAL_SEEN compressed file(s) examined, $TOTAL_BROKEN doubly compressed, $TOTAL_FIXED fixed, $TOTAL_MISMATCH size mismatch, $TOTAL_ERRORS error(s) ---"
+
+[ "$TOTAL_ERRORS" -gt 0 ] && exit 1
+exit 0

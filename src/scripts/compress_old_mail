@@ -1,0 +1,496 @@
+#!/bin/bash
+#
+# compress_old_mail — gzip messages older than N days, in place, per mailbox.
+#
+# Reqad's replacement for the hand-run archive-email.sh that this stack used
+# under Dovecot 2.3. Driven from cron by a list of opted-in mailboxes in
+#   /usr/local/reqad/etc/mail-archive.conf
+# which is EMPTY by default: with no list, this script touches nothing.
+#
+# PREREQUISITE — read this first
+# -----------------------------
+# Dovecot must be able to READ compressed mail before anything here runs, or
+# every message compressed becomes an unreadable blob of gzip bytes served to
+# the client as though it were the message. That is the mail_compress plugin:
+#     bash /usr/local/reqad/scripts/update/setup_dovecot_compress.sh
+# This script refuses to run until it can see that in the live config.
+#
+# How a message is compressed
+# ---------------------------
+# The old script did: cp to /tmp, gzip, mv back under a NEW name with a "Z"
+# appended to the maildir flags, then rm the original. Three problems with that
+# on a live server, all fixed here:
+#
+#   * Two names for one message. Between the mv and the rm both "…,S=123,S" and
+#     "…,S=123,SZ" exist in cur/. A Dovecot sync landing in that window sees a
+#     file it has no UID for and allocates a new one — the message shows up
+#     twice, the second copy unread. Here the compressed data is renamed onto
+#     the EXACT original filename, so the directory entry never changes: one
+#     rename(), atomic, no window, no new UID, no unread flag flipped.
+#   * /tmp is a different filesystem from /home, so that mv was a copy+unlink,
+#     not a rename — a crash mid-copy left a truncated message in cur/. Here the
+#     scratch file is written in the mailbox's own tmp/ dir (what maildir tmp/
+#     is for; Dovecot ignores and eventually reaps it), which is the same
+#     filesystem, so the final mv really is an atomic rename.
+#   * "Already compressed?" was answered by looking for a Z in the filename. A
+#     flag update by Dovecot rewrites that suffix and the file gets gzipped a
+#     second time. Here it is answered by reading the file's first two bytes and
+#     looking for the gzip magic — which also means messages compressed by the
+#     OLD script (the ones ending in Z) are correctly recognised and skipped.
+#
+# The maildir filename is otherwise left completely alone, which matters: the
+# ",S=<size>" in it is the UNCOMPRESSED size, and it is where Dovecot gets the
+# message size from once the bytes on disk no longer match. Any file without an
+# S= is skipped rather than compressed, because there would be nothing left to
+# report the real size from.
+#
+# Only cur/ is processed. new/ holds mail that has been delivered but not yet
+# seen by a client, tmp/ holds partial deliveries; neither should be rewritten
+# under the delivery path's feet. (The old script's regex required the ":2,"
+# flags suffix, which new/ files do not have, so this is the same set of files
+# it actually touched — just stated deliberately.)
+#
+# Usage:
+#   compress_old_mail                 # process mail-archive.conf
+#   compress_old_mail --dry-run       # report what it would do, change nothing
+#   compress_old_mail --mailbox a@b.c --days 90
+#   compress_old_mail --verbose
+#
+# Options:
+#   --days N        override the age cutoff for every mailbox this run
+#   --mailbox ADDR  ignore the config file, do just this mailbox (repeatable)
+#   --dry-run       count and report, compress nothing
+#   --force         compress even while the mailbox has live IMAP/POP3 sessions
+#   --verbose       log every file, not just per-mailbox totals
+#   --quiet         errors only
+#   --decompress    REVERSE the operation: gunzip every compressed message back
+#                   in place. --days is ignored (age is irrelevant when undoing).
+#   --all           with --decompress, work through every mailbox recorded in
+#                   /var/lib/reqad/compressed-mailboxes. This is what the panel
+#                   tells an admin to run before turning compression off.
+#
+set -uo pipefail
+
+CONF="/usr/local/reqad/etc/mail-archive.conf"
+USERS="/etc/dovecot/users"
+INI="/usr/local/reqad/etc/server-software.ini"
+LOG="/usr/local/reqad/log/compress_mail.log"
+LOCK="/var/lock/reqad-compress-mail.lock"
+GZIP_LEVEL=6
+DEFAULT_DAYS=365
+
+# Mailboxes known to hold gzipped messages. This exists so the panel's Dovecot
+# compression toggle can refuse to turn the plugin OFF while there is mail that
+# would become unreadable without it — answering that question by scanning every
+# maildir on the server is far too expensive to do from a web request, and
+# guessing wrong corrupts nobody's mail but makes all of it unreadable.
+# Append-only while mail is compressed; entries are removed by --decompress.
+MARKER="/var/lib/reqad/compressed-mailboxes"
+
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+DECOMPRESS=0
+ALL_MARKED=0
+OVERRIDE_DAYS=""
+declare -a CLI_MAILBOXES=()
+
+usage() { sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --days)     OVERRIDE_DAYS="${2:-}"; shift 2 ;;
+        --mailbox)  CLI_MAILBOXES+=("${2:-}"); shift 2 ;;
+        --dry-run|-n) DRY_RUN=1; shift ;;
+        --decompress) DECOMPRESS=1; shift ;;
+        --all)      ALL_MARKED=1; shift ;;
+        --force)    FORCE=1; shift ;;
+        --verbose|-v) VERBOSE=1; shift ;;
+        --quiet|-q) QUIET=1; shift ;;
+        --help|-h)  usage ;;
+        *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+log() {
+    # Everything lands in the log; stdout only when not --quiet. Cron redirects
+    # stdout to /dev/null, so the log file is the record.
+    local msg="$(date '+%Y-%m-%d %H:%M:%S') $*"
+    printf '%s\n' "$msg" >> "$LOG" 2>/dev/null
+    [ "$QUIET" -eq 1 ] || printf '%s\n' "$msg"
+}
+vlog() { [ "$VERBOSE" -eq 1 ] && log "$@"; return 0; }
+err() { log "ERROR: $*"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "  This script must be run as root (it rewrites files in every user's maildir)" >&2
+    exit 1
+fi
+
+# --- Cheap exits, before we take the lock or write a log line ----------------
+if [ -f "$INI" ]; then
+    EMAIL=$(grep -oP '^email=\K.*' "$INI" | tr -d '[:space:]')
+    if [ "${EMAIL:-1}" = "0" ]; then
+        exit 0
+    fi
+fi
+[ -r "$USERS" ] || exit 0
+command -v doveconf >/dev/null 2>&1 || exit 0
+
+# Nothing configured and nothing asked for on the command line: the normal state
+# on a server that has not opted in. Say nothing, do nothing.
+# --all draws its list from the marker file, not from mail-archive.conf: undoing
+# has to reach mailboxes that were removed from the config long ago.
+if [ ${#CLI_MAILBOXES[@]} -eq 0 ] && [ "$ALL_MARKED" -eq 0 ]; then
+    [ -r "$CONF" ] || exit 0
+    grep -qE '^[[:space:]]*[^#[:space:]]' "$CONF" || exit 0
+fi
+
+# --- Refuse to run unless Dovecot can read what we are about to write --------
+# Compressing mail that Dovecot cannot decompress does not degrade gracefully:
+# the client is handed gzip bytes as the message body. This is the one check
+# that must never be skippable.
+# --decompress is exempt: it is the way BACK from a server whose plugin is
+# already gone, and gunzip does not need dovecot's help.
+if [ "$DECOMPRESS" -eq 0 ] && ! doveconf -n 2>/dev/null | grep -q 'mail_compress'; then
+    err "mail_compress plugin is not enabled in Dovecot — refusing to compress."
+    err "Run: bash /usr/local/reqad/scripts/update/setup_dovecot_compress.sh"
+    exit 1
+fi
+
+# --- One run at a time -------------------------------------------------------
+# A slow first pass over a large mailbox must not have the next cron tick land
+# on top of it.
+exec 9>"$LOCK" || exit 1
+if ! flock -n 9; then
+    exit 0
+fi
+
+# Never let this compete with mail delivery for CPU or disk.
+renice -n 19 -p $$ >/dev/null 2>&1
+command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1
+
+# --- Resolve a mailbox address to its maildir root ---------------------------
+# /etc/dovecot/users is user:pw:uid:gid:gecos:home:shell:extra, and Reqad's
+# local.conf sets mail_path = ~/ — so the home IS the maildir root and cur/new/
+# tmp sit directly in it. Read it from the passwd file rather than rebuilding
+# /home/<acct>/mail/<domain>/<box> by hand, which is what the old script did and
+# what breaks the moment an account is not named after its domain.
+mailbox_home() {
+    awk -F: -v u="$1" '$1 == u { print $6; exit }' "$USERS"
+}
+
+# Every mailbox in a domain, for "@domain.tld" lines.
+domain_mailboxes() {
+    awk -F: -v d="@$1" 'index($1, d) && substr($1, length($1) - length(d) + 1) == d { print $1 }' "$USERS"
+}
+
+marker_add() {
+    [ -d /var/lib/reqad ] || mkdir -p /var/lib/reqad
+    touch "$MARKER" 2>/dev/null || return 0
+    grep -qxF "$1" "$MARKER" 2>/dev/null || printf '%s\n' "$1" >> "$MARKER"
+    chmod 0644 "$MARKER" 2>/dev/null
+}
+
+marker_remove() {
+    [ -f "$MARKER" ] || return 0
+    # grep exits 1 when it selects nothing, which is exactly the case where the
+    # file had this mailbox as its ONLY line — gating the mv on its status left
+    # the last entry behind for ever, and with it a toggle that could never be
+    # turned off. Check the temp file was written instead.
+    grep -vxF "$1" "$MARKER" > "$MARKER.tmp" 2>/dev/null
+    if [ -f "$MARKER.tmp" ]; then
+        mv -f "$MARKER.tmp" "$MARKER"
+    fi
+}
+
+is_gzip() {
+    # Two bytes settles it. Cheaper and far more reliable than trusting a "Z"
+    # in the maildir flags, which Dovecot is free to rewrite.
+    [ "$(head -c 2 -- "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "1f8b" ]
+}
+
+has_active_session() {
+    # doveadm who needs the anvil socket; if it is not reachable we get no
+    # answer, and "no answer" must not read as "nobody is connected".
+    local out
+    out=$(doveadm who -1 "$1" 2>&1)
+    if [ $? -ne 0 ]; then
+        return 2
+    fi
+    [ -n "$(printf '%s' "$out" | grep -v '^username')" ]
+}
+
+TOTAL_FILES=0
+TOTAL_SAVED=0
+TOTAL_ERRORS=0
+
+compress_mailbox() {
+    local mb="$1" days="$2"
+    local home; home=$(mailbox_home "$mb")
+
+    if [ -z "$home" ]; then
+        err "$mb: not in $USERS — skipping"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        return
+    fi
+    if [ ! -d "$home" ]; then
+        err "$mb: maildir $home does not exist — skipping"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        return
+    fi
+
+    # Renaming files under a connected client is the one thing that can make it
+    # see a message vanish. Cheap to just wait for the next run.
+    if [ "$FORCE" -eq 0 ]; then
+        has_active_session "$mb"
+        case $? in
+            0) log "$mb: has an active IMAP/POP3 session — skipping (use --force to override)"
+               return ;;
+            2) vlog "$mb: could not query doveadm who (anvil unreachable), proceeding" ;;
+        esac
+    fi
+
+    local files=0 saved=0 skipped=0 failed=0 n=0 already=0
+
+    # -mtime +N is "modified more than N days ago", the same cutoff the old
+    # script computed by hand from a fixed calendar date.
+    # -path '*/cur/*' keeps this to cur/ — see the header. Requiring ",S=" in
+    # the name keeps it to files that still carry the uncompressed size.
+    while IFS= read -r -d '' f; do
+        n=$((n + 1))
+
+        if is_gzip "$f"; then
+            skipped=$((skipped + 1))
+            already=$((already + 1))
+            continue
+        fi
+
+        local before after
+        before=$(stat -c %s -- "$f" 2>/dev/null) || { failed=$((failed+1)); continue; }
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            files=$((files + 1))
+            vlog "$mb: would compress $f ($before bytes)"
+            continue
+        fi
+
+        # Scratch file in the mailbox's own tmp/ — same filesystem as cur/, so
+        # the final mv is a true atomic rename rather than a copy+unlink.
+        local dir root tmpd tmpf
+        dir=$(dirname -- "$f"); root=$(dirname -- "$dir"); tmpd="$root/tmp"
+        if [ ! -d "$tmpd" ]; then
+            err "$mb: no tmp/ beside $dir — skipping file"
+            failed=$((failed + 1))
+            continue
+        fi
+        tmpf="$tmpd/reqad-compress.$$.$n"
+        rm -f -- "$tmpf" "$tmpf.gz"
+
+        # cp -a carries owner, mode and timestamps across; gzip keeps them on
+        # its output. INTERNALDATE for a maildir message comes from the file
+        # mtime, so losing it would silently re-date the whole archive.
+        if ! cp -a -- "$f" "$tmpf" 2>/dev/null; then
+            err "$mb: could not copy $f to $tmpf"
+            failed=$((failed + 1)); rm -f -- "$tmpf"
+            continue
+        fi
+        # -n: no original name/timestamp in the gzip header. The header mtime is
+        # not what Dovecot reads and storing it only makes the output vary.
+        if ! gzip -n -"$GZIP_LEVEL" -f -- "$tmpf" 2>/dev/null || [ ! -f "$tmpf.gz" ]; then
+            err "$mb: gzip failed on $f"
+            failed=$((failed + 1)); rm -f -- "$tmpf" "$tmpf.gz"
+            continue
+        fi
+        # Never hand Dovecot a stream we have not verified round-trips.
+        if ! gzip -t -- "$tmpf.gz" 2>/dev/null; then
+            err "$mb: gzip integrity check failed on $f"
+            failed=$((failed + 1)); rm -f -- "$tmpf.gz"
+            continue
+        fi
+
+        after=$(stat -c %s -- "$tmpf.gz" 2>/dev/null)
+        # Mail that is mostly a JPEG or a PDF does not compress; swapping it for
+        # a slightly larger file buys nothing and costs a rewrite.
+        if [ -z "$after" ] || [ "$after" -ge "$before" ]; then
+            vlog "$mb: $f does not compress ($before -> ${after:-?}), leaving as is"
+            skipped=$((skipped + 1)); rm -f -- "$tmpf.gz"
+            continue
+        fi
+
+        chown --reference="$f" -- "$tmpf.gz" 2>/dev/null
+        chmod --reference="$f" -- "$tmpf.gz" 2>/dev/null
+        touch -r "$f" -- "$tmpf.gz" 2>/dev/null
+
+        # The whole point: same directory entry, one atomic rename. The name —
+        # and with it the ",S=" uncompressed size Dovecot now depends on — is
+        # unchanged, so no sync can mistake this for a new message.
+        if ! mv -f -- "$tmpf.gz" "$f" 2>/dev/null; then
+            err "$mb: could not move compressed copy over $f"
+            failed=$((failed + 1)); rm -f -- "$tmpf.gz"
+            continue
+        fi
+
+        files=$((files + 1))
+        saved=$((saved + before - after))
+        vlog "$mb: compressed $f ($before -> $after)"
+    done < <(find "$home" -type f -path '*/cur/*' -name '*,S=*' -mtime +"$days" -print0 2>/dev/null)
+
+    TOTAL_FILES=$((TOTAL_FILES + files))
+    TOTAL_SAVED=$((TOTAL_SAVED + saved))
+    TOTAL_ERRORS=$((TOTAL_ERRORS + failed))
+
+    # Record it if anything is compressed here — including the case where this
+    # run compressed nothing because a previous one already had ($skipped>0).
+    # This is what the panel's toggle consults before letting anyone disable the
+    # plugin, so a missing entry is the dangerous direction, not a spurious one.
+    if [ "$DRY_RUN" -eq 0 ] && { [ "$files" -gt 0 ] || [ "$already" -gt 0 ]; }; then
+        marker_add "$mb"
+    fi
+
+    local verb="compressed"
+    [ "$DRY_RUN" -eq 1 ] && verb="would compress"
+    log "$mb: $verb $files of $n candidate(s) older than ${days}d, $(numfmt --to=iec ${saved:-0} 2>/dev/null || echo ${saved}B) saved, $skipped skipped, $failed failed"
+}
+
+# --- The reverse operation ---------------------------------------------------
+# Same technique as compressing, run the other way: gunzip into the mailbox's own
+# tmp/, then one atomic rename onto the unchanged filename. Age is not a factor
+# here (you are undoing, not archiving), so every gzipped file in cur/ is taken.
+decompress_mailbox() {
+    local mb="$1"
+    local home; home=$(mailbox_home "$mb")
+
+    if [ -z "$home" ] || [ ! -d "$home" ]; then
+        err "$mb: no maildir — skipping"
+        TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        return
+    fi
+
+    if [ "$FORCE" -eq 0 ]; then
+        has_active_session "$mb"
+        case $? in
+            0) log "$mb: has an active IMAP/POP3 session — skipping (use --force to override)"
+               return ;;
+        esac
+    fi
+
+    local files=0 left=0 failed=0 n=0
+    while IFS= read -r -d '' f; do
+        n=$((n + 1))
+        is_gzip "$f" || continue
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            files=$((files + 1))
+            vlog "$mb: would decompress $f"
+            continue
+        fi
+
+        local dir root tmpd tmpf
+        dir=$(dirname -- "$f"); root=$(dirname -- "$dir"); tmpd="$root/tmp"
+        if [ ! -d "$tmpd" ]; then
+            err "$mb: no tmp/ beside $dir — skipping file"
+            failed=$((failed + 1)); left=$((left + 1))
+            continue
+        fi
+        tmpf="$tmpd/reqad-decompress.$$.$n"
+        rm -f -- "$tmpf"
+
+        if ! gzip -dc -- "$f" > "$tmpf" 2>/dev/null || [ ! -s "$tmpf" ]; then
+            err "$mb: could not decompress $f"
+            failed=$((failed + 1)); left=$((left + 1)); rm -f -- "$tmpf"
+            continue
+        fi
+        chown --reference="$f" -- "$tmpf" 2>/dev/null
+        chmod --reference="$f" -- "$tmpf" 2>/dev/null
+        touch -r "$f" -- "$tmpf" 2>/dev/null
+        if ! mv -f -- "$tmpf" "$f" 2>/dev/null; then
+            err "$mb: could not move decompressed copy over $f"
+            failed=$((failed + 1)); left=$((left + 1)); rm -f -- "$tmpf"
+            continue
+        fi
+        files=$((files + 1))
+        vlog "$mb: decompressed $f"
+    done < <(find "$home" -type f -path '*/cur/*' -name '*,S=*' -print0 2>/dev/null)
+
+    TOTAL_FILES=$((TOTAL_FILES + files))
+    TOTAL_ERRORS=$((TOTAL_ERRORS + failed))
+
+    # Only clear the marker once nothing compressed is left behind — the whole
+    # value of that file is that it is never optimistic.
+    if [ "$DRY_RUN" -eq 0 ] && [ "$left" -eq 0 ]; then
+        marker_remove "$mb"
+    fi
+
+    local verb="decompressed"
+    [ "$DRY_RUN" -eq 1 ] && verb="would decompress"
+    log "$mb: $verb $files file(s) of $n, $failed failed"
+}
+
+# --- Build the work list -----------------------------------------------------
+declare -a WORK=()
+
+if [ "$ALL_MARKED" -eq 1 ]; then
+    # Every mailbox recorded as holding compressed mail. Only meaningful with
+    # --decompress, which is the one caller that has to reach mailboxes no
+    # longer listed in mail-archive.conf.
+    if [ -s "$MARKER" ]; then
+        while read -r mb; do
+            [ -n "$mb" ] && WORK+=("$mb 0")
+        done < "$MARKER"
+    fi
+    for mb in "${CLI_MAILBOXES[@]:-}"; do
+        [ -n "$mb" ] && WORK+=("$mb 0")
+    done
+elif [ ${#CLI_MAILBOXES[@]} -gt 0 ]; then
+    for mb in "${CLI_MAILBOXES[@]}"; do
+        WORK+=("$mb ${OVERRIDE_DAYS:-$DEFAULT_DAYS}")
+    done
+else
+    # mail-archive.conf: one entry per line, "# …" comments and blanks ignored.
+    #   days=180              a global default for the lines below it
+    #   user@domain.tld       use the current default
+    #   user@domain.tld 90    per-mailbox override
+    #   @domain.tld           every mailbox in that domain
+    #   @domain.tld 730
+    cur_default="$DEFAULT_DAYS"
+    while read -r entry days _rest; do
+        case "$entry" in ''|'#'*) continue ;; esac
+        if [[ "$entry" == days=* ]]; then
+            cur_default="${entry#days=}"
+            continue
+        fi
+        [ -n "${days:-}" ] || days="$cur_default"
+        [ -n "$OVERRIDE_DAYS" ] && days="$OVERRIDE_DAYS"
+        if [[ ! "$days" =~ ^[0-9]+$ ]]; then
+            err "bad day count '$days' for '$entry' in $CONF — skipping"
+            continue
+        fi
+        if [[ "$entry" == @* ]]; then
+            while read -r mb; do
+                [ -n "$mb" ] && WORK+=("$mb $days")
+            done < <(domain_mailboxes "${entry#@}")
+        else
+            WORK+=("$entry $days")
+        fi
+    done < <(sed 's/#.*//' "$CONF")
+fi
+
+if [ ${#WORK[@]} -eq 0 ]; then
+    exit 0
+fi
+
+START=$(date +%s)
+log "--- compress_old_mail $([ "$DECOMPRESS" -eq 1 ] && echo 'DECOMPRESS ')start (${#WORK[@]} mailbox(es)$([ "$DRY_RUN" -eq 1 ] && echo ', DRY RUN')) ---"
+for item in "${WORK[@]}"; do
+    if [ "$DECOMPRESS" -eq 1 ]; then
+        decompress_mailbox ${item%% *}
+    else
+        compress_mailbox ${item}
+    fi
+done
+log "--- done in $(( $(date +%s) - START ))s: $TOTAL_FILES file(s), $(numfmt --to=iec ${TOTAL_SAVED:-0} 2>/dev/null || echo ${TOTAL_SAVED}B) saved, $TOTAL_ERRORS error(s) ---"
+
+[ "$TOTAL_ERRORS" -gt 0 ] && exit 1
+exit 0

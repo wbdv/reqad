@@ -8,14 +8,10 @@ if(!in_array($_POST["mail-provider"], array('smtp', ''))) {
 	$errmsg = 'Unknown mail provider.';
 }
 
+/* Thin alias kept for readability at the call sites below; the actual write is
+   the bound-parameter upsert in functions.php. */
 function update_settings($name, $value) {
-	global $db;
-	$results = $db->query('SELECT * FROM settings WHERE name="'.$name.'"');
-	if ($results->fetchArray()) {
-		$db->query('UPDATE settings SET value="'.$value.'", updated_at=datetime("now") WHERE name="'.$name.'"');
-	} else {
-		$db->query('INSERT INTO settings VALUES ("'.$name.'", "'.$value.'", datetime("now"))');
-	}
+	return setting_put($name, $value);
 }
 
 if($errmsg == '') {

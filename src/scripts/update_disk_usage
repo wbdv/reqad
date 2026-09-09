@@ -1,5 +1,8 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
+/* The shebang pins Reqad's php.ini: the stock php82 CLI ini disables exec(),
+   and the mailbox cache refresh below shells out. */
+require_once __DIR__.'/../public_html/modules/functions.php';
 if(php_sapi_name() != "cli" || posix_getuid() != 0) {
     echo "You can only run this script as root from cli.\n";
     exit;
@@ -67,5 +70,16 @@ if($nb_accounts == 0) {
 	}
 	echo "└──────────────────────────────────────────────────────────────────────────────────────────────────────┘\n";
 	#	echo "\n";
+}
+
+/* Mailbox disk-usage cache (the `emails` table). Same job as the loop above,
+   for mail accounts instead of hosting accounts. Refreshing here means the
+   Email Accounts page normally serves cached figures instead of running a
+   du -skm per mailbox while someone waits for the page. The table is only a
+   cache — mailbox_usage_refresh_all() rebuilds it from /etc/dovecot/users and
+   drops rows for mailboxes that no longer exist. */
+if(is_file('/etc/dovecot/users')) {
+	$n = mailbox_usage_refresh_all($db);
+	echo "Refreshed disk usage for $n mailbox".($n==1?'':'es').".\n";
 }
 ?>

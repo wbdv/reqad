@@ -1,4 +1,4 @@
-<?
+<?php
 	$reboot_time = isset($_POST["time"])?$_POST["time"]:'now';
 	if(!in_array($reboot_time, array('now', '22:00', '23:00', '00:00', '01:00', '02:00'))) {
 		$reboot_time = 'now';

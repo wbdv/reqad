@@ -150,7 +150,8 @@
 				<div class="card-body" style="max-width:600px;">
 					<?
 						if($settings['dns-provider']=='cpanel' && $settings['cpanel-api-token']!='' && $settings['cpanel-server']!='' && $settings['cpanel-username']!='') {
-							$cp_http = trim(shell_exec('curl -s -o /dev/null -w "%{http_code}" https://'.$settings['cpanel-server'].':2087/json-api/listzones?api.version=1 --header "Authorization: whm '.$settings['cpanel-username'].':'.$settings['cpanel-api-token'].'"'));
+							$cp_k = ($settings['cpanel-insecure-tls']??'')=='1' ? '-k ' : '';
+							$cp_http = trim(shell_exec('curl -s '.$cp_k.'-o /dev/null -w "%{http_code}" '.escapeshellarg('https://'.$settings['cpanel-server'].':2087/json-api/listzones?api.version=1').' --header '.escapeshellarg('Authorization: whm '.$settings['cpanel-username'].':'.$settings['cpanel-api-token'])));
 							if($cp_http == '200' || $cp_http == '403') {
 								echo '<div class="alert alert-info" role="alert"><div class="alert-icon" style="float:left;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon alert-icon icon-2"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0"></path><path d="M12 9h.01"></path><path d="M11 12h1v4h1"></path></svg></div><div class="text" style="float:left"><b>Connected</b> to '.$settings['cpanel-server'].' as '.$settings['cpanel-username'].'</div><br></div>';
 							}
@@ -162,6 +163,11 @@
 					<input type="text" name="cpanel-server" value="<?=$settings['cpanel-server'];?>" class="form-control" style="font-family:monospace;" placeholder="server.dom"><br>
 					<label class="form-label">Username:</label>
 					<input type="text" name="cpanel-username" value="<?=$settings['cpanel-username'];?>" class="form-control" style="font-family:monospace;" placeholder="username"><br>
+					<label class="form-check" style="cursor:pointer;">
+						<input class="form-check-input" type="checkbox" name="cpanel-insecure-tls" value="1" <?=($settings['cpanel-insecure-tls']??'')=='1'?'checked':'';?>>
+						<span class="form-check-label">Accept self-signed TLS certificate</span>
+						<span class="form-hint">WHM on port 2087 often uses a self-signed certificate. Only enable this if the connection fails with a certificate error &mdash; it disables verification, so the API token is exposed to interception.</span>
+					</label>
 					<label class="form-check" style="cursor:pointer;">
 						<input class="form-check-input" type="checkbox" name="cpanel-test" value="1">
 						<span class="form-check-label">Test cPanel API connection</span>
@@ -204,6 +210,11 @@
 						<input type="text" name="powerdns-agent-token" value="<?=$settings['powerdns-agent-token']??'';?>" class="form-control" style="font-family:monospace;" placeholder=""><br>
 					</div>
 
+					<label class="form-check" style="cursor:pointer;">
+						<input class="form-check-input" type="checkbox" name="powerdns-insecure-tls" value="1" <?=($settings['powerdns-insecure-tls']??'')=='1'?'checked':'';?>>
+						<span class="form-check-label">Accept self-signed TLS certificate</span>
+						<span class="form-hint">A PowerDNS server or agent on a private address often uses a self-signed certificate. Only enable this if the connection fails with a certificate error &mdash; it disables verification, so the API key is exposed to interception.</span>
+					</label>
 					<label class="form-check" style="cursor:pointer;">
 						<input class="form-check-input" type="checkbox" name="powerdns-test" value="1">
 						<span class="form-check-label">Test PowerDNS API connection</span>

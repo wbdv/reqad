@@ -1,8 +1,51 @@
 <?php
 	// todo move to modules/download_backup.php
+	/* Remote download: /backup/?tab=remote&date=<d>&download=<path within that
+	   dated dir>. The path is whitelisted to the three shapes backup_remote.sh
+	   actually writes — backupdb.php interpolates $_GET straight into its ssh
+	   command and that is the bug not to repeat here. */
+	if (isset($_GET["download"]) && isset($_GET["tab"]) && $_GET["tab"] === 'remote') {
+		/* Hiding the button is not the control -- this is. An account archive
+		   carries the shadow hash and ssh keys, and system/ carries /root/.ssh,
+		   /root/.my.cnf and /etc, so the endpoint hands out root-level material
+		   and is gated on root_access like the terminal and root cron are. */
+		if (!(isset($ini['root_access']) ? (int)$ini['root_access'] : 1)) {
+			msg_redirect($_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/?tab=remote',
+				"Downloading backups is disabled (root_access=0 in server-software.ini).", 'error');
+		}
+		$rd_date = isset($_GET["date"]) ? (string)$_GET["date"] : '';
+		$rd_path = (string)$_GET["download"];
+		$rd_ok = valid_backup_date($rd_date) && preg_match(
+			'#^(accounts/[a-z0-9_-]{1,32}\.tar\.gz|system/[A-Za-z0-9._-]{1,64}|databases/[a-z0-9_-]{1,32}/[A-Za-z0-9_]{1,64}\.sql\.gz)$#',
+			$rd_path);
+		if ($rd_ok) {
+			$rd_cfg = remote_backup_config();
+			if (remote_backup_configured($rd_cfg)) {
+				$rd_full = remote_backup_base($rd_cfg).$rd_date.'/'.$rd_path;
+				$rd_rc = 0;
+				$rd_size = trim(remote_backup_ssh($rd_cfg, "stat -c %s '".$rd_full."'", $rd_rc));
+				if ($rd_rc === 0 && ctype_digit($rd_size)) {
+					remote_backup_stream($rd_cfg, $rd_full, (int)$rd_size, basename($rd_path));
+					exit;
+				}
+			}
+		}
+		msg_redirect($_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/?tab=remote&date='.rawurlencode($rd_date),
+			"That file is not in the backup.", 'error');
+	}
+
+	/* NOTE: the remote handler above has already handled and exited for
+	   ?tab=remote, so anything reaching here is a local backup filename. This
+	   block's else-branch redirects unconditionally -- with it first, every
+	   remote download landed in "Invalid backup filename" instead. */
 	if(isset($_GET["download"])) {
-		$d = $_GET["download"];
-		if(preg_match('/backup_[a-z0-9]+_[a-z0-9\-\_]+\.tar\.gz/', $d) && is_file('/usr/local/reqad/backup/'.$d)) {
+		/* basename() first, then an ANCHORED match. Unanchored, the old pattern
+		   matched anywhere in the string, so "../../../root/backup_x_y.tar.gz"
+		   passed and the traversal was concatenated straight onto the backup
+		   directory — any file called backup_*.tar.gz anywhere on the box could
+		   be pulled through this endpoint. */
+		$d = basename((string)$_GET["download"]);
+		if(preg_match('/^backup_[a-z0-9]+_[a-z0-9\-\_]+\.tar\.gz$/', $d) && is_file('/usr/local/reqad/backup/'.$d)) {
 			$filesize = filesize('/usr/local/reqad/backup/'.$d);
 			header("Cache-Control: public, must-revalidate\n");
 			header("Pragma: hack\n");
@@ -16,16 +59,28 @@
 			exit;
 		} else {
 			/* invalid/missing file in download link — flash via PRG (no output yet) */
-			msg_redirect($_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/', "Invalid backup filename.", 'error');
+			msg_redirect($_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/?tab=local', "Invalid backup filename.", 'error');
 		}
 	}
+
+	/* URL-driven tabs, the same way php-settings.php and account.php do it —
+	   Bootstrap's data-bs-toggle="tab" is not used anywhere in this app. Only the
+	   active pane is ever rendered.
+	   Remote is the default, so /backup/ opens on it; everything it needs from the
+	   backup server comes from one ssh call cached for a minute (failures cached
+	   too, so an unreachable server does not cost a connect timeout per load).
+	   The local actions redirect to ?tab=local so a generate/restore/delete still
+	   lands where it was started.
+	   Set BEFORE the header is included, because the page-header buttons are
+	   gated on it. */
+	$tab = (isset($_GET['tab']) && $_GET['tab'] === 'local') ? 'local' : 'remote';
 
 	include('templates/header.php'); 
 ?>
         <!-- Page title -->
         <div class="page-header d-print-none">
             <div class="row align-items-center">
-            	<div class="col" style="padding-left:22px;">
+            	<div class="col" style="padding-left:28px;">
 					<!-- Page pre-title -->
 					<div class="page-pretitle">
 						Backup
@@ -36,6 +91,7 @@
               	</div>			
               	<div class="col-auto ms-auto d-print-none">
                 	<div class="btn-list">
+<?php if ($tab === 'local'): /* both act on ~/backup, so they belong to that tab */ ?>
                   		<a href="#" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modal-generate-backup">
                     		<svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
                     		Generate backup
@@ -44,6 +100,7 @@
                     		<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-restore"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M3.06 13a9 9 0 1 0 .49 -4.087" /><path d="M3 4.001v5h5" /><path d="M12 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /></svg>
                     		Restore account
                   		</a>
+<?php endif; ?>
                 </div>
               </div>
             </div>
@@ -53,9 +110,40 @@
 <div id="restore-toast"></div>
 <?php
 	/* A backgrounded restore redirects here with ?restoremsg=<token>; restore.sh
-	   posts its result to messages.db under that token — polled below. */
+	   and restore_remote.sh post their result to messages.db under that token —
+	   polled below. */
 	$restore_msgtoken = (isset($_GET['restoremsg']) && preg_match('/^[0-9a-f]{16}$/', $_GET['restoremsg'])) ? $_GET['restoremsg'] : '';
+
 ?>
+<style>
+	#backup-main-card { border: none; }
+	#backup-main-card > .card-header { padding-bottom: 0; background: #f6f8fb; }
+	#backup-tabs { border-bottom: 0; gap: 30px; }
+	#backup-tabs .nav-link {
+		display: block; border: 1px solid transparent; padding: 10px 20px !important;
+		color: #6c757d; font-weight: 500; line-height: 20pt !important;
+		margin-bottom: -1px; margin-left: -16px !important;
+	}
+	#backup-tabs .nav-link:hover { border-color: #dee2e6 #dee2e6 transparent; background: #475db41a; color: #354052; }
+	#backup-tabs .nav-link.active { background: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #354052; font-weight: bold; }
+	.backup-tab-pane { border: 1px solid; border-color: transparent #dee2e6 #dee2e6 #dee2e6; background: #fff; }
+</style>
+<div class="col-12">
+  <div class="card mt-3" id="backup-main-card">
+    <div class="card-header">
+      <ul class="nav nav-tabs card-header-tabs" id="backup-tabs">
+        <li class="nav-item"><a class="nav-link <?=$tab==='remote'?'active':'';?>" href="/backup/">Remote backup</a></li>
+        <li class="nav-item"><a class="nav-link <?=$tab==='local'?'active':'';?>"  href="/backup/?tab=local">Local backup</a></li>
+      </ul>
+    </div>
+    <div class="tab-content">
+      <!-- Only ONE pane is ever rendered (the inactive tab's content is never
+           built), so it is always the active one. Making the class conditional
+           left the Remote pane with a bare .tab-pane, which Bootstrap hides with
+           display:none -- the markup was all there and none of it was visible. -->
+      <div class="tab-pane backup-tab-pane active show" id="tab-backup">
+        <div class="card-body">
+<?php if ($tab === 'remote') { include('templates/backup-remote.php'); } else { ?>
 <?
      $results = $db->query('SELECT user,domain FROM accounts');
 	 $domains = array();
@@ -142,7 +230,14 @@
         </div>
       </div>
     </div>
+<?php } /* end of the Local pane */ ?>
+        </div><!-- .card-body -->
+      </div><!-- .tab-pane -->
+    </div><!-- .tab-content -->
+  </div><!-- .card -->
+</div><!-- .col-12 -->
 
+<?php if ($tab === 'local'): /* the modals belong to the Local tab only */ ?>
 	<form method="post" action="/" id="generate-backup" class="needs-validation" novalidate>
     <input type="hidden" name="action" value="generate-backup">
     <div class="modal modal-blur fade" id="modal-generate-backup" tabindex="-1" role="dialog" aria-hidden="true">
@@ -306,11 +401,121 @@
       </div>
     </div>
 	</form>
+<?php endif; /* end of the Local-tab modals */ ?>
 <?php
     include('templates/footer.php');
 ?>
+<?php if ($tab === 'remote'): ?>
+<script>
+/* Whole-server restore progress.
+   One renderer, fed either by the blob the page was rendered with or by the
+   poll, so a refresh and the first paint cannot show different things. Polling
+   stops as soon as the run reports an end record. */
+$(function () {
+	var $c = $('#rb-srv-progress');
+	if (!$c.length) return;
+
+	var PHASES = [
+		['preflight',  'Checks'],
+		['packages',   'Package compatibility'],
+		['paneldb',    'Panel database'],
+		['accounts',   'Accounts'],
+		['panelstate', 'Filters &amp; Sieve'],
+		['sysfiles',   'System files (/etc)'],
+		['services',   'Service restart']
+	];
+	var BADGE = { running:'bg-blue', ok:'bg-success', failed:'bg-red', skipped:'bg-orange' };
+
+	function esc(t) { return $('<div>').text(t === undefined || t === null ? '' : t).html(); }
+
+	function render(st) {
+		if (!st || !st.found) { $c.hide(); return; }
+		var h = '<div class="card-body">';
+		h += '<div class="d-flex align-items-center mb-3">';
+		h += '<h3 class="card-title mb-0">Full server restore &mdash; ' + esc(st.date) + '</h3>';
+		h += '<div class="ms-auto">';
+		if (st.running)      h += '<span class="badge bg-blue">running</span>';
+		else if (st.end && st.end.state === 'ok')      h += '<span class="badge bg-success">finished</span>';
+		else if (st.end && st.end.state === 'partial') h += '<span class="badge bg-orange">finished with failures</span>';
+		else if (st.end)     h += '<span class="badge bg-red">failed</span>';
+		else                 h += '<span class="badge bg-orange">interrupted</span>';
+		h += '</div></div>';
+
+		h += '<table class="table table-sm table-borderless mb-0" style="width:auto;">';
+		for (var i = 0; i < PHASES.length; i++) {
+			var k = PHASES[i][0], ph = st.phases ? st.phases[k] : null;
+			if (!ph) continue;
+			h += '<tr><td class="text-muted pe-3 ps-0" style="min-width:190px;">' + PHASES[i][1] + '</td>'
+			   + '<td><span class="badge ' + (BADGE[ph.state] || 'bg-secondary') + '">' + esc(ph.state) + '</span> '
+			   + '<span class="text-muted" style="font-size:90%;">' + esc(ph.detail) + '</span></td></tr>';
+		}
+		h += '</table>';
+
+		var accs = st.accounts || {}, names = Object.keys(accs);
+		if (names.length) {
+			names.sort();
+			h += '<div class="mt-3"><div class="text-muted mb-1" style="font-size:90%;">Accounts</div>';
+			for (var j = 0; j < names.length; j++) {
+				var a = accs[names[j]];
+				h += '<span class="badge ' + (BADGE[a.state] || 'bg-secondary') + ' me-1 mb-1" '
+				   + 'title="' + esc(a.detail) + '">' + esc(names[j]) + '</span>';
+			}
+			h += '</div>';
+		}
+		if (st.end && st.end.detail)
+			h += '<div class="mt-3 ' + (st.end.state === 'ok' ? 'text-muted' : 'text-danger')
+			   + '" style="font-size:90%;">' + esc(st.end.detail) + '</div>';
+		h += '<div class="text-muted mt-2" style="font-size:85%;">Full output: <code>log/restore_server.log</code></div>';
+		h += '</div>';
+		$c.html(h).show();
+	}
+
+	function poll() {
+		$.post('/?ajax=1', { action: 'ajax-restore-server-status' }, function (st) {
+			render(st);
+			/* keep polling only while it is actually running */
+			if (st && st.running) setTimeout(poll, 5000);
+		}, 'json').fail(function () { setTimeout(poll, 15000); });
+	}
+
+	var initial = null;
+	try { initial = JSON.parse($c.attr('data-state')); } catch (e) {}
+	render(initial);
+	if (initial && initial.running) setTimeout(poll, 5000);
+});
+</script>
+<?php endif; ?>
 <script>
 jQuery(document).ready(function () {
+	/* Remote tab: one modal, filled from the row's data-* attributes. Which
+	   restore modes are offered depends on the account — 'entire account' only
+	   makes sense while it is deleted, the partial ones only while it is live. */
+	$('.rb-restore').on('click', function () {
+		var $b = $(this),
+		    exists = $b.data('exists') == 1,
+		    haveph = $b.data('haveph') == 1,
+		    dbs    = String($b.data('dbs') || '');
+		$('#rb-user').val($b.data('user'));
+		$('#rb-user-label').text($b.data('user'));
+
+		$('#rb-opt-account').toggle(!exists);
+		$('#rb-opt-ph').toggle(exists && haveph);
+		var dbList = dbs === '' ? [] : dbs.split(',');
+		$('#rb-opt-db').toggle(exists && dbList.length > 0);
+		var $sel = $('#rb-db').empty();
+		$.each(dbList, function (i, d) { $sel.append($('<option>').val(d).text(d)); });
+
+		$('#modal-rb-restore input[name=mode]').prop('checked', false);
+		$('#modal-rb-restore input[name=mode]:visible').first().prop('checked', true);
+		bootstrap.Modal.getOrCreateInstance(document.getElementById('modal-rb-restore')).show();
+	});
+	$('#rb-restore-form').on('submit', function (e) {
+		if (!$('#modal-rb-restore input[name=mode]:checked').length) {
+			e.preventDefault();
+			alert('Choose what to restore.');
+		}
+	});
+
 	'use strict';
 
 	$("#generate-backup").submit(function(event) {

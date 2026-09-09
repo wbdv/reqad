@@ -82,6 +82,10 @@ if ($cron_user === 'root') {
 
     if ($errmsg == '') {
         shell_exec('echo ' . escapeshellarg($line) . ' | sudo tee --append ' . escapeshellarg($cron_file) . ' > /dev/null');
+        // A spool file created by tee lands as root:root 0644 — crond skips any
+        // crontab with group/other bits set, so the job would never run.
+        shell_exec('sudo chown ' . escapeshellarg($cron_user . ':' . $cron_user) . ' ' . escapeshellarg($cron_file));
+        shell_exec('sudo chmod 600 ' . escapeshellarg($cron_file));
         $successmsg = "Cron job successfully added for user $cron_user.";
         error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " create cron (user=$cron_user): $line\n", 3, '../log/route_log');
     }

@@ -22,7 +22,7 @@ TEMPLATE=$(grep -oP '^template=\K.*' "$INI" | tr -d '[:space:]')
 
 case "$TEMPLATE" in
     nginx_php-fpm)  PLUGIN="nginx"  ;;
-    apache_mod_php) PLUGIN="apache" ;;
+    apache_modphp)  PLUGIN="apache" ;;
     *)
         echo "  Unknown template '${TEMPLATE}', skipping"
         exit 0

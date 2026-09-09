@@ -1,0 +1,133 @@
+#!/bin/bash
+#
+# deldomain — remove an additional (addon) domain created with scripts/adddomain.
+#
+# Removes the vhost file and the php-fpm pool, then reloads the web server.
+# The document root and the SSL certificate are kept unless asked for.
+#
+# Only files carrying the "Additional domain of account …" marker that adddomain
+# writes are touched, so this can never delete a main account vhost.
+#
+set -u
+
+PATH_REQAD="$(cd "$(dirname "$0")/.." && pwd)"
+INI="${PATH_REQAD}/etc/server-software.ini"
+
+DOMAIN=''
+DEL_DOCROOT=0
+DEL_CERT=0
+DRYRUN=0
+
+usage() {
+    cat <<EOF
+Remove an additional domain from its hosting account.
+
+Usage: $0 --domain=EXAMPLE.TLD [options]
+
+Options:
+  --domain=DOMAIN      the addon domain to remove
+  --delete-docroot     also delete the document root and everything in it
+  --delete-cert        also delete the Let's Encrypt certificate (certbot delete)
+  --dry-run            print what would be done, remove nothing
+  -h, --help           this help
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --domain=*)       DOMAIN="${arg#*=}" ;;
+        --delete-docroot) DEL_DOCROOT=1 ;;
+        --delete-cert)    DEL_CERT=1 ;;
+        --dry-run)        DRYRUN=1 ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                echo "Error: unknown argument '$arg'"; usage; exit 1 ;;
+    esac
+done
+
+die() { echo "Error: $*" >&2; exit 1; }
+run() {
+    if [ "$DRYRUN" -eq 1 ]; then echo "+ $*"; else "$@"; fi
+}
+
+[ "$(id -u)" -eq 0 ] || die "You can only run this script as root."
+[ -n "$DOMAIN" ] || { usage; exit 1; }
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] \
+    || die "Domain name '$DOMAIN' is not valid."
+
+TEMPLATE="$(grep -E '^[[:space:]]*template[[:space:]]*=' "$INI" | head -n1 | cut -d= -f2 | tr -d '[:space:]')"
+case "$TEMPLATE" in
+    apache_*) VHOST="/etc/httpd/conf.d/${DOMAIN}.conf"; WEB_SERVICE='httpd'; CONFTEST='httpd -t' ;;
+    nginx_*)  VHOST="/etc/nginx/conf.d/${DOMAIN}.conf"; WEB_SERVICE='nginx';  CONFTEST='nginx -t' ;;
+    *) die "Unknown web server template '$TEMPLATE' in $INI." ;;
+esac
+
+[ -f "$VHOST" ] || die "No vhost file $VHOST — '$DOMAIN' is not configured on this server."
+# The marker is what makes this an addon domain; a main account vhost has none.
+grep -qE '^#[[:space:]]*Additional domain of account[[:space:]]+[a-z][a-z0-9]{1,15}\b.*adddomain' "$VHOST" \
+    || die "$VHOST is not an addon domain vhost (no adddomain marker). Refusing to touch it."
+
+USER="$(grep -m1 -oE '^#[[:space:]]*Additional domain of account[[:space:]]+[a-z][a-z0-9]{1,15}' "$VHOST" | awk '{print $NF}')"
+DOCROOT="$(grep -m1 -oE '^[[:space:]]*(DocumentRoot|root)[[:space:]]+[^;[:space:]]+' "$VHOST" | awk '{print $NF}')"
+
+# php-fpm pool: the default version lives in /etc/php-fpm.d, the SCLs under /etc/opt/remi
+POOLS=()
+SERVICES=()
+[ -f "/etc/php-fpm.d/${DOMAIN}.conf" ] && { POOLS+=("/etc/php-fpm.d/${DOMAIN}.conf"); SERVICES+=("php-fpm.service"); }
+for d in /etc/opt/remi/php*/php-fpm.d; do
+    [ -f "${d}/${DOMAIN}.conf" ] || continue
+    short="$(echo "$d" | sed -E 's#/etc/opt/remi/php([0-9]+)/.*#\1#')"
+    POOLS+=("${d}/${DOMAIN}.conf")
+    SERVICES+=("php${short}-php-fpm.service")
+done
+
+echo "Addon domain ..... ${DOMAIN} (account ${USER})"
+echo "Vhost ............ ${VHOST}"
+[ "${#POOLS[@]}" -gt 0 ] && echo "PHP-FPM pool ..... ${POOLS[*]}"
+echo "Document root .... ${DOCROOT} ($([ "$DEL_DOCROOT" -eq 1 ] && echo 'will be DELETED' || echo 'kept'))"
+echo
+
+run rm -f "$VHOST"
+for p in "${POOLS[@]:-}"; do
+    [ -n "$p" ] && run rm -f "$p"
+done
+
+if [ "$DEL_DOCROOT" -eq 1 ]; then
+    # Only ever inside the account's home, and never the home itself
+    if [ -n "$DOCROOT" ] && [ -d "$DOCROOT" ] \
+       && [[ "$DOCROOT" == /home/${USER}/?* ]] && [ "$DOCROOT" != "/home/${USER}/public_html" ]; then
+        run rm -rf "$DOCROOT"
+        echo "Deleted ${DOCROOT}"
+    else
+        echo "Warning: refusing to delete document root '${DOCROOT}' — not a subdirectory of /home/${USER}."
+    fi
+fi
+
+if [ "$DRYRUN" -eq 1 ]; then
+    [ "$DEL_CERT" -eq 1 ] && echo "+ certbot delete --cert-name ${DOMAIN}"
+    echo "+ ${CONFTEST} && systemctl reload ${WEB_SERVICE}"
+    exit 0
+fi
+
+if [ "$DEL_CERT" -eq 1 ] && [ -d "/etc/letsencrypt/live/${DOMAIN}" ]; then
+    certbot delete --non-interactive --cert-name "$DOMAIN" >/dev/null 2>&1 \
+        && echo "Deleted Let's Encrypt certificate for ${DOMAIN}"
+fi
+rm -f "/etc/ssl/certs/${DOMAIN}.crt" "/etc/ssl/certs/${DOMAIN}.key" 2>/dev/null
+
+for s in $(printf '%s\n' "${SERVICES[@]:-}" | sort -u); do
+    [ -n "$s" ] || continue
+    systemctl restart "$s" && echo "Restarted ${s}"
+done
+
+if $CONFTEST >/dev/null 2>&1; then
+    systemctl reload "$WEB_SERVICE" 2>/dev/null || systemctl restart "$WEB_SERVICE"
+    echo "Reloaded ${WEB_SERVICE}"
+else
+    echo "Warning: ${WEB_SERVICE} configuration test failed after the removal — not reloading:" >&2
+    $CONFTEST 2>&1 | sed 's/^/    /' >&2
+    exit 1
+fi
+
+echo
+echo "Addon domain ${DOMAIN} removed."

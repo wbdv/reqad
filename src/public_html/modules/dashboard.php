@@ -1,5 +1,8 @@
 <?php
-$IP=`/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print \$2'} | awk -F/ {'print \$1'}`;
+$IP=trim(`/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print \$2'} | awk -F/ {'print \$1'}`);
+$IP2=trim(`curl ifconfig.me`);
+if($IP2 != $IP)
+    $IP = trim($IP2) .' ('.trim($IP).')';
 $HOSTNAME=trim(`hostname`);
 $OS=`hostnamectl status | grep 'Operating System:' | awk {'print $3 " " $4 " " $5'} | awk -F\( {'print $1'}`;
 $MEMORY=`free -mw | grep 'Mem:' | awk {'print \$2'}`;

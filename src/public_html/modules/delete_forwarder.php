@@ -7,11 +7,11 @@ $successmsg = '';
 #echo '<pre>'; print_r($_POST); exit;
 list($user, $domain) = explode('@', $forwarder);
 
-if(!preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+if(!valid_domain($domain)) {
 	$errmsg = "Error: Domain name is wrong, please check what you selected.";
 } else if(!is_file("/etc/exim/forwards/".$domain)) {
 	$errmsg = "Error: Missing /etc/exim/forwards/$domain file";
-} else if(!preg_match('/[A-Za-z0-9\+\-_\.]{1,32}/', $user)) {
+} else if(!valid_email_user($user)) {
 	$errmsg = "Error: User part of forwarder is wrong";
 }
 

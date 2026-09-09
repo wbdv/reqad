@@ -28,7 +28,7 @@ $errmsg 	= '';
 $successmsg = '';
 #echo '<pre>'; print_r($_POST); exit;
 
-if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+if(valid_domain($domain)) {
     $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
     if ($row = $results->fetchArray()) {
         $errmsg = "Error: Domain name already exists on this server, assigned to user ".$row["user"].".";
@@ -40,7 +40,7 @@ if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
 if($errmsg == '') {
     if(in_array($user, array('root', 'reqad', 'test', 'bin', 'daemon', 'adm', 'lp', 'sync', 'shutdown', 'halt', 'mail', 'operator', 'games', 'ftp', 'nobody', 'systemd-network', 'dbus', 'polkitd', 'sshd', 'postfix', 'chrony', 'reqad', 'apache', 'cjdns', 'vnstat', 'postgres', 'redis', 'awx', 'nginx', 'tss'))) {
         $errmsg =  "Error: Username already exists. Please choose a distinct one.";
-    } else if(preg_match('/[a-z]+[a-z0-9]{1,7}/', $user)) {
+    } else if(valid_username($user)) {
         $results = $db->query('SELECT * FROM accounts WHERE user="'.$user.'"');
         if ($row = $results->fetchArray()) {
             $errmsg =  "Error: Username already exists (UID=".$row["id"]."). Please choose a different one.";
@@ -51,7 +51,7 @@ if($errmsg == '') {
             }
         }
     } else {
-		$errmsg =  "Error: Username should contain only lowercase letters and numbers.";
+		$errmsg =  "Error: Username must be 2-16 characters, lowercase letters and numbers only, starting with a letter.";
 	}
 }
 
@@ -60,8 +60,12 @@ if($errmsg == '') {
     if(strlen($password)<8) {
         $errmsg =  "Error: Password should be at least 8 characters long.";
     }
-    if(strpos($password, ':') !== false || strpos($password, '"') !== false || strpos($password, "'") !== false) {
-        $errmsg =  "Error: Password cannot contains : \" or '";
+    /* `:` and newlines are the chpasswd record separators, so they are still
+       rejected. Quotes used to be banned too because the password was pasted
+       into a shell string; set_system_password() writes to stdin now, so they
+       are safe and no longer restricted. */
+    else if(strpos($password, ':') !== false || strpos($password, "\n") !== false || strpos($password, "\r") !== false) {
+        $errmsg =  "Error: Password cannot contain a colon (:) or a line break.";
     }
 }
 
@@ -93,7 +97,7 @@ if($errmsg == '') {
 		// set password
 		#$password = str_replace('"', '\"', $password);
 		#$password = str_replace("'", "\'", $password);
-		shell_exec("echo '$user:$password' | sudo chpasswd");
+		set_system_password($user, $password);
 		#    if(!is_null($output)) {
 		#        $errmsg =  "Error: ".$output;
 		#   } else {
@@ -179,6 +183,11 @@ if($errmsg == '') {
 			$output = trim(shell_exec("dig +short TXT _dmarc.$domain $nameserver"));
 			if($output=='')
 				add_update_dmarc($domain);		
+
+			/* Mail TLS (dovecot/exim SNI) and the static Thunderbird/Outlook
+			   autoconfiguration files both key off /etc/exim/domains, which the
+			   block above just added to. update_email_sni regenerates both. */
+			shell_exec('sudo /usr/local/reqad/scripts/update_email_sni >> /usr/local/reqad/log/debug_log 2>&1 &');
 		} 
     } else {
 		$errmsg = "User $user does not exists (cannot be created).";

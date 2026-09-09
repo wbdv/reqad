@@ -102,7 +102,15 @@ if [ "$(systemctl is-active spamassassin)" == "inactive" ]; then
 		useradd -r -g spamd -s /sbin/nologin -d /var/lib/spamassassin spamd
 		mkdir -p /var/lib/spamassassin
 		chown spamd:spamd /var/lib/spamassassin
-		echo 'SPAMDOPTIONS="-c -m5 -H -u spamd"' > /etc/sysconfig/spamassassin
+		# NO -u here. -u makes spamd drop root and run as that single user for
+		# every message, so it can never setuid to the account a scan is
+		# requested for and never reads /home/<acct>/.spamassassin/user_prefs --
+		# the whitelist/blocklist the Spam Filters page writes, mode 0600 and
+		# owned by the account. Everything then scores against site rules only,
+		# silently. spamd has to run as root and switch per request; that is how
+		# cPanel runs it too. See scripts/update/setup_spamd_per_user.sh, which
+		# repairs servers provisioned before this was fixed (2026-09-03).
+		echo 'SPAMDOPTIONS="-c -m5 -H"' > /etc/sysconfig/spamassassin
 		cat /usr/local/reqad/scripts/install/config/spamassassin_local.txt > /etc/mail/spamassassin/local.cf
 		/usr/bin/sa-update -v
 	) >> ./install_reqad.log 2>&1
@@ -169,7 +177,8 @@ EOF
 		# dovecot-submissiond is intentionally NOT installed — exim is the MSA on
 		# ports 587/465. We still write a disabling 20-submission.conf below so the
 		# protocol stays off even if the package gets pulled in later.
-		dnf -y install dovecot dovecot-imapd dovecot-pop3d dovecot-lmtpd
+		dnf -y install dovecot dovecot-imapd dovecot-pop3d dovecot-lmtpd \
+		    dovecot-sieve dovecot-managesieved
 
 		# Dovecot submission conflicts with exim on ports 587/465. Overwrite (don't
 		# rm) so that if dovecot-submissiond is ever installed, RPM keeps our file
@@ -190,11 +199,164 @@ service auth {
     group = mail
   }
 }
+
+# Local delivery goes exim -> LMTP -> dovecot so that Pigeonhole Sieve runs.
+# The 2.4 default socket is 0600 dovecot:root, which exim (running as exim, in
+# the mail group) cannot open. NOTE: DirectAdmin guides use mode 0666 here —
+# world-writable, do not copy.
+service lmtp {
+  unix_listener lmtp {
+    mode  = 0660
+    user  = mail
+    group = mail
+  }
+}
 MASTEREOF
 
-		# Dovecot 2.4 requires version headers as the very first settings
-		if ! grep -q '^dovecot_config_version' /etc/dovecot/dovecot.conf; then
-		    sed -i '1s/^/dovecot_config_version = 2.4.1\ndovecot_storage_version = 2.4.1\n/' \
+		# The sieve plugin MUST be loaded for the lmtp service. Without it LMTP
+		# delivers straight to the maildir and every filter tier is silently
+		# skipped — with no error anywhere.
+		cat > /etc/dovecot/conf.d/20-lmtp.conf <<'LMTPEOF'
+protocols {
+  lmtp = yes
+}
+
+protocol lmtp {
+  mail_plugins {
+    sieve = yes
+  }
+}
+LMTPEOF
+
+		# ManageSieve, bound to loopback: roundcube connects over localhost and
+		# reqad uses `doveadm sieve` locally. To let external IMAP clients manage
+		# filters, drop the `listen` line AND open 4190 — ssl = required already
+		# forces STARTTLS.
+		# ManageSieve binds to 127.0.0.1 ONLY, never ::1: a box with IPv6 disabled
+		# has no ::1 and dovecot treats a listener it cannot bind as FATAL —
+		#   master: Error: bind(::1, 4190) failed: Cannot assign requested address
+		#   master: Fatal: Failed to start listeners
+		# — which takes the whole mail server down. Everything that speaks
+		# ManageSieve here (roundcube, doveadm) is local and uses 127.0.0.1.
+		cat > /etc/dovecot/conf.d/20-managesieve.conf <<'MSIEVEEOF'
+protocols {
+  sieve = yes
+}
+
+service managesieve-login {
+  inet_listener sieve {
+    port   = 4190
+    listen = 127.0.0.1
+  }
+}
+MSIEVEEOF
+
+		# Sieve: three tiers, evaluated global -> domain -> personal.
+		# active_path deliberately has NO leading dot — mail_path is ~/, so the home
+		# IS the maildir root and dovecot treats ~/.<name> as an IMAP folder; the
+		# conventional ~/.dovecot.sieve makes maildir stat ~/.dovecot.sieve/tmp and
+		# fail with "Not a directory".
+		# NOTE: `stop` does NOT short-circuit between scripts in pigeonhole; only
+		# `discard` ends the sequence. The tiers are additive, not hierarchical.
+		cat > /etc/dovecot/conf.d/90-sieve.conf <<'SIEVEEOF'
+# Sieve (Pigeonhole) — managed by Reqad.
+#
+# Three tiers, evaluated in this order:
+#   1. global   — server-wide, rendered by Reqad from the email_filters table
+#   2. domain   — per-domain,  rendered by Reqad from the email_filters table
+#   3. personal — per-mailbox, the user's own script (ManageSieve-editable)
+#
+# Tiers 1 and 2 are "before" scripts. NOTE: `stop` does NOT cross script
+# boundaries — it ends only its own script and the sequence continues to the
+# next tier (measured). Only `discard` terminates the whole sequence. The tiers
+# are therefore additive, not hierarchical; this differs from cPanel.
+#
+# Scripts live under /var/lib/reqad/, NOT /var/lib/dovecot/: the dovecot spec
+# ships `%attr(0750,dovecot,dovecot) /var/lib/dovecot`, so every package upgrade
+# resets that mode and the LMTP process (which setuids to the mailbox owner)
+# loses +x on it — delivery then fails with a 451 "Temporarily unable to access
+# necessary Sieve scripts". A chmod there would be undone by the next upgrade.
+#
+# NOTE: Dovecot 2.4 syntax (named sieve_script blocks). The 90-sieve.conf in the
+# RPM's example-config is stale 2.3 `plugin { sieve = ... }` syntax — do not copy it.
+
+# active_path deliberately has NO leading dot. mail_path/mail_inbox_path are ~/,
+# so the home IS the maildir root and dovecot treats ~/.<name> as an IMAP folder
+# — the conventional ~/.dovecot.sieve makes maildir stat ~/.dovecot.sieve/tmp and
+# fail with "Not a directory". ~/dovecot.sieve sits outside the folder namespace.
+# It is also kept out of ~/sieve/ so it is not listed as a script named "active".
+sieve_script personal {
+  driver      = file
+  path        = ~/sieve
+  active_path = ~/dovecot.sieve
+}
+
+sieve_script global {
+  type   = before
+  driver = file
+  path   = /var/lib/reqad/sieve/reqad-global.sieve
+}
+
+sieve_script domain {
+  type   = before
+  driver = file
+  path   = /var/lib/reqad/sieve/domains/%{user | domain}.sieve
+}
+
+# 4th tier, evaluated last of the "before" scripts: the per-mailbox vacation
+# reply, rendered by Reqad from the autoresponders table. Declared after global
+# and domain so an admin rule that discards a message suppresses the auto-reply.
+# %{user} is the full login name (user@domain), which is how Reqad names the file.
+sieve_script autoresponder {
+  type   = before
+  driver = file
+  path   = /var/lib/reqad/sieve/autoresponders/%{user}.sieve
+}
+
+# "Pipe to a program" actions — vnd.dovecot.pipe, from the sieve_extprograms
+# plugin (ships with dovecot in lib90_sieve_extprograms_plugin.so). The Sieve
+# argument is a FILENAME resolved inside sieve_pipe_bin_dir, never a path, so a
+# filter can only run programs an administrator has installed there. The panel
+# lists that directory and never writes to it.
+# MEASURED on 2.4.5: `sieve_extensions = +vnd.dovecot.pipe` is read BEFORE the
+# plugin registers the extension, so it is dropped with "ignored unknown
+# extension" on every delivery and `require "vnd.dovecot.pipe"` then fails.
+# sieve_global_extensions is applied after the plugin loads and does work — and
+# it restricts the extension to the admin tiers: a mailbox owner's own script is
+# refused with "its use is restricted to global scripts", which is the boundary
+# we want (piping runs a program as the mailbox's system user).
+sieve_plugins           = sieve_extprograms
+sieve_global_extensions = vnd.dovecot.pipe
+sieve_pipe_bin_dir      = /var/lib/reqad/sieve/bin
+SIEVEEOF
+
+		# LMTP drops to the mailbox owner, so every uid must be able to traverse into
+		# /var/lib/reqad to reach sieve/ and volatile/. 0711 = traverse without listing.
+		mkdir -p /var/lib/reqad
+		chmod 0711 /var/lib/reqad
+
+		# Volatile dir for mail_volatile_path (lock files). Sticky like /tmp: dovecot
+		# creates the per-user subdir as the mailbox owner, so the parent must be
+		# writable by all of them without letting them touch each other's.
+		mkdir -p /var/lib/reqad/volatile
+		chmod 1777 /var/lib/reqad/volatile
+
+		mkdir -p /var/lib/reqad/sieve/domains /var/lib/reqad/sieve/autoresponders /var/lib/reqad/sieve/bin
+		chown -R dovecot:dovecot /var/lib/reqad/sieve
+		chmod 755 /var/lib/reqad/sieve /var/lib/reqad/sieve/domains /var/lib/reqad/sieve/autoresponders /var/lib/reqad/sieve/bin
+
+		# Dovecot 2.4 requires version headers as the very first settings.
+		# Declare the version we actually installed, not a hardcoded 2.4.1:
+		# these say which release the config was written for, and dovecot keeps
+		# that release's defaults for anything whose default has since moved.
+		DC_VER=$(rpm -q --qf '%{VERSION}' dovecot 2>/dev/null || true)
+		case "$DC_VER" in 2.4*) ;; *) DC_VER="2.4.1" ;; esac
+		if grep -q '^dovecot_config_version' /etc/dovecot/dovecot.conf; then
+		    sed -i "s/^dovecot_config_version *=.*/dovecot_config_version = $DC_VER/; \
+		            s/^dovecot_storage_version *=.*/dovecot_storage_version = $DC_VER/" \
+		        /etc/dovecot/dovecot.conf
+		else
+		    sed -i "1s/^/dovecot_config_version = $DC_VER\ndovecot_storage_version = $DC_VER\n/" \
 		        /etc/dovecot/dovecot.conf
 		fi
 
@@ -217,6 +379,21 @@ ssl_server_prefer_ciphers = client
 # Mail — home dir is the Maildir root; INBOX = ~/cur+new+tmp, subfolders = ~/.FolderName/
 mail_path = ~/
 mail_inbox_path = ~/
+
+# Home IS the maildir root here (mail_path = ~/), so dovecot reads every ~/.name
+# as an IMAP folder — which turned its own duplicate database into junk
+# mailboxes visible in every client: dovecot/lda-dupes and
+# dovecot/lda-dupes/locks, the latter even acquiring cur/new/tmp and an index.
+#   * stat_dirs makes the lister check that a ".name" really is a directory, so
+#     the .dovecot.lda-dupes FILE stops being listed as a folder.
+#   * mail_volatile_path moves lock directories out of the maildir altogether,
+#     which is what the ".locks" mailbox was.
+# Duplicate suppression keeps working — verified: a second vacation reply to the
+# same sender is still "discarded duplicate vacation response".
+maildir {
+  stat_dirs = yes
+}
+mail_volatile_path = /var/lib/reqad/volatile/%{user}
 
 # Auth mechanisms
 auth_mechanisms = plain login

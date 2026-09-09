@@ -196,7 +196,7 @@
                         <td data-label="Domain">
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
-                              <div class="font-weight-medium"><?=$dbname;?></div>
+                              <div class="font-weight-medium"><?=h($dbname);?></div>
                             </div>
                           </div>
                         </td>
@@ -210,7 +210,7 @@
                         <td data-label="User">
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
-                            <?=$user;?>
+                            <?=h($user);?>
                             </div>
                           </div>
                         </td>
@@ -247,9 +247,9 @@
                         <td>
                           <div class="btn-list flex-nowrap">
                             <? if(isset($mysql_users[$dbname])) { ?>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-change-db-password" data-bs-dbuser="<?=$mysql_users[$dbname];?>">Change password</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-change-db-password" data-bs-dbuser="<?=h($mysql_users[$dbname]);?>">Change password</a>
                             <? } ?>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-database" data-bs-database="<?=$dbname;?>">Delete</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-database" data-bs-database="<?=h($dbname);?>">Delete</a>
                           </div>
                         </td>
                       </tr>
@@ -305,7 +305,7 @@
 			  	<select name="user" id="user" class="form-select">
 				  <option value=""></option>
 					<? foreach ($users as $user) { ?>
-					<option value="<?=$user;?>"><?=$user;?></option>
+					<option value="<?=h($user);?>"><?=h($user);?></option>
 					<? } ?>
                 </select>              
 				<div class="invalid-feedback" id="invalid-user">

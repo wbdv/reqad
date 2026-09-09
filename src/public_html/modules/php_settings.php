@@ -127,12 +127,28 @@ if($errmsg == '') {
 					// never write a blank numeric value — php reads "var =" as 0
 					if($type=='numeric' && (!isset($_POST[$var2]) || trim($_POST[$var2])===''))
 						continue;
-					//TODO add numbers validation
-					error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." sudo sed -i 's/^$var = ".$php_ini[$var].".*/$var = ".$_POST[$var2]."/' $phpini_path_cur\n", 3, '../log/debug_log');
-					if($php_ini[$var]=='')
-						shell_exec("sudo sed -i 's/^$var =.*/$var = ".str_replace(array('&', '/'), array('\&', '\/'), $_POST[$var2])."/' $phpini_path_cur");
-					else
-						shell_exec("sudo sed -i 's/^$var = ".$php_ini[$var].".*/$var = ".str_replace(array('&', '/'), array('\&', '\/'), $_POST[$var2])."/' $phpini_path_cur");
+					/* SECURITY: this value used to be pasted into the sed script with
+					   only & and / escaped -- those are sed's specials, not the
+					   shell's -- so a single quote in it closed the script and the
+					   rest ran as a shell command under the panel user's
+					   NOPASSWD:ALL sudo. It is now rejected unless it matches what
+					   the setting can legitimately hold, escaped for sed, and the
+					   whole expression is escapeshellarg()d so nothing in a value
+					   can reach the shell as syntax. */
+					$newval = (string)$_POST[$var2];
+					if(!php_ini_valid_value($type, $newval)) {
+						$errmsg = 'Invalid value for '.$var.'.';
+						continue;
+					}
+					error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." $phpini_path_cur $var = $newval\n", 3, '../log/debug_log');
+					/* Match on the KEY, not on the current value. The old pattern
+					   interpolated the existing value into the regex unescaped, so
+					   any setting already holding a slash (date.timezone =
+					   Europe/Bucharest) built a broken sed expression and silently
+					   never saved. */
+					$expr = 's/^'.sed_escape_pattern($var).'[[:space:]]*=.*/'
+					      . sed_escape_replacement($var.' = '.$newval).'/';
+					shell_exec('sudo sed -i '.escapeshellarg($expr).' '.escapeshellarg($phpini_path_cur));
 					$successmsg =  "PHP Settings saved.";
 				}
 			}
@@ -186,7 +202,22 @@ if($errmsg == '') {
 				// never write a blank numeric value — it would be read as 0
 				if($type=='numeric' && trim($_POST[$var2])==='')
 					continue;
-				shell_exec("sudo sed -i 's/^$var=.*/$var=".str_replace(array('&', '/'), array('\&', '\/'), $_POST[$var2])."/' $opcache_path_cur");
+				/* SECURITY: this value used to be pasted into the sed script with
+				   only & and / escaped -- those are sed's specials, not the
+				   shell's -- so a single quote in it closed the script and the
+				   rest ran as a shell command under the panel user's
+				   NOPASSWD:ALL sudo. It is now rejected unless it matches what
+				   the setting can legitimately hold, escaped for sed, and the
+				   whole expression is escapeshellarg()d so nothing in a value
+				   can reach the shell as syntax. */
+				$newval = (string)$_POST[$var2];
+				if(!php_ini_valid_value($type, $newval)) {
+					$errmsg = 'Invalid value for '.$var.'.';
+					continue;
+				}
+				$expr = 's/^'.sed_escape_pattern($var).'[[:space:]]*=.*/'
+				      . sed_escape_replacement($var.'='.$newval).'/';
+				shell_exec('sudo sed -i '.escapeshellarg($expr).' '.escapeshellarg($opcache_path_cur));
 				$successmsg = "PHP Settings saved.";
 			}
 		}
@@ -242,7 +273,17 @@ if($errmsg == '' && isset($_POST['apcu_present'])) {
 				if($type=='numeric' && trim($newval)==='')
 					continue;
 				if($ac[$var] != $newval) {
-					shell_exec("sudo sed -i 's/^$var=.*/$var=".str_replace(array('&', '/'), array('\&', '\/'), $newval)."/' $apcu_path_cur");
+					/* SECURITY: see the php.ini block above — the value is now
+					   whitelisted and the sed expression escapeshellarg()d.
+					   (Stripping quotes just above already blocked the quote-escape
+					   here, but this leaves no half-safe copy of the pattern.) */
+					if(!php_ini_valid_value($type, $newval)) {
+						$errmsg = 'Invalid value for '.$var.'.';
+						continue;
+					}
+					$expr = 's/^'.sed_escape_pattern($var).'[[:space:]]*=.*/'
+					      . sed_escape_replacement($var.'='.$newval).'/';
+					shell_exec('sudo sed -i '.escapeshellarg($expr).' '.escapeshellarg($apcu_path_cur));
 					$successmsg = "PHP Settings saved.";
 				}
 			}

@@ -185,7 +185,7 @@
                   <a href="/accounts/" class="text-muted">Accounts</a> / <?=$acct["user"];?>
                 </div>
                 <h2 class="page-title" style="white-space:nowrap !important;">
-                  Advanced settings for &nbsp;<b><?=$domain;?></b>
+                  Advanced settings for &nbsp;<b><?=h($domain);?></b>
                 </h2>
               </div>
               <div class="col-auto ms-auto d-print-none">
@@ -257,7 +257,7 @@
                     <div class="card-body">
                       <div class="d-flex align-items-center mb-3">
                         <div style="padding:5px;max-width:720px;">
-                          <div class="text-muted"><b>Note:</b> Alias domains are supplementary domains that share the same document root, config files and serve the same site as main domain, <code><?=$domain;?></code>. Wildcard domains like <code>*.<?=$domain;?></code> are allowed.</div>
+                          <div class="text-muted"><b>Note:</b> Alias domains are supplementary domains that share the same document root, config files and serve the same site as main domain, <code><?=h($domain);?></code>. Wildcard domains like <code>*.<?=h($domain);?></code> are allowed.</div>
                         </div>
                         <div class="ms-auto d-flex" style="gap:8px;">
                           <?php if($uses_le): ?>
@@ -326,14 +326,14 @@
                             <!-- mail.<domain> is derived from the email setting, not stored; view-only. -->
                             <tr>
                               <td>
-                                <span class="font-weight-medium">mail.<?=$domain;?></span>
+                                <span class="font-weight-medium">mail.<?=h($domain);?></span>
                                 <span class="badge bg-secondary-lt border ms-1">mail</span>
                               </td>
                               <td><span class="badge bg-blue-lt">standard</span></td>
                               <td>
                                 <?php if(!$uses_le): ?><span class="text-muted">&mdash;</span>
                                 <?php elseif(alias_is_covered('mail.'.$domain, $cert_san)): ?><span class="badge bg-success-lt">covered</span>
-                                <?php else: ?><span class="badge bg-orange-lt" title="Reissue SSL to cover mail.<?=$domain;?>">pending</span><?php endif; ?>
+                                <?php else: ?><span class="badge bg-orange-lt" title="Reissue SSL to cover mail.<?=h($domain);?>">pending</span><?php endif; ?>
                               </td>
                               <td><span class="text-muted" style="font-size:.85rem;" title="Managed automatically while email is enabled">required</span></td>
                             </tr>
@@ -453,10 +453,10 @@
         <div class="modal-body">
           <div class="mb-3">
             <label class="form-label">Alias domain</label>
-            <input type="text" name="alias" id="alias-input" class="form-control" placeholder="alias.example.com or *.<?=$domain;?>" autocomplete="off">
+            <input type="text" name="alias" id="alias-input" class="form-control" placeholder="alias.example.com or *.<?=h($domain);?>" autocomplete="off">
             <div class="invalid-feedback" id="alias-invalid">Please enter a valid domain.</div>
             <small class="form-text text-muted" style="display:block;margin-top:8px;">
-              Serves the same site as <b><?=$domain;?></b>. A <b>standard</b> alias must point to this server's IP.
+              Serves the same site as <b><?=h($domain);?></b>. A <b>standard</b> alias must point to this server's IP.
               A <b>wildcard</b> (<code>*.domain</code>) matches every subdomain.
             </small>
           </div>
@@ -465,7 +465,7 @@
             <label class="form-check">
               <input class="form-check-input" type="checkbox" name="add_dns" checked="true">
               <span class="form-check-label">Create the DNS record for this alias (<?=$dns_provider;?>)</span>
-              <span class="form-check-description">Adds an <b>A</b> record (or wildcard <b>A</b>) pointing to this server. A subdomain of <b><?=$domain;?></b> is added to its zone; a separate domain gets a new zone. Uncheck if DNS is managed elsewhere.</span>
+              <span class="form-check-description">Adds an <b>A</b> record (or wildcard <b>A</b>) pointing to this server. A subdomain of <b><?=h($domain);?></b> is added to its zone; a separate domain gets a new zone. Uncheck if DNS is managed elsewhere.</span>
             </label>
           </div>
           <?php endif; ?>

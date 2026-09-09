@@ -1,4 +1,4 @@
-<?
+<?php
 $powerdns_server   = $settings["powerdns-server"];
 $powerdns_api_key  = $settings["powerdns-api-key"];
 $dns_provider_name = 'PowerDNS';
@@ -52,11 +52,10 @@ function powerdns_agent_call($action, $data, &$error = null, &$response = null) 
         CURLOPT_POSTFIELDS     => json_encode($data),
         CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Authorization: Bearer '.$token],
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false,
         CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
         CURLOPT_TIMEOUT        => 60,
     ]);
+    curl_set_tls($curl, 'powerdns');
     $raw  = curl_exec($curl);
     $cerr = curl_error($curl);
     $resp = json_decode($raw, true);
@@ -200,8 +199,7 @@ function powerdns_api($api_query, $parse_to_array = false, $method = 'GET', $dat
         curl_setopt($curl, CURLOPT_STDERR, fopen(_PATH.'/log/debug_log', 'a'));
     }
 
-    curl_setopt($curl, CURLOPT_SSL_VERIFYHOST,0);
-    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER,0);
+    curl_set_tls($curl, 'powerdns');
     curl_setopt($curl, CURLOPT_RETURNTRANSFER,1);
 
     $header[] = "X-API-Key: $powerdns_api_key";

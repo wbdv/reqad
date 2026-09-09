@@ -12,12 +12,10 @@
 	$output = shell_exec('sudo ls -1 /etc/exim/domains/ 2>/dev/null | sort');
 	$domains = array_filter(explode("\n", trim($output)));
 
-	// Gather available email addresses: from emails table (stored as full "user@domain")
-	$emails_list = array();
-	$results2 = $db->query('SELECT email FROM emails ORDER BY email');
-	while ($row2 = $results2->fetchArray(SQLITE3_ASSOC)) {
-		$emails_list[] = $row2['email'];
-	}
+	// Real mailboxes only, straight from /etc/dovecot/users. The `emails` table
+	// is a stale disk-usage cache and lists addresses that no longer exist —
+	// picking one of those creates an autoresponder exim can never trigger.
+	$emails_list = mailbox_list();
 ?>
           <!-- Page title -->
           <div class="page-header d-print-none">
@@ -39,32 +37,7 @@
             </div>
           </div>
 
-<? if(isset($errmsg) && $errmsg != '') { ?>
-          <div class="alert alert-warning" role="alert" style="background:#FFE;">
-            <div class="d-flex">
-				<div style="width:55px;">
-                	<svg xmlns="http://www.w3.org/2000/svg" class="icon mb-2 text-danger icon-md" width="48" height="48" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><path d="M12 9v2m0 4v.01"></path><path d="M5 19h14a2 2 0 0 0 1.84 -2.75l-7.1 -12.25a2 2 0 0 0 -3.5 0l-7.1 12.25a2 2 0 0 0 1.75 2.75"></path></svg>
-             	</div>
-             	<div>
-				 <h3 class="text-danger" style="margin-top:6px;margin-bottom:0">Error</h3>
-				 <div class="text-danger"><?=str_replace('Error: ', '', htmlspecialchars($errmsg));?></div>
-              	</div>
-            </div>
-          </div>
-<? } ?>
-<? if(isset($successmsg) && $successmsg != '') { ?>
-          <div class="alert alert-success" role="alert" style="background:#EFE;">
-            <div class="d-flex">
-				<div style="width:55px;">
-					<svg xmlns="http://www.w3.org/2000/svg" class="icon mb-2 text-success icon-md icon-tabler-circle-check" width="48" height="48" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><circle cx="12" cy="12" r="9" /><path d="M9 12l2 2l4 -4" /></svg>
-              	</div>
-              	<div>
-                	<h3 class="text-success" style="margin-top:6px;margin-bottom:0">Success</h3>
-                	<div class="text-success"><?=htmlspecialchars($successmsg);?></div>
-              	</div>
-            </div>
-          </div>
-<? } ?>
+<?php msg_render(); ?>
 
 <?	if(count($autoresponders) == 0) { ?>
 		<p style="padding:14px;">There are no autoresponders configured on this server.</p>
@@ -90,7 +63,13 @@
 					$date_from = $ar['date_from'];
 					$date_to   = $ar['date_to'];
 
-					if($date_from == '' && $date_to == '') {
+					// A row can outlive its mailbox (deleted account, typo'd address).
+					// Exim then drops the message on the catch-all `dropper` router
+					// long before dovecot/sieve is reached, so the autoresponder is
+					// simply dead — say so instead of showing a green Active badge.
+					if(!mailbox_exists($ar['user'], $ar['domain'])) {
+						$status = '<span class="badge bg-danger" title="There is no such mailbox on this server, so nothing is ever delivered and the autoresponder cannot fire.">No mailbox</span>';
+					} elseif($date_from == '' && $date_to == '') {
 						$status = '<span class="badge bg-success">Active</span>';
 					} elseif($date_from != '' && $date_from > $today) {
 						$status = '<span class="badge bg-warning text-dark">Scheduled</span>';
@@ -162,11 +141,13 @@
             <label class="form-label">Subject</label>
             <input type="text" class="form-control" name="subject" id="ar-subject" placeholder="Out of office" maxlength="255" required autocomplete="off">
             <div class="invalid-feedback">Please enter a subject.</div>
+            <small class="form-text text-muted">You can use <code>%subject%</code> - it is replaced with the subject of the message being replied to.</small>
           </div>
           <div class="mb-3">
             <label class="form-label">Message body</label>
             <textarea class="form-control" name="message" id="ar-message" rows="5" required placeholder="Thank you for your email. I am currently out of office and will reply as soon as possible."></textarea>
             <div class="invalid-feedback">Please enter a message.</div>
+            <small class="form-text text-muted"><code>%subject%</code> works here too.</small>
           </div>
           <div class="row">
             <div class="col-md-6 mb-3">
@@ -215,11 +196,13 @@
             <label class="form-label">Subject</label>
             <input type="text" class="form-control" name="subject" id="ar-edit-subject" maxlength="255" required autocomplete="off">
             <div class="invalid-feedback">Please enter a subject.</div>
+            <small class="form-text text-muted">You can use <code>%subject%</code> - it is replaced with the subject of the message being replied to.</small>
           </div>
           <div class="mb-3">
             <label class="form-label">Message body</label>
             <textarea class="form-control" name="message" id="ar-edit-message" rows="5" required></textarea>
             <div class="invalid-feedback">Please enter a message.</div>
+            <small class="form-text text-muted"><code>%subject%</code> works here too.</small>
           </div>
           <div class="row">
             <div class="col-md-6 mb-3">

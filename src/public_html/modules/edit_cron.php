@@ -57,23 +57,23 @@ $new_line  = $cron_type === 'global' ? "$schedule $cron_user $cron_cmd" : "$sche
 $cron_file = $cron_type === 'global' ? '/etc/crontab' : '/var/spool/cron/' . $cron_user;
 
 if ($errmsg == '') {
-    $existing = (int)trim(shell_exec("sudo grep -cF " . escapeshellarg($orig_line) . " " . escapeshellarg($cron_file) . " 2>/dev/null"));
-    if ($existing === 0) {
-        $errmsg = "Error: Original cron entry not found in $cron_file.";
+    // The helper matches on whitespace-normalised lines (the table rebuilds the
+    // entry from parsed fields, while the file may be padded), replaces it in
+    // place and preserves the crontab's owner and mode.
+    $cmd = 'sudo ' . _PATH . '/scripts/cron_edit.sh ' . escapeshellarg($cron_file) . ' '
+         . escapeshellarg($orig_line) . ' ' . escapeshellarg($new_line) . ' 2>&1';
+    $out = trim((string)shell_exec($cmd . '; echo "rc=$?"'));
+    $rc  = 1;
+    if (preg_match('/rc=(\d+)$/', $out, $m)) {
+        $rc  = (int)$m[1];
+        $out = trim(preg_replace('/rc=\d+$/', '', $out));
     }
-}
 
-if ($errmsg == '') {
-    // Replace old line with new line
-    $tmpfile = '/tmp/crontab.reqad_tmp';
-    shell_exec('sudo grep -vF ' . escapeshellarg($orig_line) . ' ' . escapeshellarg($cron_file) . ' | sudo tee ' . $tmpfile . ' > /dev/null');
-    shell_exec('echo ' . escapeshellarg($new_line) . ' | sudo tee --append ' . $tmpfile . ' > /dev/null');
-    shell_exec('sudo mv ' . $tmpfile . ' ' . escapeshellarg($cron_file));
-    if ($cron_type === 'global') {
-        shell_exec('sudo chmod 644 ' . escapeshellarg($cron_file));
-        shell_exec('sudo chown root:root ' . escapeshellarg($cron_file));
+    if ($rc !== 0) {
+        $errmsg = $out != '' ? $out : "Error: Cron job could not be updated.";
+    } else {
+        $successmsg = "Cron job successfully updated.";
+        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " edit cron ($cron_type, user=$cron_user): $orig_line -> $new_line\n", 3, '../log/route_log');
     }
-    $successmsg = "Cron job successfully updated.";
-    error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " edit cron ($cron_type, user=$cron_user): $orig_line -> $new_line\n", 3, '../log/route_log');
 }
 ?>

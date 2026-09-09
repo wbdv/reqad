@@ -223,9 +223,9 @@
             </div>
             <div class="mb-3">
               <label class="form-label">Username</label>
-              <input type="text" class="form-control" name="user" id="user" placeholder="user1" aria-describedby="userHelpBlock" required pattern="[a-z]+[a-z0-9]{1,7}" maxlength="8" autocomplete="off">
+              <input type="text" class="form-control" name="user" id="user" placeholder="user1" aria-describedby="userHelpBlock" required pattern="[a-z]+[a-z0-9]{1,15}" maxlength="16" autocomplete="off">
               <small id="userHelpBlock" class="form-text text-muted" style="display:block;margin-top:8px;">
-                Username must be unique, 2-8 characters long, contain letters and numbers, and must not contain spaces.
+                Username must be unique, 2-16 characters long, contain letters and numbers, and must not contain spaces.
               </small>
               <div class="invalid-feedback" id="invalid-user">
                 Please enter a username.

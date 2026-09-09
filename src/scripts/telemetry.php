@@ -28,7 +28,14 @@ try {
 
 	// email / dovecot: "no" (not installed), "yes" (2.4+), "yes [2.3]" (older)
 	$email = 'no';
-	$dovecot_bin = trim(shell_exec('command -v dovecot 2>/dev/null'));
+	// cron runs with PATH=/usr/bin:/bin, so don't rely on command -v alone
+	$dovecot_bin = '';
+	foreach (['/usr/sbin/dovecot', '/sbin/dovecot', '/usr/local/sbin/dovecot'] as $cand) {
+		if (is_executable($cand)) { $dovecot_bin = $cand; break; }
+	}
+	if (!$dovecot_bin) {
+		$dovecot_bin = trim(shell_exec('PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v dovecot 2>/dev/null'));
+	}
 	if ($dovecot_bin) {
 		$dovecot_ver = trim(shell_exec(escapeshellarg($dovecot_bin) . ' --version 2>/dev/null'));
 		// e.g. "2.4.1-4 (7d8c0e5759)" -> "2.4.1-4"

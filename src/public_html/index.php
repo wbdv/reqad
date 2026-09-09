@@ -47,18 +47,25 @@
 
 	$allowed_actions = array(
 		'accounts'			=> array('create-account', 'edit-account', 'delete-account'),
+		'addon-domains'		=> array('edit-addon-domain', 'delete-addon-domain'),
 		'account'			=> array('alias-add', 'alias-delete', 'reissue-ssl', 'config-save', 'config-restore'),
 		'databases' 		=> array('create-database', 'delete-database', 'change-db-password'),
 		'email-accounts' 	=> array('create-email', 'edit-email', 'delete-email'),
+		'email'				=> array('clamav-exim'),
+		'email-config'		=> array('save-mail-settings', 'save-mail-rbl'),
 		'forwarders'		=> array('create-forwarder', 'edit-forwarder', 'delete-forwarder'),
 		'autoresponders'	=> array('create-autoresponder', 'edit-autoresponder', 'delete-autoresponder'),
+		'email-filters'		=> array('create-email-filter', 'edit-email-filter', 'delete-email-filter', 'save-email-filter-raw'),
+		'spam-filters'		=> array('create-spam-rule', 'delete-spam-rule', 'save-spam-rules'),
 		'ssl'				=> array('update-ssl'),
 		'settings'			=> array('settings'),
 		'dns-settings'		=> array('dns-settings'),
 		'php-settings'		=> array('php-settings'),
 		'wp-toolkit'		=> array('wp-install', 'wp-clone', 'wp-scan', 'wp-auto-login'),
 		'reboot'			=> array('reboot-server'),
-		'backup'			=> array('generate-backup', 'delete-backup', 'download-backup', 'restore-backup'),
+		'backup'			=> array('generate-backup', 'delete-backup', 'download-backup', 'restore-backup',
+							       'remote-backup-settings', 'remote-backup-cron', 'remote-backup-restore',
+							       'remote-backup-restore-server'),
 		'transfer-tool'		=> array('ajax-transfer-run'),
 		'ssh-keys'			=> array('add-ssh-key', 'delete-ssh-key'),
 		'cron'				=> array('create-cron', 'edit-cron', 'delete-cron'),
@@ -133,6 +140,9 @@
             $acct_user = isset($reqs[2]) ? preg_replace('/[^a-z0-9]/', '', $reqs[2]) : '';
             include('templates/account.php');
             break;
+        case 'addon-domains':
+            include('templates/addon-domains.php');
+            break;
         case 'ssh-keys':
             include('templates/ssh-keys.php');
             break;
@@ -176,9 +186,23 @@
 		case 'autoresponders':
 			include('templates/autoresponders.php');
 			break;
+		case 'email-filters':
+			include('templates/email-filters.php');
+			break;
+		case 'spam-filters':
+			include('templates/spam-filters.php');
+			break;
         case 'check-email-settings':
             include('templates/check-email-settings.php');
             break;
+        case 'email':
+            include('templates/email.php');
+            break;
+
+        case 'email-config':
+            include('templates/email-config.php');
+            break;
+
         case 'email-stats':
             include('templates/email-stats.php');
             break;

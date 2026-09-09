@@ -25,9 +25,18 @@ if ($errmsg == '') {
     $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
     $stmt->execute();
 
-    $msg_file = '/etc/exim/autoreply/' . $domain . '/' . $user;
-    shell_exec('sudo rm -f ' . escapeshellarg($msg_file));
+    /* The row is gone either way; a helper failure here only leaves a stale
+       script behind, so report it but do not pretend the delete failed. */
+    $errmsg = autoresponder_remove($user, $domain);
 
-    $successmsg = "Autoresponder for $user@$domain deleted.";
-    error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " delete autoresponder $user@$domain\n", 3, '../log/route_log');
+    if ($errmsg == '') {
+        $successmsg = "Autoresponder for $user@$domain deleted.";
+        error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " delete autoresponder $user@$domain\n", 3, '../log/route_log');
+    }
 }
+
+$msg_base = $_SERVER['REQUEST_SCHEME'] . '://' . $_SERVER['HTTP_HOST'] . '/autoresponders/';
+if ($errmsg != '')
+    msg_redirect($msg_base, $errmsg, 'error');
+else
+    msg_redirect($msg_base, $successmsg, 'success');

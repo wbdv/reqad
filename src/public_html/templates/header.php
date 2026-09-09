@@ -274,6 +274,9 @@
                 </a>
                 <div class="collapse show" id="menu-accounts">
                     <ul class="btn-toggle-nav list-unstyled fw-normal pb-1 small">
+                    <? if(feature_enabled($ini, 'addon_domains')) { ?>
+                      <li><a class="dropdown-item <?php if($route=='addon-domains') echo 'active'; ?>" href="/addon-domains/">Addon Domains</a>
+                    <? } ?>
                       <li><a class="dropdown-item <?php if($route=='ssh-keys') echo 'active'; ?>" href="/ssh-keys/">SSH Keys</a>
                     </ul>
                 </div>
@@ -298,7 +301,7 @@
 -->
 <? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
               <li class="nav-item">
-                <a class="nav-link" href="#" role="button" data-bs-toggle="collapse" data-bs-target="#menu-email" aria-expanded="true">
+                <a class="nav-link <?=($route=='email'?'active':'');?>" href="/email/">
                   <span class="nav-link-icon d-md-none d-lg-inline-block"><svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-mail" width="44" height="44" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"> <path stroke="none" d="M0 0h24v24H0z" fill="none"/> <rect x="3" y="5" width="18" height="14" rx="2" /> <polyline points="3 7 12 13 21 7" /> </svg>
                   </span>
                   <span class="nav-link-title">
@@ -310,12 +313,19 @@
                       <li><a class="dropdown-item <?php if($route=='email-accounts') echo 'active'; ?>" href="/email-accounts/">Email Accounts</a>
                       <li><a class="dropdown-item <?php if($route=='forwarders') echo 'active'; ?>" href="/forwarders/">Forwarders</a>
                       <li><a class="dropdown-item <?php if($route=='autoresponders') echo 'active'; ?>" href="/autoresponders/">Autoresponders</a>
+                      <li><a class="dropdown-item <?php if($route=='email-filters') echo 'active'; ?>" href="/email-filters/">Email Filters</a>
+                      <li><a class="dropdown-item <?php if($route=='spam-filters') echo 'active'; ?>" href="/spam-filters/">Spam Filters</a>
 <? /*
                       <li><a class="dropdown-item" href="">Anti-Spam Settings</a>
 */ ?>
                       <li><a class="dropdown-item" href="/webmail/" target="_blank">Webmail</a>
+<? /*
                       <li><a class="dropdown-item <?php if($route=='check-email-settings') echo 'active'; ?>" href="/check-email-settings/">Check Email Settings</a>
                       <li><a class="dropdown-item <?php if($route=='email-stats') echo 'active'; ?>" href="/email-stats/" style="padding-left:53px;">SMTP Statistics</a>
+				      <li><a class="dropdown-item" href="/email/#queue">Mail Queue</a>
+        			  <li><a class="dropdown-item <?php if($route=='email-config' && isset($reqs[2]) && $reqs[2]=='exim') echo 'active'; ?>" href="/email-config/exim/">Exim Configuration</a>
+			          <li><a class="dropdown-item <?php if($route=='email-config' && isset($reqs[2]) && $reqs[2]=='dovecot') echo 'active'; ?>" href="/email-config/dovecot/">Dovecot Configuration</a>
+*/ ?>
                     </ul>
                 </div>
               </li>

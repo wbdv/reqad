@@ -9,10 +9,15 @@ USER=$1
 shift 2>/dev/null
 
 if [ "${USER}" == "" ]; then
-   echo "Usage: $(basename $0) user [-w] [-m] [-d]"
+   echo "Usage: $(basename $0) user [-w] [-m] [-d] [--stage-only DIR] [--db-max-mb N]"
    echo "  -w website (files w/o mail, config, ssl, cron, meta, DNS zone)"
    echo "  -m email   (mail folder, exim/dovecot settings, email DNS records)"
    echo "  -d databases     (-f legacy alias for -w -m)"
+   echo "  --stage-only DIR  build backup-<user>/ inside DIR and stop (no tarball,"
+   echo "                    no cleanup) - used by backup_remote.sh, which tars the"
+   echo "                    staged tree and the homedir straight into an ssh pipe"
+   echo "  --db-max-mb N     do not dump databases larger than N MB; list them in"
+   echo "                    databases/_streamed_separately.txt instead"
    exit 0
 fi
 
@@ -29,13 +34,18 @@ fi
 INCLUDE_WEB=0
 INCLUDE_MAIL=0
 INCLUDE_DB=0
-for o in "$@"; do
-	case "${o}" in
+STAGE_ONLY=''
+DB_MAX_MB=0
+while [ $# -gt 0 ]; do
+	case "${1}" in
 		-w) INCLUDE_WEB=1 ;;
 		-m) INCLUDE_MAIL=1 ;;
 		-d) INCLUDE_DB=1 ;;
 		-f) INCLUDE_WEB=1; INCLUDE_MAIL=1 ;;
+		--stage-only) STAGE_ONLY="${2}"; shift ;;
+		--db-max-mb)  DB_MAX_MB="${2}"; shift ;;
 	esac
+	shift
 done
 # default (no flag): website only, matching the previous "files only" default
 if [ ${INCLUDE_WEB} -eq 0 ] && [ ${INCLUDE_MAIL} -eq 0 ] && [ ${INCLUDE_DB} -eq 0 ]; then
@@ -51,7 +61,10 @@ DATE=$(date +%Y-%m-%d_%H%M)
 REQAD='/usr/local/reqad'
 PHP='/usr/bin/php82'
 # -list/-noheader force plain output regardless of the panel's ~/.sqliterc (box mode)
-SQLITE='/usr/local/bin/sqlite3 -batch -noheader -list'
+# stock EL sqlite (what install-el*.sh installs); -init /dev/null ignores
+# ~/.sqliterc, whose ".mode box" EL8's 3.26 rejects and which would corrupt
+# the plain output parsed here
+SQLITE='/usr/bin/sqlite3 -init /dev/null -batch -noheader -list'
 DB_FILE="${REQAD}/db/reqad.db"
 MYSQL='sudo mysql --defaults-extra-file=/root/.my.cnf'
 MYSQLDUMP='sudo /usr/bin/mysqldump --defaults-extra-file=/root/.my.cnf'
@@ -70,8 +83,14 @@ echo "Domain: ${DOMAIN}"
 # Built on the same filesystem as the final archive (not /tmp) so big DB dumps
 # don't hit a small tmpfs. Some files land root-owned (sudo cp), so the final
 # cleanup uses sudo.
-mkdir -p ~/backup/
-BUILD=$(mktemp -d ~/backup/.build_${USER}_${DATE}.XXXXXX)
+if [ -n "${STAGE_ONLY}" ]; then
+	# caller owns the directory and the cleanup (backup_remote.sh streams from it)
+	mkdir -p "${STAGE_ONLY}"
+	BUILD="${STAGE_ONLY}"
+else
+	mkdir -p ~/backup/
+	BUILD=$(mktemp -d ~/backup/.build_${USER}_${DATE}.XXXXXX)
+fi
 ROOT="${BUILD}/backup-${USER}"
 mkdir -p "${ROOT}"
 
@@ -102,14 +121,30 @@ if [ ${INCLUDE_DB} -eq 1 ]; then
 
 		# per-database dump (data + schema, no CREATE DATABASE)
 		for DB in ${DBS}; do
+			# CREATE DATABASE (with the real charset/collation) — written for every
+			# database, including one skipped by --db-max-mb below, so a restore can
+			# always rebuild the empty database.
+			read CS COL < <(${MYSQL} -Ns -e "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB}'")
+			echo "CREATE DATABASE IF NOT EXISTS \`${DB}\` CHARACTER SET ${CS:-utf8mb4} COLLATE ${COL:-utf8mb4_general_ci};" >> "${ROOT}/databases/_create_databases.sql"
+
+			# --db-max-mb: a big database is left out of the staged tree so the
+			# caller can stream its dump straight to the backup server instead of
+			# spooling a multi-GB .sql on this disk first. Its CREATE DATABASE and
+			# its grants are still written below, so a restore rebuilds the empty
+			# database and only the data has to be piped back in.
+			if [ "${DB_MAX_MB}" -gt 0 ]; then
+				DB_MB=$(${MYSQL} -Ns -e "SELECT COALESCE(ROUND(SUM(data_length+index_length)/1048576),0) FROM information_schema.TABLES WHERE TABLE_SCHEMA='${DB}'" 2>/dev/null)
+				if [ -n "${DB_MB}" ] && [ "${DB_MB}" -ge "${DB_MAX_MB}" ]; then
+					echo "Skip database ${DB} (${DB_MB} MB >= ${DB_MAX_MB} MB) - streamed separately"
+					echo "${DB}" >> "${ROOT}/databases/_streamed_separately.txt"
+					continue
+				fi
+			fi
 			echo "Dump database ${DB}"
 			${MYSQLDUMP} --opt --lock-tables=false --single-transaction "${DB}" > "${ROOT}/databases/${DB}.sql"
 			if [ ! -s "${ROOT}/databases/${DB}.sql" ]; then
 				echo "Warning: ${DB}.sql is empty."
 			fi
-			# CREATE DATABASE (with the real charset/collation) — was missing before
-			read CS COL < <(${MYSQL} -Ns -e "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB}'")
-			echo "CREATE DATABASE IF NOT EXISTS \`${DB}\` CHARACTER SET ${CS:-utf8mb4} COLLATE ${COL:-utf8mb4_general_ci};" >> "${ROOT}/databases/_create_databases.sql"
 		done
 
 		# Grants scoped to THIS account's databases only (the old wp_/wc_ grep
@@ -182,10 +217,38 @@ if [ ${INCLUDE_MAIL} -eq 1 ]; then
 		sudo cp -p /etc/exim/keys/${DOMAIN}.public.key  "${ROOT}/email/dkim/" 2>/dev/null
 	fi
 	sudo grep "^${DOMAIN}:" /etc/exim/userdomains > "${ROOT}/email/userdomains-entry" 2>/dev/null
-	${SQLITE} "${DB_FILE}" "SELECT email, status, created_at FROM emails WHERE email LIKE '%@${DOMAIN}'" > "${ROOT}/email/_email_accounts.txt" 2>/dev/null
+	# NOTE: the panel's `emails` table is NOT backed up. Since db/1032.sql it is
+	# only a du -skm cache keyed by address (the mailbox inventory is
+	# /etc/dovecot/users, captured below as email/dovecot-users), and restoring a
+	# cache is meaningless — it re-measures itself on first use.
 	# dovecot mailbox auth lines (passwd-style, hashed) for this domain — needed to
 	# restore working mailboxes (maildirs themselves ride along in homedir/mail/)
 	sudo grep "@${DOMAIN}:" /etc/dovecot/users > "${ROOT}/email/dovecot-users" 2>/dev/null
+
+	# ---- email filters: domain tier ---------------------------------------
+	# Per-account Sieve needs no code here. Home IS the maildir root, so a
+	# mailbox's ~/sieve/ and ~/.dovecot.sieve ride along inside homedir/mail/.
+	# The global tier is server-wide, not part of any one account, so it is
+	# deliberately left out of an account backup.
+	# Only the .sieve source is taken. The .svbin beside it records the path it
+	# was compiled from, so a copied binary would be permanently stale — restore
+	# recompiles instead.
+	if sudo test -f "/var/lib/reqad/sieve/domains/${DOMAIN}.sieve"; then
+		sudo cp -p "/var/lib/reqad/sieve/domains/${DOMAIN}.sieve" "${ROOT}/email/sieve-domain.sieve"
+	fi
+	# The rows that script was rendered from. Dumped as ready-to-run INSERTs via
+	# quote() so the JSON in conditions/actions survives verbatim, quotes and all.
+	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO email_filters (scope,target,name,enabled,priority,match_type,conditions,actions,stop) VALUES ('||quote(scope)||','||quote(target)||','||quote(name)||','||enabled||','||priority||','||quote(match_type)||','||quote(conditions)||','||quote(actions)||','||stop||');' FROM email_filters WHERE scope='domain' AND target='${DOMAIN}'" > "${ROOT}/email/email_filters.sql" 2>/dev/null
+	[ -s "${ROOT}/email/email_filters.sql" ] || rm -f "${ROOT}/email/email_filters.sql"
+
+	# ---- autoresponders ---------------------------------------------------
+	# The `autoresponders` table is the truth; the live artefact (a Pigeonhole
+	# vacation script under /var/lib/reqad/sieve/autoresponders/, or the legacy
+	# /etc/exim/autoreply file) is rendered FROM it. Backing up the rows rather
+	# than the artefact lets restore pick whichever backend the target machine
+	# actually runs — see autoresponder_backend() in modules/functions.php.
+	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO autoresponders (user,domain,subject,message,date_from,date_to,created_at) VALUES ('||quote(user)||','||quote(domain)||','||quote(subject)||','||quote(message)||','||quote(date_from)||','||quote(date_to)||','||quote(created_at)||');' FROM autoresponders WHERE domain='${DOMAIN}'" > "${ROOT}/email/autoresponders.sql" 2>/dev/null
+	[ -s "${ROOT}/email/autoresponders.sql" ] || rm -f "${ROOT}/email/autoresponders.sql"
 
 	# ---- email DNS records (MX / SPF / DKIM / DMARC) ----------------------
 	dump_dns "${ROOT}/dns/dns-email.json" --email-only
@@ -238,6 +301,14 @@ fi
 		echo "cPanel cpmove. Treat the downloaded tarball as sensitive."
 	fi
 } > "${ROOT}/summary.txt" 2>/dev/null
+
+# --stage-only: the staged tree IS the deliverable. No tarball, no cleanup -
+# backup_remote.sh tars ${ROOT} and /home/<user> together into an ssh pipe and
+# removes the directory itself afterwards.
+if [ -n "${STAGE_ONLY}" ]; then
+	echo "Staged ${ROOT}"
+	exit 0
+fi
 
 # ===========================================================================
 # Create the archive — a SINGLE root folder 'backup-<user>/'

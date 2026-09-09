@@ -21,7 +21,7 @@ if(!preg_match('/^[A-Za-z0-9\+\-_\.]{1,32}$/', $user)) {
 	$errmsg = "Error: New domain conains unallowed characters.";
 } else if(!preg_match('/^[A-Za-z0-9\+\-_\.]{1,32}$/', $old_user)) {
 	$errmsg = "Error: Old (existing) user conains unallowed characters.";
-} else if(!preg_match('/[a-z0-9\-\.]{2,32}\.[a-z]{2,10}/', $old_domain)) {
+} else if(!valid_domain($old_domain)) {
 	$errmsg = "Error: Old (existing) domain conains unallowed characters.";
 } else if(!is_file("/etc/exim/forwards/".$old_domain)) {
 	$existing_forwards = explode("\n", shell_exec("sudo awk -F: {'print $1'} /etc/exim/forwards/".$old_domain));
@@ -34,7 +34,7 @@ if($errmsg == '' && $old_forward!=$email) {
 		$errmsg = "Error: User $email already has an forwarder, please edit existing one instead of adding a new one.";
 }
 if($errmsg == '') {
-	if(!preg_match('/[A-Za-z0-9\+\-_\.]{1,32}@[a-z0-9\-\.]{2,32}\.[a-z]{2,10}/', $forward) && $forward!='') {
+	if(!valid_forward_list($forward) && $forward!='') {
 		$errmsg = "Error: Forwarder should contain at least one email address.";
 	}
 }
@@ -52,7 +52,7 @@ if($errmsg == '') {
 			$forward.=', ';
 		$forward.='|'.$pipe;
 	}
-    error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." edit forwarder $old_forwarder ==> $email -> $forward\n", 3, '../log/route_log');
+    error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." edit forwarder $old_forward ==> $email -> $forward\n", 3, '../log/route_log');
 	shell_exec('sudo sed -i \'/^'.$old_user.':/d\' /etc/exim/forwards/'.$old_domain);
 	shell_exec('echo "'.$user.": ".$forward.'" | sudo tee --append /etc/exim/forwards/'.$domain);
 	if($old_forward == $email)

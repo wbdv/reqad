@@ -684,6 +684,17 @@ acl_check_rcpt:
   # warn !verify = csa
   #      set acl_m_greylistreasons = Host failed CSA check\n$acl_m_greylistreasons
 
+  # Remember which hosting account this recipient belongs to, so the DATA ACL
+  # can run SpamAssassin as that user and pick up its user_prefs. It has to be
+  # captured HERE: $domain exists only per recipient, and by the time the DATA
+  # ACL runs the message may have several.
+  #
+  # A message addressed to two different accounts has no single correct set of
+  # preferences, so it falls back to nobody (site rules only) rather than
+  # applying one customer's whitelist to another customer's mail.
+  warn    set acl_m_rcptuser = ${lookup{$domain}lsearch{/etc/exim/userdomains}{$value}{nobody}}
+          set acl_m_sauser   = ${if or{{eq{$acl_m_sauser}{}}{eq{$acl_m_sauser}{$acl_m_rcptuser}}}{$acl_m_rcptuser}{nobody}}
+
   # At this point, the address has passed all the checks that have been
   # configured, so we accept it unconditionally.
 
@@ -720,13 +731,6 @@ acl_check_prdr:
 
 acl_check_data:
 
-# Added by BitDefender, do not remove!
-#drop
-#	message    = 554 As instructed by BitDefender
-#	condition  = ${if !eq {${dlfunc{/opt/BitDefender/var/lib/libbdexim.so}{dl_scan}{/opt/BitDefender/var/run/bdexim}{/var/spool/exim/input/}{/var/spool/exim/scan/}}} {OK}}
-
-accept
-# End of added lines, do no remove!
   deny    message    = rejected because $sender_host_address is in a blacklist at $dnslist_domain see $dnslist_text
           !authenticated = *
           dnslists  =  bl.abuseat.org : b.barracudacentral.org : zen.spamhaus.org : bl.spamcop.net  : dnsbl.dronebl.org : combined.abuse.ch
@@ -778,7 +782,7 @@ accept
 
   # Bypass SpamAssassin checks if the message is too large.
   
-  accept  condition  = ${if >={$message_size}{100000} {1}}
+  accept  condition  = ${if >={$message_size}{512000} {1}}
           add_header = X-Spam-Note: SpamAssassin run bypassed due to message size
 
   #############################################################################
@@ -793,21 +797,73 @@ accept
   #           condition    = ...
   #############################################################################
 
-  # Run SpamAssassin, but allow for it to fail or time out. Add a warning message
-  # and accept the mail if that happens. Add an X-Spam-Flag: header if the SA
-  # score exceeds the SA system threshold.
-  
-  warn    spam       = nobody/defer_ok
-          add_header = X-Spam-Flag: YES
-  
+  # SpamAssassin — inbound mail only.
+  #
+  # Mail our own users submit (authenticated) and anything injected from the
+  # local host is accepted here, before the scan: it is on its way OUT, and an
+  # X-Spam-* header on outgoing mail only confuses the receiving side.
+  #
+  # Everything else is scanned once, as the hosting account that owns the
+  # recipient domain, and tagged with the same header set cPanel writes — these
+  # are the names the panel's email filter builder offers:
+  #
+  #   X-Spam-Status: Yes, score=7.6      X-Spam-Score: 76   (score x 10)
+  #   X-Spam-Bar: ++++++                 X-Spam-Level: ****** (X-Spam-Flag: YES)
+  #   X-Spam-Report / X-Ham-Report       X-Spam-Subject: ***SPAM*** <subject>
+  #
+  # Both verdicts also reach /var/log/exim/main.log as
+  #   SpamAssassin as <account> detected message as (NOT) spam (<score>)
+  # which is what puts the score of every inbound message in the mail log.
+  # Note that log_message is only ever written for warn/deny/defer — hanging it
+  # off an `accept` (as this config used to) logs nothing at all.
+
+  # Strip any X-Spam-*/X-Ham-* header the sender supplied. Without this a
+  # spammer can forge "X-Spam-Flag: NO" and walk straight past every filter.
+  warn    !authenticated = *
+          !hosts     = +relay_from_hosts
+          remove_header = X-Spam-Subject : X-Spam-Status : X-Spam-Score : \
+                          X-Spam-Bar : X-Spam-Report : X-Spam-Flag : \
+                          X-Spam-Level : X-Spam-Checker-Version : \
+                          X-Spam-Note : X-Ham-Report
+
+  # Outbound / local submission: no scan, no headers, no log line.
+  accept  authenticated = *
+  accept  hosts      = +relay_from_hosts
+
+  # Scan as the account the mail is addressed to, so SpamAssassin loads that
+  # account's ~/.spamassassin/user_prefs — the Spam Filters whitelist and
+  # blocklist. acl_m_sauser is captured per recipient in acl_check_rcpt and is
+  # empty only for a message that never passed through that ACL.
+  warn    set acl_m_sauser = ${if eq{$acl_m_sauser}{}{nobody}{$acl_m_sauser}}
+
+  # Run SpamAssassin, but allow for it to fail or time out; defer_ok means a
+  # dead spamd lets mail through rather than bouncing it.
+  warn    spam       = ${acl_m_sauser}/defer_ok
+          set acl_m_spam = yes
+
   accept  condition  = ${if !def:spam_score_int {1}}
           add_header = X-Spam-Note: SpamAssassin invocation failed
-  
 
-  # Unconditionally add score and report headers
-  
-  warn    add_header = X-Spam-Score: $spam_score ($spam_bar)\n\
-                       X-Spam-Report: $spam_report
+  # Over threshold: tag as spam and log the score.
+  warn    condition  = ${if eq{$acl_m_spam}{yes}{yes}{no}}
+          add_header = X-Spam-Subject: ***SPAM*** $h_Subject:
+          add_header = X-Spam-Status: Yes, score=$spam_score
+          add_header = X-Spam-Score: $spam_score_int
+          add_header = X-Spam-Bar: $spam_bar
+          add_header = X-Spam-Level: ${sg{${sg{$spam_bar}{\N[^+]\N}{}}}{\N\+\N}{*}}
+          add_header = X-Spam-Report: ${sg{${from_utf8:${sg{$spam_report}{\N\n \n\N}{\n}}}}{[[:^ascii:]]}{_}}
+          add_header = X-Spam-Flag: YES
+          log_message = SpamAssassin as $acl_m_sauser detected message as spam ($spam_score)
+
+  # Under threshold: same headers, ham verdict, still logged.
+  warn    condition  = ${if eq{$acl_m_spam}{yes}{no}{yes}}
+          add_header = X-Spam-Status: No, score=$spam_score
+          add_header = X-Spam-Score: $spam_score_int
+          add_header = X-Spam-Bar: $spam_bar
+          add_header = X-Spam-Level: ${sg{${sg{$spam_bar}{\N[^+]\N}{}}}{\N\+\N}{*}}
+          add_header = X-Ham-Report: ${sg{${from_utf8:${sg{$spam_report}{\N\n \n\N}{\n}}}}{[[:^ascii:]]}{_}}
+          add_header = X-Spam-Flag: NO
+          log_message = SpamAssassin as $acl_m_sauser detected message as NOT spam ($spam_score)
 
   # And reject if the SpamAssassin score is greater than ten
   
@@ -836,7 +892,6 @@ accept
   # require acl = greylist_mail
 
   accept
-          log_message = "SpamAssassin score: $spam_score"
 
 
 # To enable the greylisting, also uncomment this line:
@@ -915,7 +970,12 @@ begin routers
 #DKIM_PRIVATE_KEY = /etc/exim/keys/DKIM_DOMAIN.private.key"
 
 
-DKIM_DOMAIN = ${lookup{$sender_address_domain}dsearch{/etc/exim/domains/}}
+# Auto-replies (and bounces) carry a null envelope sender per RFC 3834, so
+# $sender_address_domain is empty and the dsearch below returned nothing —
+# with dkim_strict = 0 that silently sent them UNSIGNED. Fall back to the From:
+# header domain. The dsearch still gates it: we can only sign for a domain we
+# actually host, and it detaints the value for use in the key path.
+DKIM_DOMAIN = ${lookup{${if def:sender_address_domain {$sender_address_domain}{${domain:$h_From:}}}}dsearch{/etc/exim/domains/}}
 DKIM_PRIVATE_KEY = /etc/exim/keys/${lookup{$sender_address_domain}dsearch{/etc/exim/domains/}}.private.key"
 
 dnslookup:
@@ -974,8 +1034,21 @@ virtual_autoreply:
   ignore_enotdir
   reply_transport = autoreply
   no_verify
-  require_files = /etc/exim/autoreply/${domain_data}/${local_part}.msg
-  file = /etc/exim/autoreply/${domain_data}/${local_part}.msg
+  # $domain_data / $local_part_data are only populated by THIS router's own
+  # domains/local_parts lookups. Without them both expand to empty, the path
+  # becomes /etc/exim/autoreply//<lp>, and the router is always skipped by the
+  # file check — no autoresponder ever fires. The lookups also detaint the
+  # values, which exim requires before they may be used in a file path.
+  domains = dsearch;/etc/exim/domains
+  local_parts = lsearch,ret=key;/etc/exim/domains/$domain_data
+  # No .msg suffix: reqad's create_autoresponder.php / manage_autoresponders.php
+  # write /etc/exim/autoreply/<domain>/<localpart>.
+  require_files = /etc/exim/autoreply/$domain_data/$local_part_data
+  file = /etc/exim/autoreply/$domain_data/$local_part_data
+  # exim disables the sieve "vacation" extension unless this is set; without it
+  # every generated autoresponder dies with "Sieve error: vacation disabled".
+  # It is also where the :days dedup databases live.
+  sieve_vacation_directory = /etc/exim/autoreply/$domain_data
   allow_filter
   user = exim
   group = mail
@@ -990,15 +1063,21 @@ forwards:
   pipe_transport = address_pipe
   unseen
 
-spamcheck:
-    no_verify
-    driver         = accept
-    condition      = ${if and {\
-                         {!eq {$received_protocol}{spam-scanned}}\
-                         {<{$message_size}{10240k}}\
-                     } }
-    headers_remove = X-Spam-Flag:X-Spam-Report:X-Spam-Status:X-Spam-Level:X-Spam-Checker-Version
-    transport = spam_check
+# The spamcheck router used to pipe EVERY message through `spamc -u <account>`
+# and re-inject it with `exim -oMr spam-scanned -bS`. That second pass was the
+# only place per-account SpamAssassin preferences were ever applied, because
+# acl_check_data scanned as "nobody" — and it cost a full second scan, a second
+# message id and a second set of log lines for every single message.
+#
+# acl_check_data now scans as the account itself (acl_m_sauser), so the second
+# pass bought nothing but load and doubled-up logs. Removed 2026-09-03 by
+# scripts/update/setup_spam_score_logging.sh.
+#
+# Consequence worth knowing: LOCALLY generated mail (cron, PHP mail(), P=local)
+# never reaches the DATA ACL, so it is no longer spam scanned at all. That is
+# what cPanel does too. It also makes the !eq{$received_protocol}{spam-scanned}
+# guard on the forwards router above dead — harmless, and left alone rather
+# than churn a delivery router for a comment.
 
 virtual_user:
   driver = accept
@@ -1007,7 +1086,7 @@ virtual_user:
   local_parts = lsearch,ret=key;/etc/exim/domains/$domain_data
 #  require_files = "+${extract{5}{::}{${lookup passwd{${lookup{$domain}lsearch*{/etc/exim/userdomains}{$value}}}{$value}}}}/etc/$domain/passwd"
 #  condition = ${if eq {${lookup {$local_part} lsearch {${extract{5}{:}{${lookup passwd{${lookup{$domain}lsearch*{/etc/exim/userdomains}{$value}}}{$value}}}}/etc/$domain/passwd}}}{} {false}{true}}
-  transport = virtual_users_trans
+  transport = dovecot_lmtp
 
 virtual:
 	driver = redirect
@@ -1327,6 +1406,29 @@ address_file:
 address_reply:
   driver = autoreply
 
+# Local delivery to dovecot over LMTP so that Pigeonhole Sieve runs (the three
+# email-filter tiers). Replaces virtual_users_trans, which is kept below for
+# rollback: revert the virtual_user router's transport= line and restart exim.
+#
+# batch_max = 1 is deliberate. With LMTP batching exim sends several RCPT TO in
+# one transaction and dovecot writes an Envelope-To: header, which can expose a
+# Bcc'd recipient to the others in the batch. cPanel carries a whole
+# r_bcc_addr/batch_id apparatus to split that case; not batching is cheaper.
+#
+# rcpt_include_affixes passes the full user+detail@domain through so sieve's
+# subaddress extension can match :detail / :user on plus-addressed mail.
+#
+# user/group are named explicitly: exim IS in the mail group, but it does not
+# apply supplementary groups when dropping privileges for a transport, so
+# without this it gets EACCES on the 0660 mail:mail socket.
+dovecot_lmtp:
+  driver               = lmtp
+  socket               = /var/run/dovecot/lmtp
+  batch_max            = 1
+  rcpt_include_affixes = true
+  user                 = exim
+  group                = mail
+
 virtual_users_trans:
   driver = appendfile
   delivery_date_add
@@ -1343,35 +1445,21 @@ virtual_users_trans:
   user = "${lookup{$domain_data}lsearch* {/etc/exim/userdomains}{$value}}"
   group = mail
 
-virtual_users_spam_trans:
-  driver = appendfile
-  delivery_date_add
-  envelope_to_add
-  #directory = "${extract{5}{:}{${lookup passwd{${lookup{$domain_data}lsearch*{/etc/exim/userdomains}{$value}}}{$value}}}}/mail/${domain_data}/${local_part_data}/.spam/"
-  directory = "/home/${lookup{$domain_data}lsearch* {/etc/exim/userdomains}{$value}}/mail/${domain_data}/${local_part_data}/.spam"
-  maildir_use_size_file
-  maildir_format
-  maildir_tag = ,S=$message_size
-  quota_size_regex = ,S=(\d+)
-  return_path_add
-  mode = 0660
-  user = "${lookup{$domain_data}lsearch* {/etc/exim/userdomains}{$value}}"
-  group = mail
-
+# virtual_users_spam_trans: REMOVED 2026-08-30.
+#
+# It filed spam into <maildir>/.spam and was referenced by no router — dead
+# config since before the Sieve tiers landed. Spam filing is now an ordinary
+# email filter (a global rule on X-Spam-Flag / X-Spam-Status, editable in the
+# panel under Email Filters), which is why nothing points at it any more.
+# Local delivery goes exim -> dovecot LMTP -> pigeonhole; the surviving
+# appendfile transport is virtual_users_trans, kept for rollback.
 autoreply:
   driver = autoreply
   to = ${reply_address}
   from = ${local_part}@${domain}
 
 
-spam_check:
-  driver = pipe
-  command = /usr/sbin/exim -oMr spam-scanned -bS
-  use_bsmtp
-  #transport_filter = /usr/bin/spamc -u $local_part@$domain
-  transport_filter = /usr/bin/spamc -u "${lookup{$domain_data}lsearch* {/etc/exim/userdomains}{$value}}"
-  home_directory = /tmp
-  current_directory = /tmp
+# spam_check: the pipe transport for the spamcheck router above. Removed with it.
 
 null_transport:
     driver = appendfile

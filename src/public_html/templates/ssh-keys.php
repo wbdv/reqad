@@ -282,28 +282,6 @@
     </div>
 </form>
 
-<form action="#" id="view-zone" class="needs-validation" novalidate>
-    <div class="modal modal-blur fade" id="modal-view-zone" tabindex="-1" role="dialog" aria-hidden="true">
-      <div class="modal-dialog modal-sm modal-dialog-centered" role="document" style="min-width:1200px">
-        <div class="modal-content">
-		  <div class="modal-header">
-            <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">View zone <span id="zone-title"></span> on <?=$dns_provider_name;?></h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-          </div>
-          <div class="modal-body" id="view-zone-body">
-          </div>
-          <div class="modal-footer">
-            <div class="w-100">
-              <div class="row">
-			  	<div class="col"><a href="#" class="btn btn-whit" data-bs-dismiss="modal">Close</a></div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-</form>	
-
 <?php
     include('templates/footer.php'); 
 ?>

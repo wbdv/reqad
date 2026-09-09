@@ -34,6 +34,14 @@
 		}
 	}
 
+	/* Progress for a running whole-server restore. Read-only: it parses
+	   log/restore_server.status, which restore_server.sh appends to. */
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-restore-server-status') {
+		header('Content-Type: application/json');
+		echo json_encode(restore_server_status());
+		exit;
+	}
+
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-check-email-fixing' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
 		$output = trim(shell_exec("dig +short NS $domain | head -n 1 | sed 's/\.$//'"));
@@ -65,7 +73,7 @@
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-check-email' && isset($_POST["domain"])) {
 		$need_fix = false;
         $domain = trim($_POST["domain"]);
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+        if(valid_domain($domain)) {
             $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
             if ($row = $results->fetchArray()) {
                 if ($row["has_email"]==true) {
@@ -203,7 +211,7 @@
 
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-domain' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+        if(valid_domain($domain)) {
             $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
             if ($row = $results->fetchArray()) {
                 echo "Error: Domain name already exists on this server, assigned to user ".$row["user"].".";
@@ -218,7 +226,7 @@
         $user = trim($_POST["user"]);
         if(in_array($user, array('root', 'reqad', 'test', 'bin', 'daemon', 'adm', 'lp', 'sync', 'shutdown', 'halt', 'mail', 'operator', 'games', 'ftp', 'nobody', 'systemd-network', 'dbus', 'polkitd', 'sshd', 'postfix', 'chrony', 'reqad', 'apache', 'cjdns', 'vnstat', 'postgres', 'redis', 'awx', 'nginx', 'tss'))) {
             echo "Error: Username already exists. Please choose a distinct one.";
-        } else if(preg_match('/[a-z]+[a-z0-9]{1,7}/', $user)) {
+        } else if(valid_username($user)) {
             $results = $db->query('SELECT * FROM accounts WHERE user="'.$user.'"');
             if ($row = $results->fetchArray()) {
                 echo "Error: Username already exists (UID=".$row["id"]."). Please choose a different one.";
@@ -558,6 +566,39 @@
         exit;
     }
 
+    /* Apple Mail configuration profile (GET download).
+       Apple ignores both the Mozilla autoconfig XML and Autodiscover for IMAP,
+       so a .mobileconfig is the only deterministic way to set up iPhone, iPad
+       and Mac. Carries no password -- the device prompts on install -- and is
+       signed with the domain's own certificate when one is available so it
+       installs "Verified" rather than under the red Unverified banner. */
+    if(isset($_GET["action"]) && $_GET["action"] == 'ajax-mobileconfig' && isset($_GET["email"])) {
+        $mc_email = strtolower(trim((string)$_GET["email"]));
+        /* the mailbox must actually exist here -- /etc/dovecot/users is the
+           inventory, the emails table is only a disk-usage cache */
+        if(!in_array($mc_email, mailbox_list(), true)) {
+            header('HTTP/1.1 404 Not Found');
+            echo 'No such mailbox on this server.';
+            exit;
+        }
+        $mc_plist = mobileconfig_build($mc_email);
+        if($mc_plist === '') {
+            header('HTTP/1.1 400 Bad Request');
+            echo 'Could not build a profile for that address.';
+            exit;
+        }
+        $mc_domain = substr($mc_email, strrpos($mc_email, '@') + 1);
+        $mc_signed = mobileconfig_sign($mc_plist, $mc_domain);
+        $mc_body   = $mc_signed !== '' ? $mc_signed : $mc_plist;
+
+        header('Content-Type: application/x-apple-aspen-config');
+        header('Content-Disposition: attachment; filename="'.str_replace(array('"', "\r", "\n"), '', $mc_email).'.mobileconfig"');
+        header('Content-Length: '.strlen($mc_body));
+        header('Cache-Control: private, no-store');
+        echo $mc_body;
+        exit;
+    }
+
     /* ===================== Terminal =====================
        wetty is started with a fixed command and gets no per-request context,
        so the target user is handed off through a one-shot root-owned file.
@@ -575,28 +616,24 @@
 
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-database' && isset($_POST["dbname"])) {
         $dbname = trim($_POST["dbname"]);
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]+[a-z0-9]+\.[a-z]{2,}/', $dbname)) {
-			$mysql_databases = array();
-			$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SHOW DATABASES'"))), true);
-			foreach($mysql_array["row"] as $mysql_array2) {
-				$mysql_databases[] = $mysql_array2["field"];
-			}
-			#echo "Databases: ".var_export($mysql_databases, true);
-			if(in_array($dbname, $mysql_databases)) {
-				echo "Database ".$dbname." already exists. Please choose a different name.";
-				exit;
-			}
+        /* This gate was valid_domain() -- a database name is not a domain, and
+           the check that matters is the one create_database.php enforces. */
+        if(!valid_mysql_identifier($dbname)) {
+			echo "Database name may only contain letters, numbers and underscores.";
+			exit;
+		}
+		if(in_array($dbname, mysql_rows('SHOW DATABASES'))) {
+			echo "Database ".$dbname." already exists. Please choose a different name.";
+			exit;
 		}
 
 		if(isset($_POST["dbuser"])) {
         	$dbuser = trim($_POST["dbuser"]);
-			$mysql_users = array();
-			$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SELECT User FROM mysql.user'"))), true);
-			foreach($mysql_array["row"] as $mysql_array2) {
-				$mysql_users[] = $mysql_array2["field"];
+			if(!valid_mysql_identifier($dbuser)) {
+				echo "Database user may only contain letters, numbers and underscores.";
+				exit;
 			}
-			#echo "Users: ".var_export($mysql_users, true);
-			if(in_array($dbuser, $mysql_users)) {
+			if(in_array($dbuser, mysql_rows('SELECT User FROM mysql.user'))) {
 				echo "User ".$dbuser." already exists. Please choose a different user name.";
 				exit;
 			}
@@ -608,9 +645,9 @@
         $user = trim($_POST["user"]);
         $domain = trim($_POST["domain"]);
 
-		if(!preg_match('/[A-Za-z0-9\+\-_]{1,32}/', $user)) {
+		if(!valid_email_user($user)) {
 			echo "Email must be unique, 1-64 characters long, contain letters, numbers, dashes and underscores.";
-		} else if(!preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+		} else if(!valid_domain($domain)) {
             echo "Error: Domain name is wrong, please check what you selected.";
 		} else {
 			$domains = explode("\n", trim(shell_exec("sudo ls -1 /etc/exim/domains/")));
@@ -644,7 +681,7 @@
 			if(in_array($user, $existing_forwards))
 				echo "Error: User $user already has an forward, please edit existing one instead of adding a new one.";
 		}
-		if(!preg_match('/[A-Za-z0-9\+\-_\.]{1,32}@[a-z0-9\-\.]{2,32}\.[a-z]{2,10}.*/', $forward) && $forward!='') {
+		if(!valid_forward_list($forward) && $forward!='') {
             echo "Error: Forwarder should contain at least one email address.";
 		} else if($pipe!='' && !is_executable($pipe)) {
             echo "Error: Pipe should point to an executable file.";
@@ -657,6 +694,8 @@
 		$domain = trim($_POST["domain"]);
 		if(!preg_match('/^[A-Za-z0-9_\-\+\.]{1,64}$/', $user)) {
 			echo "Error: User must be 1-64 characters, letters, numbers, dashes, underscores.";
+		} else if(!mailbox_exists($user, $domain)) {
+			echo "Error: $user@$domain is not a mailbox on this server.";
 		} else {
 			$stmt = $db->prepare('SELECT id FROM autoresponders WHERE user=:u AND domain=:d');
 			$stmt->bindValue(':u', $user, SQLITE3_TEXT);
@@ -673,9 +712,12 @@
         $newcert = trim($_POST["newcert"]);
         $privkey = trim($_POST["privkey"]);
 
-		$x1 = trim(shell_exec("echo '".$newcert."' | openssl x509 -in /dev/stdin -noout -modulus"));
-		$x2 = trim(shell_exec("echo '".$privkey."' | openssl rsa -in /dev/stdin -noout -modulus"));
-		if($x1!=$x2) {
+		$x1 = trim(shell_with_stdin("openssl x509 -in /dev/stdin -noout -modulus 2>/dev/null", $newcert));
+		$x2 = trim(shell_with_stdin("openssl rsa -in /dev/stdin -noout -modulus 2>/dev/null", $privkey));
+		/* Both empty means openssl rejected the input, not that they match. */
+		if($x1=='' || $x2=='') {
+			echo "Error: Could not read the certificate or the private key.";
+		} else if($x1!=$x2) {
 			echo "Error: Private key and certificate don't match.";
 		}
 		exit;
@@ -685,7 +727,7 @@
         $domain = trim($_POST["domain"]);
         $newcert = trim($_POST["newcert"]);
 		#echo $cert;
-		$x = trim(shell_exec("echo '".$newcert."' | openssl x509 -in /dev/stdin -noout -text| grep -E 'Issuer:|Not Before:|Not After :|Subject:|DNS:'"));
+		$x = trim(shell_with_stdin("openssl x509 -in /dev/stdin -noout -text 2>/dev/null | grep -E 'Issuer:|Not Before:|Not After :|Subject:|DNS:'", $newcert));
 
 		#echo 'Error: '.nl2br($x); exit;
 		
@@ -740,37 +782,28 @@
 
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-ssl' && isset($_POST["info"]) && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
-		$HOSTNAME=trim(`hostname`);
-		#error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." check ssl $domain $HOSTNAME\n", 3, '../log/debug_log');
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
-            $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
-            if ($row = $results->fetchArray() || $domain==$HOSTNAME) {
-				$orignal_parse = parse_url('https://'.$domain, PHP_URL_HOST);
-				$get = stream_context_create(array(
-				'ssl' => array(
-					'capture_peer_cert' => true,
-					'verify_peer' => false,
-					'verify_peer_name' => false,
-					'allow_self_signed' => true)
-				));
-
-                if($domain==$HOSTNAME)
-                	$port = '2087';
-                else
-                	$port = '443';
-                $read = @stream_socket_client("ssl://".$orignal_parse.":".$port, $errno, $errstr, 30, STREAM_CLIENT_CONNECT, $get);
-				if(!$read) {
-					echo '<span class="badge bg-red text-red-fg"><b>Error:</b> &nbsp; '.substr($errstr, strpos($errstr, ':', 30)+2, 99)."</span>|-|-|-";
+		#error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." check ssl $domain\n", 3, '../log/debug_log');
+        if(valid_domain($domain)) {
+            /* accounts + addon domains + hostname, the same list the page lists */
+            if (ssl_domain_exists($db, $ini, $domain)) {
+				/* Read the certificate installed on THIS server. Asking the domain
+				   over the network returns whatever certificate its DNS currently
+				   points to - for a domain moved here but not yet propagated that
+				   is the old server's certificate, and we would report a valid
+				   certificate for a domain that has none here. */
+				$certinfo = local_ssl_cert_info($domain);
+				if($certinfo === false) {
+					echo '<span class="badge bg-red text-red-fg">no certificate installed on this server</span>|-|-|-|0';
 					exit;
 				}
-				$cert = stream_context_get_params($read);
-				$certinfo = openssl_x509_parse($cert['options']['ssl']['peer_certificate']);
 				$sslcert['serialnumber']=$certinfo['serialNumber'];
 				if(isset($certinfo['extensions']['subjectAltName']))
 					$sslcert['domains'] = str_replace('DNS:', '', $certinfo['extensions']['subjectAltName']);
+				else if(isset($certinfo['subject']['CN']))
+					$sslcert['domains'] = $certinfo['subject']['CN'];
 				else
 					$sslcert['domains'] = $domain;
-				if($certinfo['issuer']['O']=='Org') {
+				if(ssl_is_self_signed($certinfo)) {
 					$sslcert['cert'] 	=  '-'; 
 					$sslcert['ca'] 	=  '<span class="badge bg-orange text-orange-fg">self-signed certifiate</span>';
 				} else {
@@ -785,7 +818,7 @@
 					$sslcert['expire'].=' (in '.$expdays.' day)';
 				else
 					$sslcert['expire'].=' (expired)';
-				#sleep(rand(1,4));
+
 				echo $sslcert['domains'].'|'.$sslcert['cert'].'|'.$sslcert['ca'].'|'.$sslcert['expire'].'|'.$expdays;
             } else {
 				echo "Error: Domain name does not exists on this server.";
@@ -798,28 +831,28 @@
 
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-ssl' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
-		$HOSTNAME=trim(`hostname`);
-		#error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." check ssl $domain $HOSTNAME\n", 3, '../log/debug_log');
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
-            $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
-            if ($row = $results->fetchArray() || $domain==$HOSTNAME) {
-				$orignal_parse = parse_url('https://'.$domain, PHP_URL_HOST);
-				$get = stream_context_create(array(
-				'ssl' => array(
-					'capture_peer_cert' => true,
-					'verify_peer' => false,
-					'verify_peer_name' => false,
-					'allow_self_signed' => true)
-				));
-				$read = stream_socket_client("ssl://".$orignal_parse.":443", $errno, $errstr, 30, STREAM_CLIENT_CONNECT, $get);
-				$cert = stream_context_get_params($read);
-				$certinfo = openssl_x509_parse($cert['options']['ssl']['peer_certificate']);
+		#error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." check ssl $domain\n", 3, '../log/debug_log');
+        if(valid_domain($domain)) {
+            /* accounts + addon domains + hostname, the same list the page lists */
+            if (ssl_domain_exists($db, $ini, $domain)) {
+				/* Read the certificate installed on THIS server, not the one the
+				   domain currently serves - if its DNS still points to the old
+				   server we would show that server's certificate instead. */
+				$certinfo = local_ssl_cert_info($domain);
+				if($certinfo === false) {
+					/* keep the self-signed marker so the Let's Encrypt option stays
+					   available for a domain that has no certificate yet */
+					echo '<!--self-signed--><div style="padding:20px 20px 10px 20px;border:1px solid #FAA;vertical-align:baseline;" class="bg-red-lt"><div style="float:left;width:20px;height:20px;margin-right:10px;"><svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-alert-triangle" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="#c13333" fill="none" stroke-linecap="round" stroke-linejoin="round"> <path stroke="none" d="M0 0h24v24H0z" fill="none"></path> <path d="M10.24 3.957l-8.422 14.06a1.989 1.989 0 0 0 1.7 2.983h16.845a1.989 1.989 0 0 0 1.7 -2.983l-8.423 -14.06a1.989 1.989 0 0 0 -3.4 0z"></path> <path d="M12 9v4"></path> <path d="M12 17h.01"></path> </svg></div> <h3>no certificate is installed on this server for this domain</h3></div>';
+					exit;
+				}
 				$sslcert['serialnumber']=$certinfo['serialNumber'];
 				if(isset($certinfo['extensions']['subjectAltName']))
 					$sslcert['domains'] = str_replace('DNS:', '', $certinfo['extensions']['subjectAltName']);
+				else if(isset($certinfo['subject']['CN']))
+					$sslcert['domains'] = $certinfo['subject']['CN'];
 				else
 					$sslcert['domains'] = $domain;
-				if($certinfo['issuer']['O']=='Org') {
+				if(ssl_is_self_signed($certinfo)) {
 					$sslcert['cert'] 	=  '-'; 
 					$sslcert['ca'] 	=  'self-signed certifiate';
 				} else {
@@ -853,7 +886,7 @@
 
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-ssl-getkey' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+        if(valid_domain($domain)) {
 			if($ini["template"] == 'nginx_php-fpm' && is_file("/etc/nginx/conf.d/".$domain.".conf")) {
 				$privkey_file = trim(shell_exec("sudo grep 'ssl_certificate_key' /etc/nginx/conf.d/".$domain.".conf | awk {'print $2'} | sed 's/;//'"));
 				if($privkey_file!='') {
@@ -878,7 +911,7 @@
 
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-install' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
-        if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
+        if(valid_domain($domain)) {
             $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
             if ($row = $results->fetchArray()) {
 				$user = $row["user"];
@@ -903,11 +936,18 @@
 		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ajax-wp-scan $user\n", 3, '../log/debug_log');
 		#echo "/usr/local/bin/wordfence malware-scan --no-color --no-banner --verbose /home/wp/public_html/ 2>&1 | websocat -s 2122";
 		#shell_exec("/usr/local/bin/wordfence malware-scan --no-color --no-banner --verbose /home/wp/public_html/ 2>&1 | websocat -s 2122 &");
+		/* Empty $user means "scan everything"; anything else must be a real
+		   account name before it becomes a script argument. */
+		if($user != '' && !valid_username($user)) {
+			echo "Invalid user.";
+			exit;
+		}
+		$q_user = escapeshellarg($user);
 		if($user == '') {
-			$output = shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $user");
+			$output = shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $q_user");
 			echo $output;
 		} else {
-			shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $user > /usr/local/reqad/wordfence.log 2>&1");
+			shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $q_user > /usr/local/reqad/wordfence.log 2>&1");
 		}
 		#$output = shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $user 2>&1");
 		#echo("/usr/local/reqad/scripts/wordfence_vuln.sh $user\n");
@@ -1690,6 +1730,196 @@
 		]);
 		exit;
 	}
+
+
+    /* ===================== Mail queue (ajax-mq-*) =======================
+       Backs the queue manager on /email/. Every privileged operation goes
+       through scripts/mail/mq-helper.sh, which validates message ids itself;
+       the checks here exist so a bad id comes back as a clean JSON error
+       rather than a non-zero helper exit. Feature-gated to `email`.
+       Helpers live in modules/functions.php. */
+
+    // Queue depth only. Called before any listing: exim -bpc is cheap, exim -bp
+    // is not, and the answer decides whether listing is attempted at all.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-count') {
+        header('Content-Type: application/json');
+        $n = mq_count();
+        if($n < 0) { echo json_encode(array('error' => 'Could not read the mail queue.')); exit; }
+        echo json_encode(array('ok' => true, 'total' => $n, 'max' => MQ_MAX_LIST, 'items' => MQ_PAGE_ITEMS));
+        exit;
+    }
+
+    // One page of the queue. The full parse is cached for 30s (see mq_list), so
+    // paging costs no exim calls; an unfiltered queue over MQ_MAX_LIST is refused.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-list') {
+        header('Content-Type: application/json');
+        $filter  = (isset($_POST["filter"]) && $_POST["filter"] === 'frozen') ? 'frozen' : 'all';
+        $q       = isset($_POST["q"]) ? trim((string)$_POST["q"]) : '';
+        if(strlen($q) > 128) { echo json_encode(array('error' => 'Search term is too long.')); exit; }
+        /* the pattern reaches exim only as an awk substring match, but keep it
+           to things that can plausibly appear in an address or a domain */
+        if($q !== '' && !preg_match('/^[A-Za-z0-9@\.\-_\+ ]+$/', $q)) {
+            echo json_encode(array('error' => 'Search may only contain letters, numbers and @ . - _ +')); exit;
+        }
+
+        $total = mq_count();
+        if($total < 0) { echo json_encode(array('error' => 'Could not read the mail queue.')); exit; }
+        if($total > MQ_MAX_LIST && $filter === 'all' && $q === '') {
+            echo json_encode(array('error' => 'toobig', 'total' => $total, 'max' => MQ_MAX_LIST)); exit;
+        }
+
+        $rows  = mq_list($filter, $q);
+        $found = count($rows);
+        $items = MQ_PAGE_ITEMS;
+        $start = isset($_POST["start"]) ? (int)$_POST["start"] : 1;
+        if($start < 1) $start = 1;
+        if($start > $found) $start = $found > 0 ? (int)(floor(($found - 1) / $items) * $items + 1) : 1;
+
+        /* subjects are fetched for the visible page only -- one spool read per
+           message, so never for the whole queue */
+        $page = array_slice($rows, $start - 1, $items);
+        $subs = mq_subjects(array_column($page, 'id'));
+        foreach($page as $i => $r)
+            $page[$i]['subject'] = isset($subs[$r['id']]) ? $subs[$r['id']] : '';
+
+        echo json_encode(array(
+            'ok'    => true,
+            'rows'  => $page,
+            'total' => $found,
+            'queue' => $total,
+            'start' => $start,
+            'items' => $items,
+        ));
+        exit;
+    }
+
+    // Headers + body of one queued message.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-view' && isset($_POST["id"])) {
+        header('Content-Type: application/json');
+        $id = trim((string)$_POST["id"]);
+        if(!mq_valid_id($id)) { echo json_encode(array('error' => 'Invalid message id.')); exit; }
+        $out = mq_helper(array('view', $id), $rc);
+        if($rc !== 0) { echo json_encode(array('error' => trim($out) !== '' ? trim($out) : 'Message not found.')); exit; }
+        /* the helper separates the two with one blank line */
+        $parts = preg_split('/\n\s*\n/', $out, 2);
+        $body  = isset($parts[1]) ? $parts[1] : '';
+        /* the helper stops at MQ_VIEW_BODY_LINES; tell the UI when it did, so a
+           truncated body is never mistaken for the whole message */
+        $lines = ($body === '') ? 0 : substr_count($body, "\n") + 1;
+        echo json_encode(array(
+            'ok'        => true,
+            'headers'   => isset($parts[0]) ? $parts[0] : '',
+            'body'      => $body,
+            'lines'     => $lines,
+            'truncated' => ($lines >= MQ_VIEW_BODY_LINES),
+        ));
+        exit;
+    }
+
+    // Deliver / remove / freeze / thaw, one or many. Each id is validated
+    // individually before it reaches the shell, and the per-message log comes
+    // back so the modal can show exactly what exim said about each one.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-action' && isset($_POST["verb"]) && isset($_POST["ids"])) {
+        header('Content-Type: application/json');
+        $verb = (string)$_POST["verb"];
+        if(!in_array($verb, array('deliver', 'remove', 'freeze', 'thaw'), true)) {
+            echo json_encode(array('error' => 'Unknown action.')); exit;
+        }
+        $ids = array();
+        foreach((array)$_POST["ids"] as $raw) {
+            $id = trim((string)$raw);
+            if(!mq_valid_id($id)) { echo json_encode(array('error' => 'Invalid message id in selection.')); exit; }
+            $ids[] = $id;
+        }
+        if(!$ids) { echo json_encode(array('error' => 'Nothing selected.')); exit; }
+        if(count($ids) > 500) { echo json_encode(array('error' => 'Too many messages in one request.')); exit; }
+
+        $results = array();
+        $failed  = 0;
+        foreach($ids as $id) {
+            $out = mq_helper(array($verb, $id), $rc);
+            if($rc !== 0) $failed++;
+            $results[] = array('id' => $id, 'ok' => ($rc === 0), 'log' => trim($out));
+        }
+        mq_cache_clear();
+        echo json_encode(array('ok' => true, 'results' => $results, 'failed' => $failed));
+        exit;
+    }
+
+    // Run the whole queue (exim -qff). Returns whatever exim reported.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-runq') {
+        header('Content-Type: application/json');
+        $out = mq_helper(array('runq'), $rc);
+        mq_cache_clear();
+        echo json_encode(array('ok' => true, 'log' => trim($out) !== '' ? trim($out) : 'Queue run started.'));
+        exit;
+    }
+
+    // Remove every frozen message. The one bulk op that does not need a
+    // selection, so it still works when the queue is too large to list.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-purge-frozen') {
+        header('Content-Type: application/json');
+        $out = mq_helper(array('purge-frozen'), $rc);
+        mq_cache_clear();
+        if($rc !== 0) { echo json_encode(array('error' => trim($out) !== '' ? trim($out) : 'Could not purge frozen messages.')); exit; }
+        echo json_encode(array('ok' => true, 'removed' => (int)trim($out)));
+        exit;
+    }
+
+    // Mint a single-use webmail auto-login ticket. The master password stays
+    // server-side; only this token is ever exposed, and only for 30 seconds.
+    //
+    // The token and the URL are returned SEPARATELY, and the browser submits the
+    // token as a form POST -- never as a query string. A token in a URL is
+    // written to the nginx access log, the browser history and any Referer sent
+    // from the webmail page; single-use + 30s made that survivable, but a POST
+    // body is not recorded in any of them.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-webmail-ticket' && isset($_POST["email"])) {
+        header('Content-Type: application/json');
+        if(!webmail_autologin_enabled()) { echo json_encode(array('error' => 'Webmail auto-login is not enabled.')); exit; }
+        $token = webmail_ticket_create($_POST["email"]);
+        if($token === '') { echo json_encode(array('error' => 'No such mailbox.')); exit; }
+        echo json_encode(array('ok' => true, 'token' => $token, 'url' => '/webmail/'));
+        exit;
+    }
+
+    /* ===================== Mail config (ajax-mailconf-*) ================
+       The raw editor on /email-config/<exim|dovecot>/. $which is a whitelisted
+       key, never a path. Saving goes through apply_mail_config(), which backs
+       up, preflights, writes, re-tests and reverts on failure. */
+
+    if(isset($_POST["action"]) && substr((string)$_POST["action"], 0, 14) == 'ajax-mailconf-' && isset($_POST["which"])) {
+        header('Content-Type: application/json');
+        $which = (string)$_POST["which"];
+        if(!mail_config_target($which)) { echo json_encode(array('error' => 'Unknown config file.')); exit; }
+        $t = mail_config_target($which);
+
+        if($_POST["action"] == 'ajax-mailconf-validate' && isset($_POST["content"])) {
+            $err = validate_mail_config($which, (string)$_POST["content"]);
+            echo json_encode($err === '' ? array('ok' => true) : array('error' => $err));
+            exit;
+        }
+
+        if($_POST["action"] == 'ajax-mailconf-save' && isset($_POST["content"])) {
+            $r = apply_mail_config($which, (string)$_POST["content"]);
+            echo json_encode($r['error'] !== '' ? array('error' => $r['error']) : array('ok' => true, 'message' => $r['success']));
+            exit;
+        }
+
+        if($_POST["action"] == 'ajax-mailconf-versions') {
+            echo json_encode(array('ok' => true, 'versions' => list_config_backups('mail', $which, $t['path'])));
+            exit;
+        }
+
+        // Load an older version back into the editor. Restoring is just a save
+        // of that content, so it is validated and backed up like any other.
+        if($_POST["action"] == 'ajax-mailconf-restore' && isset($_POST["version"])) {
+            $content = read_config_backup('mail', $which, $t['path'], (string)$_POST["version"]);
+            if($content === null) { echo json_encode(array('error' => 'That version is no longer available.')); exit; }
+            echo json_encode(array('ok' => true, 'content' => $content));
+            exit;
+        }
+    }
 
 	// Plugin AJAX handlers. Each is a sequence of guarded if(...action...){...exit;}
 	// blocks (same style as above); reached only if no core action matched. Feature

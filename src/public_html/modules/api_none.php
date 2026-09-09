@@ -1,4 +1,4 @@
-<?
+<?php
 $dns_provider_name = '(no DNS provider)';
 function get_nameservers() {
 }

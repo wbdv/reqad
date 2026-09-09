@@ -11,9 +11,10 @@ $TEMPLATE = shell_exec("grep -e '^template=' ../etc/server-software.ini | awk -F
 #sleep(5);
 #echo '<pre>'; print_r($_POST); exit;
 
-if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
-    $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
-    if ($row = $results->fetchArray()) {
+if(valid_domain($domain)) {
+    /* Accounts, addon domains and the hostname alike -- the accounts table alone
+       rejected an addon domain (no row) and this server's own hostname. */
+    if (ssl_domain_exists($db, $ini, $domain)) {
 		if($ssltype == 'letsencrypt') {
 			#shell_exec('sudo certbot --non-interactive --nginx -d '.$domain.',www.'.$domain.' >> '.__DIR__.'/../../log/debug_log 2>&1');
 
@@ -68,7 +69,6 @@ if(preg_match('/[a-z0-9]+[a-z0-9\-\.]*[a-z0-9]+\.[a-z]{2,}/', $domain)) {
 			$errmsg = "Error: Please check the form for errors, not all fields are filled in.";
 		}
 	} else {
-		// TODO if domain == hostname
         $errmsg = "Error: Domain name does not exists on this server.";
     }
 } else {

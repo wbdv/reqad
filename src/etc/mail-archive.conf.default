@@ -1,0 +1,38 @@
+# mail-archive.conf — mailboxes whose OLD mail gets gzipped on disk.
+#
+# Read by /usr/local/reqad/scripts/compress_old_mail, which runs nightly from
+# /etc/cron.d/reqad. This file is empty of entries by default, and an empty file
+# means the cron job does nothing at all: compression is opt-in per mailbox.
+#
+# Before adding anything here, Dovecot has to be able to READ compressed mail:
+#
+#     bash /usr/local/reqad/scripts/update/setup_dovecot_compress.sh
+#
+# Without that plugin the client is handed the raw gzip bytes as the message
+# body — so the cron job checks for it and refuses to run rather than trusting
+# this file.
+#
+# Syntax — one entry per line, "#" starts a comment:
+#
+#   days=365              set the default age cutoff for the lines BELOW it
+#   user@domain.tld       compress that mailbox using the current default
+#   user@domain.tld 90    ... or with its own cutoff, in days
+#   @domain.tld           every mailbox in that domain, current default
+#   @domain.tld 730       every mailbox in that domain, 2 years
+#
+# The cutoff is on file mtime, which for a maildir message is when it was
+# delivered (or last flag-updated). 365 is the built-in default when no days=
+# line has been seen.
+#
+# Compression is in place and reversible: the maildir filename never changes,
+# and a message that is already gzipped is detected by its content and left
+# alone, so this is safe to re-run and safe to widen later. To undo a mailbox,
+# drop its line here and gunzip the files back over themselves — nothing else
+# recorded that they were compressed.
+#
+# Try it read-only first:
+#     /usr/local/reqad/scripts/compress_old_mail --dry-run --verbose
+
+# days=365
+# old@example.com 365
+# @archive.example.com 180

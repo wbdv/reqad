@@ -1,34 +1,81 @@
 <?php
-	$ssh_key_opt = (isset($backup_sshkey) && $backup_sshkey !== '') ? "-i $backup_sshkey " : '';
+/*
+ * SECURITY (fixed 2026-09-08): this page used to interpolate $_GET["download"]
+ * straight into a shell command --
+ *
+ *     shell_exec("sudo ssh ... 'cat ./".$d."'")
+ *
+ * -- while only checking that ONE EXPLODED SEGMENT of it ended in .sql.gz. $d
+ * itself was never validated, so a single quote in the query string closed the
+ * remote command and everything after it ran in the local shell as the panel
+ * user, which has NOPASSWD:ALL. That was remote code execution as root behind
+ * nothing but the Nginx basic auth.
+ *
+ * The path is now whitelisted to the exact shape backupdb.sh writes
+ * (<date>/<hour>/<db>.sql.gz, or <date>/<db>.sql.gz), out of a charset with no
+ * quote, $, backtick, space or backslash in it, and every command is assembled
+ * by remote_backup_ssh_cmdline(), which escapeshellarg()s each part.
+ *
+ * The download also used `echo shell_exec(...)`, which reads the whole dump into
+ * PHP memory before sending a byte; it now streams with passthru().
+ *
+ * Credentials still come from defines.php here, deliberately: this page talks to
+ * the DB-dump backup account (scripts/backupdb.sh), which is not necessarily the
+ * account the full remote backup uses, and a security fix should not silently
+ * re-point it at a different server.
+ */
+	$bdb_cfg = array(
+		'host' => isset($backup_server)  ? (string)$backup_server  : '',
+		'user' => isset($backup_user)    ? (string)$backup_user    : '',
+		'port' => (isset($backup_sshport) && $backup_sshport !== '') ? (string)$backup_sshport : '22',
+		'key'  => isset($backup_sshkey)  ? (string)$backup_sshkey  : '',
+		'dest' => '',
+	);
+	$bdb_ready = ($bdb_cfg['host'] !== '' && $bdb_cfg['user'] !== '');
+
 	if(isset($_GET["download"])) {
-		$d = $_GET["download"];
-		$filepath = explode('/', $d);
-		$filename = $filepath[2];
-		if(substr($filename, -7)!='.sql.gz') {
-			$filename = $filepath[1];
-		}
-		if(substr($filename, -7)!='.sql.gz') {
+		$d = (string)$_GET["download"];
+		/* two or three segments, nothing but [A-Za-z0-9._:-] in each, no "..",
+		   and it must name a .sql.gz */
+		$valid = (bool)preg_match('#^[A-Za-z0-9._:-]{1,64}(?:/[A-Za-z0-9._:-]{1,64}){1,2}$#', $d)
+		       && strpos($d, '..') === false
+		       && substr($d, -7) === '.sql.gz';
+		if(!$valid) {
 			$errmsg = 'Wrong filename.';
+		} elseif(!$bdb_ready) {
+			$errmsg = 'No backup server is configured.';
 		} else {
-			$out = shell_exec("sudo ssh -p $backup_sshport {$ssh_key_opt}$backup_user@$backup_server 'ls -al ./".$d."'");
-			$out = explode(' ', $out);
-			$filesize = (int)($out[4]);
-			if($filesize == 0) {
+			$filename = basename($d);
+			$rc = 0;
+			$filesize = trim(remote_backup_ssh($bdb_cfg, "stat -c %s './".$d."'", $rc));
+			if($rc !== 0 || !ctype_digit($filesize) || (int)$filesize === 0) {
 				$errmsg = 'Empty file.';
 			} else {
-				header("Cache-Control: public, must-revalidate\n");
-				header("Pragma: hack\n");
-				header("Expires: " . gmdate("D, d M Y H:i:s", mktime(date("H") + 2, date("i"), date("s"), date("m"), date("d"), date("Y"))) . " GMT\n");
-				header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT");
-				header("Content-Type: application/gzip\n");
-				header("Content-Length: " . $filesize . "\n");
-				header("Content-Disposition: attachment; filename=\"" . $filename . "\"\n");
-				header("Content-Transfer-Encoding: binary");
-				echo shell_exec("sudo ssh -p $backup_sshport {$ssh_key_opt}$backup_user@$backup_server 'cat ./".$d."'");
+				/* passthru, not echo shell_exec: a dump must not be buffered in
+				   PHP memory in its entirety before the first byte is sent */
+				remote_backup_stream($bdb_cfg, './'.$d, (int)$filesize, $filename);
 				exit;
 			}
 		}
 	}
+	/* The listing runs BEFORE the header is included: $errmsg is rendered by the
+	   alert block a few lines below the header, so an error raised after that
+	   point would never be shown. */
+	$bdb_list = '';
+	if(!$bdb_ready) {
+		$errmsg = 'No backup server is configured in defines.php.';
+	} else {
+		/* the glob is quoted so the REMOTE shell hands it to find as a pattern
+		   instead of expanding it against the remote working directory */
+		$rc = 0;
+		$bdb_list = remote_backup_ssh($bdb_cfg,
+			"find . -type f -name '*.sql.gz'"
+			." ! -name mysql.sql.gz ! -name information_schema.sql.gz"
+			." ! -name performance_schema.sql.gz ! -name phpmyadmin.sql.gz"
+			." ! -name sys.sql.gz", $rc);
+		if($rc !== 0) { $errmsg = 'Cannot reach the backup server: '.trim($bdb_list); $bdb_list = ''; }
+	}
+
     include('templates/header.php'); 
 ?>
         <!-- Page title -->
@@ -77,11 +124,13 @@
             <div class="card">
 <? 
 	$backup = array();
-	$list = shell_exec("sudo ssh -p $backup_sshport {$ssh_key_opt}$backup_user@$backup_server 'find . -type f -name *.sql.gz ! -name mysql.sql.gz ! -name information_schema.sql.gz ! -name performance_schema.sql.gz ! -name phpmyadmin.sql.gz ! -name sys.sql.gz'");
-	$line = strtok($list, PHP_EOL);
+	$line = strtok($bdb_list, PHP_EOL);
 	while ($line !== false) {
 		$l = explode('/', $line);
-		$backup[$l[1]][$l[2]][] = $l[3];
+		/* ./<date>/<hour>/<file> — anything else is not one of ours */
+		if(count($l) >= 3) {
+			$backup[$l[1]][$l[2]][] = isset($l[3]) ? $l[3] : '';
+		}
     	$line = strtok(PHP_EOL);
 	}
 	krsort($backup);
@@ -92,15 +141,17 @@
 	foreach($backup as $d => $b2) {
 		if($date!=$d) {
 			$date = $d;
-			echo '<tr><th><br>'.$date.'</th><th>&nbsp;</th></tr>';
+			echo '<tr><th><br>'.h($date).'</th><th>&nbsp;</th></tr>';
 		}
 		foreach($b2 as $h => $b3) {
-			echo '<tr><td>'.$h.'</td><td>';
+			echo '<tr><td>'.h($h).'</td><td>';
 			foreach($b3 as $b) {
+                /* these names come off the backup server, so they are escaped
+                   both as URL and as HTML rather than pasted in raw */
                 if($b=='')
-                    echo '<a href="/backupdb/?download='.$d.'/'.$h.'">'.$h.'</a> &nbsp;';
+                    echo '<a href="/backupdb/?download='.rawurlencode($d).'/'.rawurlencode($h).'">'.h($h).'</a> &nbsp;';
                 else
-                    echo '<a href="/backupdb/?download='.$d.'/'.$h.'/'.$b.'">'.$b.'</a> &nbsp;';
+                    echo '<a href="/backupdb/?download='.rawurlencode($d).'/'.rawurlencode($h).'/'.rawurlencode($b).'">'.h($b).'</a> &nbsp;';
 			}
 			echo '</td></tr>';
 		}

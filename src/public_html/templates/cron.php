@@ -196,9 +196,16 @@
                           </div>
                         </td>
                         <td data-label="Cmd">
+                          <?
+                            // A long command used to stretch the row until the
+                            // Edit/Delete buttons sat off the right edge of the
+                            // scroll area — show a prefix, full text on hover.
+                            $cmd_full  = $cron["cmd"];
+                            $cmd_short = mb_strlen($cmd_full) > 110 ? mb_substr($cmd_full, 0, 80) . '…' : $cmd_full;
+                          ?>
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
-                              <div class="font-weight-medium" style="font-family:monospace;white-space:nowrap;"><?=$cron["cmd"];?></div>
+                              <div class="font-weight-medium" style="font-family:monospace;white-space:nowrap;" title="<?=htmlspecialchars($cmd_full, ENT_QUOTES);?>"><?=htmlspecialchars($cmd_short);?></div>
                             </div>
                           </div>
                         </td>
@@ -207,8 +214,13 @@
                             $sched_parts = explode(' ', $cron["date"]);
                             $orig_line = $cron["global"] ? $cron["date"].' '.$cron["user"].' '.$cron["cmd"] : $cron["date"].' '.$cron["cmd"];
                             $cron_type = $cron["global"] ? 'global' : 'user';
+                            // Special schedules (@reboot, @daily, ...) are a single
+                            // field — the 5-field edit form cannot represent them,
+                            // so only offer Delete on those rows.
+                            $editable = count($sched_parts) == 5;
                           ?>
                           <div class="btn-list flex-nowrap">
+                          <? if ($editable) { ?>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-cron"
                                data-bs-orig-line="<?=htmlspecialchars($orig_line, ENT_QUOTES);?>"
                                data-bs-cron-type="<?=$cron_type;?>"
@@ -219,6 +231,9 @@
                                data-bs-cron-mon="<?=htmlspecialchars($sched_parts[3] ?? '*', ENT_QUOTES);?>"
                                data-bs-cron-dow="<?=htmlspecialchars($sched_parts[4] ?? '*', ENT_QUOTES);?>"
                                data-bs-cron-cmd="<?=htmlspecialchars($cron["cmd"], ENT_QUOTES);?>">Edit</a>
+                          <? } else { ?>
+                            <span class="btn btn-white btn-md disabled" title="Special schedules (<?=htmlspecialchars($cron["date"], ENT_QUOTES);?>) cannot be edited here">Edit</span>
+                          <? } ?>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-cron"
                                data-bs-cron-line="<?=htmlspecialchars($orig_line, ENT_QUOTES);?>"
                                data-bs-cron-type="<?=$cron_type;?>"

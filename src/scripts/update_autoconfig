@@ -1,0 +1,296 @@
+#!/usr/bin/php82
+<?php
+/* Generate the static mail-client autoconfiguration files served on every
+ * hosted vhost.
+ *
+ *   /var/lib/reqad/autoconfig/<domain>.xml
+ *       Mozilla clientConfig 1.1, served at
+ *       https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml
+ *       (Thunderbird 115+; the "mail/" path segment is part of the spec).
+ *
+ *   /var/lib/reqad/autoconfig/<domain>.autodiscover.xml
+ *       Outlook/Exchange autodiscover, served at
+ *       https://<domain>/autodiscover/autodiscover.xml
+ *
+ * Nothing in either file varies per request -- %EMAILADDRESS% is a placeholder
+ * the client substitutes itself -- so these are plain files served by nginx,
+ * with no PHP in the request path at all. nginx picks the file with
+ * "alias /var/lib/reqad/autoconfig/$host.xml", which keeps one identical
+ * include for every vhost; a Host header that could escape the directory is
+ * rejected by nginx with 400 before it ever reaches the alias.
+ *
+ * A domain with no file gets a 404, which is deliberate: that is what makes
+ * Thunderbird fall through to the ISPDB, the right answer for a web-only
+ * account whose MX points at Google.
+ *
+ * Run from update_email_sni, so every path that refreshes the mail TLS
+ * configuration refreshes these too (account email enable/disable, certificate
+ * issue and renewal, hostname rename).
+ *
+ * Usage: update_autoconfig [--quiet]
+ */
+
+if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+    echo "You can only run this script as root from cli.\n";
+    exit(1);
+}
+
+define('AC_DIR',          '/var/lib/reqad/autoconfig');
+define('AC_EXIM_DOMAINS', '/etc/exim/domains');
+
+$quiet = in_array('--quiet', $argv);
+function say($msg) { global $quiet; if(!$quiet) echo $msg."\n"; }
+
+$ini = @parse_ini_file('/usr/local/reqad/etc/server-software.ini');
+$email_enabled = (is_array($ini) && isset($ini["email"]) && $ini["email"] == "1");
+
+/* ---------------------------------------------------------------- helpers */
+
+function ac_valid_domain($d) {
+	if($d == '' || strlen($d) > 253) return false;
+	if(strpos($d, '..') !== false) return false;
+	return (bool)preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/', $d);
+}
+
+/* The certificate this server serves for $domain, read off disk. The vhost is
+   asked first (a domain may use a bought certificate), Let's Encrypt second. */
+function ac_cert_file($domain) {
+	$vhosts = array(
+		'/etc/nginx/conf.d/'.$domain.'.conf',
+		'/etc/httpd/conf.d/'.$domain.'.conf',
+		'/etc/reqad/conf.d/'.$domain.'.conf',
+	);
+	foreach($vhosts as $file) {
+		if(!is_file($file)) continue;
+		$conf = (string)@file_get_contents($file);
+		/* the trailing whitespace class keeps ssl_certificate_key out */
+		if(preg_match('/^[ \t]*(?:ssl_certificate|SSLCertificateFile)[ \t]+([^;\s]+)/mi', $conf, $m)) {
+			if(is_file($m[1])) return $m[1];
+		}
+	}
+	foreach(array('fullchain.pem', 'cert.pem') as $f) {
+		$cert = '/etc/letsencrypt/live/'.$domain.'/'.$f;
+		if(is_file($cert)) return $cert;
+	}
+	return '';
+}
+
+/* Every name that certificate is valid for, lowercased. */
+function ac_cert_names($domain) {
+	$file = ac_cert_file($domain);
+	if($file == '') return array();
+
+	$pem = (string)@file_get_contents($file);
+	if(strpos($pem, '-----BEGIN CERTIFICATE-----') === false) return array();
+
+	$info = @openssl_x509_parse($pem);
+	if(!is_array($info)) return array();
+
+	$names = array();
+	if(isset($info['subject']['CN']))
+		$names[] = strtolower($info['subject']['CN']);
+	if(isset($info['extensions']['subjectAltName'])) {
+		foreach(explode(',', $info['extensions']['subjectAltName']) as $san) {
+			$san = trim($san);
+			if(stripos($san, 'DNS:') === 0)
+				$names[] = strtolower(trim(substr($san, 4)));
+		}
+	}
+	return array_values(array_unique($names));
+}
+
+function ac_cert_covers($names, $name) {
+	if(in_array($name, $names, true)) return true;
+	$wild = '*.'.substr($name, strpos($name, '.') + 1);
+	return in_array($wild, $names, true);
+}
+
+/* The host handed to the client for IMAP/POP/SMTP.
+ *
+ * Only ever advertise a name whose certificate validates, or the wizard
+ * finishes and then dies with a certificate warning on first connect -- worse
+ * than offering no autoconfiguration at all.
+ *
+ *   1. the autoconfig-hostname setting, when the admin has forced one
+ *   2. mail.<domain>, when the domain's certificate covers it
+ *   3. <domain> itself, when the certificate covers it
+ *   4. this server's hostname, which always has one
+ *
+ * update_email_sni gives dovecot a local_name block and exim an sni_certs.db
+ * entry for both mail.<domain> and <domain>, so 2 and 3 are served correctly. */
+function ac_mail_hostname($domain, $forced, $hostname) {
+	if($forced != '') return $forced;
+
+	$names = ac_cert_names($domain);
+	if(ac_cert_covers($names, 'mail.'.$domain)) return 'mail.'.$domain;
+	if(ac_cert_covers($names, $domain))         return $domain;
+
+	return $hostname != '' ? $hostname : $domain;
+}
+
+function ac_x($s) { return htmlspecialchars($s, ENT_XML1, 'UTF-8'); }
+
+/* Mozilla clientConfig 1.1. password-cleartext means cleartext inside TLS,
+   which is what dovecot and exim do here. %EMAILADDRESS% is substituted by
+   the client, so the file needs no per-user knowledge. */
+function ac_mozilla_xml($domain, $mailhost) {
+	$d  = ac_x($domain);
+	$mh = ac_x($mailhost);
+
+	$x  = '<?xml version="1.0" encoding="UTF-8"?>'."\n";
+	$x .= '<!-- generated by Reqad -->'."\n";
+	$x .= '<clientConfig version="1.1">'."\n";
+	$x .= '  <emailProvider id="'.$d.'">'."\n";
+	$x .= '    <domain>'.$d.'</domain>'."\n";
+	$x .= '    <displayName>'.$d.'</displayName>'."\n";
+	$x .= '    <displayShortName>'.$d.'</displayShortName>'."\n";
+
+	foreach(array(
+		array('imap', 993, 'SSL'),
+		array('imap', 143, 'STARTTLS'),
+		array('pop3', 995, 'SSL'),
+		array('pop3', 110, 'STARTTLS'),
+	) as $in) {
+		$x .= '    <incomingServer type="'.$in[0].'">'."\n";
+		$x .= '      <hostname>'.$mh.'</hostname>'."\n";
+		$x .= '      <port>'.$in[1].'</port>'."\n";
+		$x .= '      <socketType>'.$in[2].'</socketType>'."\n";
+		$x .= '      <authentication>password-cleartext</authentication>'."\n";
+		$x .= '      <username>%EMAILADDRESS%</username>'."\n";
+		$x .= '    </incomingServer>'."\n";
+	}
+
+	foreach(array(array(465, 'SSL'), array(587, 'STARTTLS')) as $out) {
+		$x .= '    <outgoingServer type="smtp">'."\n";
+		$x .= '      <hostname>'.$mh.'</hostname>'."\n";
+		$x .= '      <port>'.$out[0].'</port>'."\n";
+		$x .= '      <socketType>'.$out[1].'</socketType>'."\n";
+		$x .= '      <authentication>password-cleartext</authentication>'."\n";
+		$x .= '      <username>%EMAILADDRESS%</username>'."\n";
+		$x .= '      <addThisServer>true</addThisServer>'."\n";
+		$x .= '      <useGlobalPreferredServer>false</useGlobalPreferredServer>'."\n";
+		$x .= '    </outgoingServer>'."\n";
+	}
+
+	$x .= '  </emailProvider>'."\n";
+	$x .= '</clientConfig>'."\n";
+	return $x;
+}
+
+/* Outlook autodiscover. <LoginName> is deliberately omitted: a static file
+   cannot echo the address back out of the POST body, and with it absent
+   Outlook uses the full email address, which is exactly what
+   /etc/dovecot/users is keyed on. */
+function ac_outlook_xml($mailhost) {
+	$mh = ac_x($mailhost);
+
+	$x  = '<?xml version="1.0" encoding="utf-8"?>'."\n";
+	$x .= '<!-- generated by Reqad -->'."\n";
+	$x .= '<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">'."\n";
+	$x .= '  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">'."\n";
+	$x .= '    <Account>'."\n";
+	$x .= '      <AccountType>email</AccountType>'."\n";
+	$x .= '      <Action>settings</Action>'."\n";
+	foreach(array(array('IMAP', 993), array('SMTP', 465)) as $proto) {
+		$x .= '      <Protocol>'."\n";
+		$x .= '        <Type>'.$proto[0].'</Type>'."\n";
+		$x .= '        <Server>'.$mh.'</Server>'."\n";
+		$x .= '        <Port>'.$proto[1].'</Port>'."\n";
+		$x .= '        <DomainRequired>off</DomainRequired>'."\n";
+		$x .= '        <SPA>off</SPA>'."\n";
+		$x .= '        <SSL>on</SSL>'."\n";
+		$x .= '        <Encryption>SSL</Encryption>'."\n";
+		$x .= '        <AuthRequired>on</AuthRequired>'."\n";
+		if($proto[0] == 'SMTP') {
+			$x .= '        <UsePOPAuth>on</UsePOPAuth>'."\n";
+			$x .= '        <SMTPLast>off</SMTPLast>'."\n";
+		}
+		$x .= '      </Protocol>'."\n";
+	}
+	$x .= '    </Account>'."\n";
+	$x .= '  </Response>'."\n";
+	$x .= '</Autodiscover>'."\n";
+	return $x;
+}
+
+/* Write only on change, so an unchanged run leaves mtimes alone. */
+function ac_put($file, $content) {
+	if(is_file($file) && (string)@file_get_contents($file) === $content) return false;
+	file_put_contents($file, $content);
+	chmod($file, 0644);
+	return true;
+}
+
+/* --------------------------------------------------------------- generate */
+
+if(!is_dir(AC_DIR)) {
+	mkdir(AC_DIR, 0755, true);
+	chmod(AC_DIR, 0755);
+}
+
+/* /etc/exim/domains/<domain> is the authority for "this server accepts mail
+   for it" -- the same file create_email.php and mailbox_create() go by. Using
+   it rather than the accounts table means addon domains and anything added by
+   hand are covered too. */
+$domains = array();
+if($email_enabled && is_dir(AC_EXIM_DOMAINS)) {
+	foreach((array)scandir(AC_EXIM_DOMAINS) as $entry) {
+		$d = strtolower(trim($entry));
+		if(ac_valid_domain($d) && is_file(AC_EXIM_DOMAINS.'/'.$d))
+			$domains[$d] = true;
+	}
+} else if(!$email_enabled) {
+	say("Email is disabled in etc/server-software.ini -- removing autoconfig files.");
+}
+$domains = array_keys($domains);
+sort($domains);
+
+/* The forced hostname is optional; the panel does not create the row. */
+$forced = '';
+if(is_file('/usr/local/reqad/db/reqad.db')) {
+	$db  = new SQLite3('/usr/local/reqad/db/reqad.db', SQLITE3_OPEN_READONLY);
+	$st  = @$db->prepare('SELECT value FROM settings WHERE key=:k LIMIT 1');
+	if($st) {
+		$st->bindValue(':k', 'autoconfig-hostname', SQLITE3_TEXT);
+		$res = @$st->execute();
+		$row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+		if($row) $forced = strtolower(trim((string)$row['value']));
+	}
+	if(!ac_valid_domain($forced)) $forced = '';
+}
+
+$hostname = strtolower(trim((string)shell_exec('hostname')));
+if(!ac_valid_domain($hostname)) $hostname = '';
+
+$keep = array();
+$changed = 0;
+foreach($domains as $domain) {
+	$mailhost = ac_mail_hostname($domain, $forced, $hostname);
+
+	$f1 = AC_DIR.'/'.$domain.'.xml';
+	$f2 = AC_DIR.'/'.$domain.'.autodiscover.xml';
+	$keep[basename($f1)] = true;
+	$keep[basename($f2)] = true;
+
+	$w1 = ac_put($f1, ac_mozilla_xml($domain, $mailhost));
+	$w2 = ac_put($f2, ac_outlook_xml($mailhost));
+	if($w1 || $w2) {
+		$changed++;
+		say("  Updated: $domain -> $mailhost");
+	}
+}
+
+/* Prune files for domains that no longer take mail here. Only ever touch names
+   this script could have written. */
+$removed = 0;
+foreach((array)scandir(AC_DIR) as $entry) {
+	if($entry == '.' || $entry == '..') continue;
+	if(isset($keep[$entry])) continue;
+	if(!preg_match('/^[a-z0-9.-]+\.(autodiscover\.)?xml$/', $entry)) continue;
+	if(is_file(AC_DIR.'/'.$entry) && unlink(AC_DIR.'/'.$entry)) {
+		say("  Removed: $entry");
+		$removed++;
+	}
+}
+
+say(count($domains)." domain(s), $changed updated, $removed removed.");

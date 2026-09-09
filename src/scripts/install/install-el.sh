@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.1.0 - Jul 28, 2026'
+VERSION='0.1.1 - Sep 6, 2026'
 
 # Merged from install-el8.sh (0.0.27) + install-el9.sh (0.0.30). One script for
 # every Enterprise Linux release; EL-specific bits are switched on ${EL} below.
@@ -100,10 +100,22 @@ echo -ne "${NC}"
 if [ "$1" == "--skip-update" ]; then
     echo -e "  ~~~ skip dnf update and packages install ~~~\n";
 else
-	# linux-firmware is a few hundred MB of driver blobs for physical hardware.
-	# A guest (KVM, Xen, VMware, LXC, ...) never loads any of it, so exclude it
-	# from dnf on a VPS: it is the single slowest part of the initial update.
+	# linux-firmware is ~1.5 GB of driver blobs for physical hardware (wifi, GPU,
+	# exotic NICs). A guest (KVM, Xen, VMware, LXC, ...) never loads any of it, so
+	# exclude it from dnf on a VPS: it is the single slowest part of the first update.
+	#
+	# On KVM we go further and delete it outright (see below). It cannot be removed
+	# *before* the update though: kernel-core carries "Requires(pre): linux-firmware",
+	# so with the package gone and still excluded dnf refuses to install any kernel
+	# ("nothing provides linux-firmware needed by kernel-core"). Erasing it is safe
+	# (rpm ignores Requires(pre) on removal - nothing cascades), so the working order
+	# is: exclude -> update (the installed copy keeps the kernel dependency satisfied,
+	# and nothing is re-downloaded) -> remove the packages -> drop the exclude again.
 	VIRT=$(systemd-detect-virt 2>/dev/null || echo none)
+	case "${VIRT}" in
+	    kvm|qemu) PRUNE_FIRMWARE=1 ;;
+	    *)        PRUNE_FIRMWARE=0 ;;
+	esac
 	if [ "${VIRT}" != "none" ] && ! grep -q '^exclude=.*linux-firmware' /etc/dnf/dnf.conf; then
 	    echo -n "Virtual machine (${VIRT}), exclude linux-firmware ";
 	    if grep -q '^exclude=' /etc/dnf/dnf.conf; then
@@ -118,6 +130,34 @@ else
 	(dnf clean all) >> ./install_reqad.log 2>&1
 	(dnf --refresh makecache && dnf -y update) >> ./install_reqad.log 2>&1
 	echo -e "[ ${GREEN}DONE${NC} ]"
+
+	# Nothing in a KVM guest requests firmware - it only ever binds virtio and
+	# emulated devices - so drop the blobs now that the update (and any kernel it
+	# pulled in) is done. EL8 ships one big linux-firmware plus the iwl* sets;
+	# EL9 splits it into per-vendor subpackages. Globs that match nothing are
+	# simply skipped, and microcode_ctl is deliberately left alone.
+	if [ "${PRUNE_FIRMWARE}" == "1" ] && rpm -q --quiet linux-firmware; then
+	    echo -n "Remove firmware blobs (${VIRT} guest)        " | cut -b 1-36 | echo -n "$(</dev/stdin)"
+	    set -f   # ${FW} holds rpm globs - keep the shell from expanding them as paths
+	    FW="linux-firmware linux-firmware-* iwl*-firmware alsa-sof-firmware"
+	    FW="${FW} libertas-*-firmware atheros-firmware brcmfmac-firmware"
+	    FW="${FW} mt7xxx-firmware realtek-firmware tiwilink-firmware"
+	    FW="${FW} nxpwireless-firmware qcom-firmware amd-gpu-firmware"
+	    FW="${FW} nvidia-gpu-firmware intel-gpu-firmware liquidio-firmware"
+	    FW="${FW} netronome-firmware mrvlprestera-firmware"
+	    (dnf -y remove ${FW}) >> ./install_reqad.log 2>&1
+	    set +f
+	    # The exclude has to go with it, otherwise the next kernel update fails to
+	    # resolve. linux-firmware comes back if a kernel is ever updated; that is
+	    # the price of keeping dnf working.
+	    sed -i -e '/^exclude=linux-firmware$/d' \
+	           -e 's/^\(exclude=.*\),linux-firmware\b/\1/' /etc/dnf/dnf.conf
+	    if rpm -q --quiet linux-firmware; then
+	        echo -e "[ ${RED}ERROR${NC} ]"
+	    else
+	        echo -e "[ ${GREEN}DONE${NC} ]"
+	    fi
+	fi
 	if [ ! -f "/etc/yum.repos.d/epel.repo" ]; then
 	    echo -n "Install epel                        ";
 	    (dnf install -y epel-release) >> ./install_reqad.log 2>&1
@@ -236,11 +276,25 @@ echo -n "Install Configserver Firewall (csf) "
 # module stream (they come with perl-interpreter); asking for them there fails
 # with "All matches were filtered out by modular filtering". EL9 ships them as
 # real packages.
-CSF_PERL="ipset perl-libwww-perl perl-Net-SSLeay perl-IO-Socket-SSL perl-LWP-Protocol-https perl-GDGraph perl-Math-BigInt perl-Crypt-SSLeay"
+CSF_PERL="ipset perl perl-libwww-perl perl-Net-SSLeay perl-IO-Socket-SSL perl-LWP-Protocol-https perl-GDGraph perl-Math-BigInt perl-Math-BigInt-FastCalc perl-Crypt-SSLeay"
 if [ "${EL}" -ge 9 ]; then
     CSF_PERL="${CSF_PERL} perl-File-Copy perl-File-Find"
 fi
-(dnf -y install ${CSF_PERL}) >> ./install_reqad.log
+# One unresolvable name (perl-GDGraph and perl-Crypt-SSLeay live in EPEL, which
+# may not be there yet) aborts the whole dnf transaction and leaves NOTHING
+# installed - that is how csf ended up missing Math::BigInt on EL8. Install the
+# dependencies one at a time so a missing optional one cannot take the rest down.
+for CSF_PKG in ${CSF_PERL}; do
+    rpm -q --quiet "${CSF_PKG}" && continue
+    (dnf -y install "${CSF_PKG}") >> ./install_reqad.log 2>&1
+done
+# csf's own perl scripts hard-require Math::BigInt; nothing else on a minimal
+# install pulls it in, so fail loudly here instead of inside csftest.pl.
+if ! perl -MMath::BigInt -e1 >/dev/null 2>&1; then
+    (dnf -y install perl-Math-BigInt) >> ./install_reqad.log 2>&1
+    perl -MMath::BigInt -e1 >/dev/null 2>&1 || \
+        echo -e "\n${RED}WARNING${NC}: perl module Math::BigInt is missing - csf may not work." 1>&2
+fi
 (wget -q https://repo.reqad.net/csf.tgz) >> ./install_reqad.log 2>&1
 (tar xzf csf.tgz) >> ./install_reqad.log 2>&1
 cd csf
@@ -370,7 +424,7 @@ fi
 if ! systemctl is-active --quiet reqad; then
 
 	(dnf install -y https://rpms.remirepo.net/enterprise/remi-release-${EL}.rpm) >> ./install_reqad.log 2>&1
-	(dnf install -y https://repo.reqad.net/el${EL}/RPMS/x86_64/reqad-repo-1.0.1-1.el${EL}.noarch.rpm) >> ./install_reqad.log 2>&1
+	(dnf install -y https://repo.reqad.net/el${EL}/RPMS/x86_64/reqad-repo-1.0.2-1.el${EL}.noarch.rpm) >> ./install_reqad.log 2>&1
 
 	# dnf modularity only exists on EL8; mariadb/mysql ship as plain packages from EL9 on.
 	if [ "${EL}" -eq 8 ]; then

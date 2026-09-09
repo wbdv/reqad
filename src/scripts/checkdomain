@@ -49,10 +49,11 @@ function run($s) {
 
 $d = trim($argv[1]);
 $d = preg_replace('/[^a-z0-9\-\.]+/', '', $d);
+require_once(__DIR__.'/../public_html/modules/functions.php');
 
 #$d = 'ename.ro';
 
-if(preg_match('/[a-z0-9]+[a-z0-9\-\.]+[a-z0-9]+\.[a-z]{2,}/', $d)===false) {
+if(!valid_domain($d)) {
     $errmsg =  "$WRONG Error: Domain name is wrong, please check what you typed.\n";
 	echo $errmsg."\n";
 	exit;

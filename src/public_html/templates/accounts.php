@@ -153,7 +153,7 @@
 							}
 							$domain = $row["domain"];
                     ?>
-                      <tr class="account-row" data-domain="<?=$domain;?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?>">
+                      <tr class="account-row" data-domain="<?=h($domain);?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?>">
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
@@ -164,11 +164,11 @@
                         <td data-label="Domain">
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
-                              <div class="font-weight-medium"><a href="https://<?=$domain;?>" target="_blank">
+                              <div class="font-weight-medium"><a href="https://<?=h($domain);?>" target="_blank">
 								  <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-link" width="24" height="24" viewBox="0 0 24 24" stroke-width="1" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">   <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>   <path d="M10 14a3.5 3.5 0 0 0 5 0l4 -4a3.5 3.5 0 0 0 -5 -5l-.5 .5"></path>   <path d="M14 10a3.5 3.5 0 0 0 -5 0l-4 4a3.5 3.5 0 0 0 5 5l.5 -.5"></path></svg>							  	
-								  <?=$domain;?></a>
+								  <?=h($domain);?></a>
 								  <? if(array_key_exists($domain, $zones) && $zones[$domain]["status"]!='active') { ?>
-									<div class="link-warning" style="display:inline; width:22px;height:22px;overflow:none;padding:0;cursor:pointer" data-bs-toggle="popover" data-bs-title="Nameservers" data-bs-content="Change nameservers to: <?=$zones[$domain]["nameservers"];?>">
+									<div class="link-warning" style="display:inline; width:22px;height:22px;overflow:none;padding:0;cursor:pointer" data-bs-toggle="popover" data-bs-title="Nameservers" data-bs-content="Change nameservers to: <?=h($zones[$domain]["nameservers"]);?>">
 										<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 -4 32 32" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon alert-icon icon-2">
 										<path d="M12 9v4"></path>
 										<path d="M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0z"></path>
@@ -186,7 +186,7 @@
 									<?php foreach($acct_aliases as $al): ?>
 									<div>&#8627; <?=htmlspecialchars($al['alias']);?><?php if($al['is_wildcard']) echo ' <span class="badge bg-purple-lt">wildcard</span>'; ?></div>
 									<?php endforeach; ?>
-									<?php if($row_has_mail): ?><div>&#8627; mail.<?=$domain;?> <span class="text-muted">(mail)</span></div><?php endif; ?>
+									<?php if($row_has_mail): ?><div>&#8627; mail.<?=h($domain);?> <span class="text-muted">(mail)</span></div><?php endif; ?>
 								</div>
 								<?php endif; ?>
                             </div>
@@ -195,7 +195,7 @@
                         <td data-label="User">
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
-                            <?=$row["user"];?>
+                            <?=h($row["user"]);?>
                             </div>
                           </div>
                         </td>
@@ -212,9 +212,9 @@
                         <? if($row["status"] == 'active') { ?>
                           <span class="badge bg-green-lt border">Active</span>
 					    <? } else if($row["status"] == 'inactive') { ?>
-                          <span class="badge bg-orange">Inactive</span>
+                          <span class="badge bg-orange-lt border">Inactive</span>
                         <? } else if($row["status"] == 'suspended') { ?>
-                          <span class="badge bg-danger">Suspended</span>
+                          <span class="badge bg-red-lt border">Suspended</span>
                         <? } ?>
                         </td>
 					<? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
@@ -228,7 +228,7 @@
 					<? } ?>
                         <td class="text-muted" data-label="PHP Version">
 							<? $php_color = $php_version_colors[$phpversion] ?? $php_version_colors[substr($phpversion, 0, 1)] ?? '#aaa'; ?>
-							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=$phpversion;?></span>
+							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($phpversion);?></span>
                         </td>
 					<? if($is_apache): ?>
                         <td class="text-muted" data-label="Handler">
@@ -240,11 +240,11 @@
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-account" data-bs-user="<?=$row["user"];?>" data-bs-domain="<?=$row["domain"];?>" data-bs-phpversion="<?=$phpversion;?>" data-bs-phphandler="<?=$phphandler;?>" data-bs-hasemail="<?=$row["has_email"];?>" <? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Manage</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-account" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>" data-bs-phpversion="<?=h($phpversion);?>" data-bs-phphandler="<?=h($phphandler);?>" data-bs-hasemail="<?=$row["has_email"];?>" <? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Manage</a>
                             <? if(feature_enabled($ini, 'filemanager')) { ?>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-file-manager" data-bs-user="<?=$row["user"];?>" data-bs-domain="<?=$row["domain"];?>">Files</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-file-manager" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>">Files</a>
                             <? } ?>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-account" data-bs-user="<?=$row["user"];?>">Delete</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-account" data-bs-user="<?=h($row["user"]);?>">Delete</a>
                           </div>
                         </td>
                       </tr>

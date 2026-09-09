@@ -154,6 +154,30 @@ if($pubkey) {
           <span class="form-check-label" style="cursor:pointer"><strong>Transfer email accounts</strong></span>
         </label>
 
+        <label class="form-check mt-1 mb-1" style="cursor:pointer">
+          <input class="form-check-input" type="checkbox" id="transfer-filters">
+          <span class="form-check-label" style="cursor:pointer"><strong>Transfer email filters</strong>
+            <span class="text-muted">— cPanel's filters are Exim filter files; they are converted to
+            Sieve. Anything that cannot be converted is listed, never guessed at.</span></span>
+        </label>
+
+        <label class="form-check mt-1 mb-1" style="cursor:pointer">
+          <input class="form-check-input" type="checkbox" id="transfer-spam">
+          <span class="form-check-label" style="cursor:pointer"><strong>Transfer spam filters</strong>
+            <span class="text-muted">- the cPanel account's SpamAssassin whitelist and
+            blocklist. They live in the same file here, so this is a merge, not a conversion; the
+            local account's other SpamAssassin preferences are left alone.</span></span>
+        </label>
+
+        <label class="form-check mt-1 mb-1" style="cursor:pointer">
+          <input class="form-check-input" type="checkbox" id="transfer-autoresponders">
+          <span class="form-check-label" style="cursor:pointer"><strong>Transfer autoresponders</strong>
+            <span class="text-muted">&mdash; cPanel's <code>~/.autorespond</code> files. On cPanel an
+            autoresponder needs no mailbox; here it is a Sieve vacation script that only runs on
+            delivery, so an address that has none gets a mailbox with a random password (printed in
+            the output). Responders whose window has already closed are listed, not imported.</span></span>
+        </label>
+
         <label class="form-check mt-1 mb-3" style="cursor:pointer">
           <input class="form-check-input" type="checkbox" id="transfer-cron">
           <span class="form-check-label" style="cursor:pointer"><strong>Transfer cron jobs</strong></span>
@@ -351,6 +375,25 @@ $('#generate-btn').click(function() {
             $('#step3-error').text('Please select a local account as the destination to transfer cron jobs.').show();
             return;
         }
+        if($('#transfer-spam').is(':checked') && !localUser) {
+            $('#step3-error').text('Please select a local account as the destination to transfer spam filters.').show();
+            return;
+        }
+        if($('#transfer-autoresponders').is(':checked')) {
+            if(!selectedDomain) {
+                $('#step3-error').text('Please select a domain to transfer autoresponders.').show();
+                return;
+            }
+            /* Importing one creates the mailbox when it is missing, and that needs the
+               domain to be a mail domain here -- so email must be on for the account. */
+            if(!$('#local-user-select option:selected').data('email')) {
+                $('#step3-error').text(
+                    'Autoresponders need email enabled on the local account: importing one may have to ' +
+                    'create the mailbox it answers for. Enable email for the local account first.'
+                ).show();
+                return;
+            }
+        }
 
         // Check remote email vs local email-enabled status
         if(selectedDomain && $('#transfer-email').is(':checked')) {
@@ -398,15 +441,20 @@ $('#generate-btn').click(function() {
         if(selectedDomain) {
             var dom = selectedDomain.domain;
             var certDest = '/etc/ssl/certs/' + dom;
-            var whmCert = sshBase + ' "whmapi1 --output=json fetch_ssl_vhost domain=' + dom + ' | python3 -c \\"import json,sys; r=json.load(sys.stdin); d=r.get(\'data\',{}).get(\'ssl\',{}); print(d.get(\'certificate\',\'\'))\\""';
-            var whmKey  = sshBase + ' "whmapi1 --output=json fetch_ssl_vhost domain=' + dom + ' | python3 -c \\"import json,sys; r=json.load(sys.stdin); d=r.get(\'data\',{}).get(\'ssl\',{}); print(d.get(\'key\',\'\'))\\""';
-            cmd += '# ── 2. Transfer SSL certificate ───────────────────────────\n\n';
+            // Prefer the on-disk cPanel bundle (key + cert + chain); fall back to WHM API.
+            var pyExtract = 'python3 -c \\"import json,sys; d=(json.load(sys.stdin).get(\'data\') or {}).get(\'ssl\') or {}; print(d.get(\'key\') or \'\'); print(d.get(\'crt\') or d.get(\'certificate\') or \'\'); print(d.get(\'cabundle\') or \'\')\\"';
+            var remoteSsl = sshBase + ' "cat /var/cpanel/ssl/apache_tls/' + dom + '/combined 2>/dev/null || whmapi1 --output=json fetch_ssl_vhost domain=' + dom + ' | ' + pyExtract + '"';
+            cmd += '# ── 2. Transfer SSL certificate ─────────────────────────\n\n';
             cmd += 'echo "[2/5] Transferring SSL certificate for ' + dom + '"\n';
-            cmd += whmCert + ' \\\n';
-            cmd += '  | sudo tee ' + certDest + '_newcert.pem > /dev/null\n';
-            cmd += 'if grep -q "BEGIN CERTIFICATE" ' + certDest + '_newcert.pem; then\n';
-            cmd += '  ' + whmKey + ' \\\n';
-            cmd += '    | sudo tee ' + certDest + '_privkey.pem > /dev/null\n\n';
+            cmd += 'TMPSSL=$(mktemp)\n';
+            cmd += remoteSsl + ' > "$TMPSSL"\n';
+            cmd += 'if grep -q "BEGIN CERTIFICATE" "$TMPSSL" && grep -q "PRIVATE KEY" "$TMPSSL"; then\n';
+            cmd += '  awk \'/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/\' "$TMPSSL" \\\n';
+            cmd += '    | sudo tee ' + certDest + '_newcert.pem > /dev/null\n';
+            cmd += '  awk \'/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/\' "$TMPSSL" \\\n';
+            cmd += '    | sudo tee ' + certDest + '_privkey.pem > /dev/null\n';
+            cmd += '  sudo chmod 600 ' + certDest + '_privkey.pem\n';
+            cmd += '  rm -f "$TMPSSL"\n\n';
             cmd += '  # Apply certificate to webserver config\n';
             cmd += '  if [ -f /etc/nginx/conf.d/' + dom + '.conf ]; then\n';
             cmd += '    sudo sed -i \'s#ssl_certificate[[:blank:]].*;#ssl_certificate ' + certDest + '_newcert.pem;#\' /etc/nginx/conf.d/' + dom + '.conf\n';
@@ -419,7 +467,7 @@ $('#generate-btn').click(function() {
             cmd += '    sudo apachectl configtest && sudo systemctl reload httpd\n';
             cmd += '  fi\n';
             cmd += 'else\n';
-            cmd += '  sudo rm -f ' + certDest + '_newcert.pem\n';
+            cmd += '  rm -f "$TMPSSL"\n';
             cmd += '  echo "No SSL certificate found on remote for ' + dom + ', skipping."\n';
             cmd += 'fi\n\n';
         }
@@ -500,12 +548,120 @@ $('#generate-btn').click(function() {
             cmd += '  | sudo tee /etc/exim/keys/' + dom2 + '.public.key > /dev/null\n\n';
 
             if(emailInfo2.fwd_count > 0) {
-                var domEscaped = dom2.replace(/\./g, '\\.');
+                /* cPanel valiases lines look like "alias@domain: dest1, dest2".
+                   Reqad wants the bare local part as the key, but FULLY QUALIFIED
+                   destinations -- cPanel leaves same-domain destinations unqualified
+                   ("another, other"), and exim on this box would not resolve those,
+                   so every destination without an "@" gets "@domain" appended.
+                   Pipes (|/path) and cPanel specials (:fail:, :blackhole:) pass through,
+                   EXCEPT the autoresponder pipe: cPanel implements an autoresponder as
+                   `|/usr/local/cpanel/bin/autorespond <addr> /home/<acct>/.autorespond`
+                   in this very file, and that binary does not exist here -- carried over
+                   it would be a delivery failure on every message. The address is handled
+                   by the autoresponder import instead, so the pipe token is dropped; if it
+                   was the only destination the line goes with it, and if the alias also
+                   forwarded somewhere the real destinations survive. */
                 cmd += '# Forwarders for ' + dom2 + '\n';
                 cmd += sshBase + ' "cat /etc/valiases/' + dom2 + '" \\\n';
-                cmd += "  | sed 's/@" + domEscaped + "//g' \\\n";
+                cmd += "  | awk -v dom=" + dom2 + " '\n";
+                cmd += "      { i = index($0, \":\"); if (i == 0) next;\n";
+                cmd += "        k = substr($0, 1, i - 1); v = substr($0, i + 1);\n";
+                cmd += "        sub(\"@\" dom \"$\", \"\", k);\n";
+                cmd += "        gsub(/^[ \\t]+|[ \\t]+$/, \"\", k);\n";
+                cmd += "        if (k == \"\") next;\n";
+                cmd += "        gsub(/^[ \\t]+|[ \\t]+$/, \"\", v);\n";
+                cmd += "        if (v ~ /^\\\".*\\\"$/) { v = substr(v, 2, length(v) - 2); gsub(/^[ \\t]+|[ \\t]+$/, \"\", v) }\n";
+                cmd += "        if (v ~ /^:/) { print k \": \" v; next }\n";
+                cmd += "        n = split(v, a, \",\"); out = \"\";\n";
+                cmd += "        for (j = 1; j <= n; j++) {\n";
+                cmd += "          t = a[j]; gsub(/^[ \\t]+|[ \\t]+$/, \"\", t);\n";
+                cmd += "          if (t == \"\") continue;\n";
+                cmd += "          if (t ~ /^\\|.*autorespond/) continue;\n";
+                cmd += "          if (t !~ /^[|:]/ && t !~ /@/) t = t \"@\" dom;\n";
+                cmd += "          out = (out == \"\" ? t : out \", \" t);\n";
+                cmd += "        }\n";
+                cmd += "        if (out != \"\") print k \": \" out; }' \\\n";
                 cmd += '  | sudo tee /etc/exim/forwards/' + dom2 + ' > /dev/null\n\n';
             }
+        }
+
+        var transferFilters = $('#transfer-filters').is(':checked');
+        if(transferFilters && selectedDomain) {
+            var domF   = selectedDomain.domain;
+            var stage  = '/tmp/reqad-filters-' + domF;
+            var impBin = '/usr/local/reqad/scripts/import_cpanel_filters.php';
+            cmd += '# ── Email filters (cPanel Exim filters → Sieve) ───────────\n\n';
+            cmd += 'echo "[filters] Fetching cPanel filters for ' + domF + '"\n';
+            cmd += 'mkdir -p ' + stage + '\n\n';
+
+            // Domain tier: /etc/vfilters/<domain>
+            cmd += sshBase + ' "cat /etc/vfilters/' + domF + ' 2>/dev/null" > ' + stage + '/vfilter\n';
+            cmd += 'if [ -s ' + stage + '/vfilter ]; then\n';
+            cmd += '  sudo ' + impBin + ' --scope=domain --target=' + domF + ' --file=' + stage + '/vfilter --apply\n';
+            cmd += 'fi\n\n';
+
+            // Account tier: /home/<acct>/etc/<domain>/<localpart>/filter, pulled in one go.
+            cmd += sshBase + ' "tar czf - -C /home/' + d.raccount + '/etc ' + domF + ' 2>/dev/null" \\\n';
+            cmd += '  | tar xzf - -C ' + stage + ' 2>/dev/null\n';
+            cmd += 'for f in ' + stage + '/' + domF + '/*/filter; do\n';
+            cmd += '  [ -s "$f" ] || continue\n';
+            cmd += '  lp=$(basename "$(dirname "$f")")\n';
+            cmd += '  sudo ' + impBin + ' --scope=account --target="$lp@' + domF + '" --file="$f" --apply\n';
+            cmd += 'done\n\n';
+
+            // Global tier is server-wide and belongs to the OLD server's policy,
+            // so it is only ever shown — importing it is a deliberate decision.
+            cmd += '# The remote server-wide filter is shown, NOT imported: it is the old\n';
+            cmd += '# server\'s policy and applies to every mailbox here if you accept it.\n';
+            cmd += '# Review, then re-run the last line with --apply to take it.\n';
+            cmd += sshBase + ' "cat /etc/cpanel_exim_system_filter 2>/dev/null" > ' + stage + '/system_filter\n';
+            cmd += 'if [ -s ' + stage + '/system_filter ]; then\n';
+            cmd += '  sudo ' + impBin + ' --scope=global --file=' + stage + '/system_filter\n';
+            cmd += 'fi\n\n';
+            cmd += '# rm -rf ' + stage + '   # the pulled filter files, kept for reference\n\n';
+        }
+
+        var transferSpam = $('#transfer-spam').is(':checked');
+        if(transferSpam && localUser) {
+            var spamStage = '/tmp/reqad-spam-' + d.raccount;
+            var spamBin   = '/usr/local/reqad/scripts/import_cpanel_spam.php';
+            // cPanel keeps the allow/block lists per cPanel ACCOUNT, in the very
+            // file SpamAssassin reads - the same place Reqad keeps them - so there
+            // is one file to pull no matter how many domains the account holds.
+            cmd += '# \u2500\u2500 Spam filters (SpamAssassin allow / block lists) \u2500\u2500\n\n';
+            cmd += 'echo "[spam] Fetching SpamAssassin lists for ' + d.raccount + '"\n';
+            cmd += 'mkdir -p ' + spamStage + '\n';
+            cmd += sshBase + ' "cat /home/' + d.raccount + '/.spamassassin/user_prefs 2>/dev/null" > ' + spamStage + '/user_prefs\n';
+            cmd += 'if [ -s ' + spamStage + '/user_prefs ]; then\n';
+            cmd += '  sudo ' + spamBin + ' --user=' + localUser + ' --file=' + spamStage + '/user_prefs --apply\n';
+            cmd += 'else\n';
+            cmd += '  echo "[spam] No SpamAssassin preferences on the remote account, skipping."\n';
+            cmd += 'fi\n\n';
+            cmd += '# rm -rf ' + spamStage + '   # the pulled prefs file, kept for reference\n\n';
+        }
+
+        var transferAr = $('#transfer-autoresponders').is(':checked');
+        if(transferAr && selectedDomain) {
+            var domA    = selectedDomain.domain;
+            var arStage = '/tmp/reqad-autoresponders-' + d.raccount;
+            var arBin   = '/usr/local/reqad/scripts/import_cpanel_autoresponders.php';
+            /* cPanel keeps one .autorespond directory per cPanel ACCOUNT, holding every
+               domain's responders; the importer takes the one domain being transferred
+               and ignores the rest, so the whole directory is pulled once. */
+            cmd += '# \u2500\u2500 Autoresponders (cPanel ~/.autorespond \u2192 Sieve vacation) \u2500\u2500\n\n';
+            cmd += 'echo "[autoresponders] Fetching autoresponders for ' + d.raccount + '"\n';
+            cmd += 'mkdir -p ' + arStage + '\n';
+            cmd += sshBase + ' "tar czf - -C /home/' + d.raccount + ' .autorespond 2>/dev/null" \\\n';
+            cmd += '  | tar xzf - -C ' + arStage + ' 2>/dev/null\n';
+            cmd += 'if [ -d ' + arStage + '/.autorespond ]; then\n';
+            cmd += '  sudo ' + arBin + ' --domain=' + domA + ' --dir=' + arStage + '/.autorespond --apply\n';
+            cmd += 'else\n';
+            cmd += '  echo "[autoresponders] No autoresponders on the remote account, skipping."\n';
+            cmd += 'fi\n\n';
+            cmd += '# Expired autoresponders were listed, not imported. To take them too, re-run\n';
+            cmd += '# the line above with --include-expired; add --replace to overwrite ones\n';
+            cmd += '# that already exist here.\n';
+            cmd += '# rm -rf ' + arStage + '   # the pulled autoresponders, kept for reference\n\n';
         }
 
         var transferCron = $('#transfer-cron').is(':checked');

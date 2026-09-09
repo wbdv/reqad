@@ -57,18 +57,14 @@ if($output=='index.php' || $output=='') {
 		}
 
 		$mysql_users = array();
-		$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SELECT DISTINCT User FROM mysql.db'"))), true);
-		foreach($mysql_array["row"] as $mysql_array2) {
-			if(isset($mysql_array2["field"]))
-				$mysql_users[] = $mysql_array2["field"];
-		}
+		$mysql_users = mysql_rows('SELECT DISTINCT User FROM mysql.db');
 		while(in_array($db_user, $mysql_users)) {
 			$i++;
 			$db_user = $user.'_wp'.$i;
 		}
 		$db_pass = trim(shell_exec("head -n 10 /dev/urandom | tr -cd '[:alnum:]!@#%^&*()+-0123456789' | paste -sd - | sed 's/[\t, ]//g' | cut -b -16"));
-		$output = shell_exec("sudo mysql -e 'CREATE DATABASE ".$db_name."' 2>&1");
-		$output = shell_exec("sudo mysql -e 'GRANT ALL ON ".$db_name.".* TO ".$db_user."@localhost IDENTIFIED BY \"".addslashes($db_pass)."\"'  2>&1");
+		$output = mysql_exec('CREATE DATABASE `'.$db_name.'`');
+		$output = mysql_exec('GRANT ALL ON `'.$db_name.'`.* TO `'.$db_user.'`@`localhost` IDENTIFIED BY '.mysql_quote($db_pass));
 	
 		$output = shell_exec('sudo -u '.$user.' /usr/local/bin/wp config create --dbname='.escapeshellarg($db_name).' --dbuser='.escapeshellarg($db_user).' --dbpass='.escapeshellarg($db_pass).' --path=/home/'.$user.'/public_html/ 2>&1');
 		if(substr($output, 0, 5)=='Error') {
@@ -95,7 +91,18 @@ if($output=='index.php' || $output=='') {
 					// list explicit columns — the table gained a `path` column in a later
 					// migration, so a positional INSERT now fails ("9 columns but 8 values")
 					// and the install never showed up in the list. path='' = docroot root.
-					$db->query('INSERT INTO wordpress (user, domain, title, wp_version, comments, status, created_at, path) VALUES ("'.$user.'", "'.$domain.'", "'.addslashes($title).'", "'.$wp_version.'", "", "active", datetime("now"), "")');
+					/* $title is free text straight from the install form, and
+					   addslashes() is not SQLite escaping -- a title containing
+					   an apostrophe produced a broken INSERT and the install
+					   silently never appeared in the list. */
+					$stmt = $db->prepare('INSERT INTO wordpress (user, domain, title, wp_version, comments, status, created_at, path)
+					                      VALUES (:user, :domain, :title, :wp_version, "", "active", datetime("now"), "")');
+					$stmt->bindValue(':user',       $user,       SQLITE3_TEXT);
+					$stmt->bindValue(':domain',     $domain,     SQLITE3_TEXT);
+					$stmt->bindValue(':title',      $title,      SQLITE3_TEXT);
+					$stmt->bindValue(':wp_version', $wp_version, SQLITE3_TEXT);
+					$stmt->execute();
+					$stmt->close();
 				} else {
 					$errmsg = 'Error: Cannot determine Wordpress version after install finished.';
 				}

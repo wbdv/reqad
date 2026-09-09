@@ -75,7 +75,7 @@ $get_ssl_from_domain = function($d) use ($fix_letsencrypt_chain) {
 		$ssl_cert_key = trim(shell_exec('sudo grep ssl_certificate_key /etc/nginx/conf.d/'.$d.'.conf 2>/dev/null | head -n 1 | awk {\'print $2\'} | sed \'s/;//\''));
 		return [$fix_letsencrypt_chain($ssl_cert), $ssl_cert_key];
 	}
-	// Try apache (template apache_mod_php)
+	// Try apache (template apache_modphp)
 	$ssl_cert = trim(shell_exec('sudo grep -i "SSLCertificateFile " /etc/httpd/conf.d/'.$d.'.conf 2>/dev/null | head -n 1 | awk {\'print $2\'}'));
 	if($ssl_cert != '') {
 		$ssl_cert_key = trim(shell_exec('sudo grep -i "SSLCertificateKeyFile " /etc/httpd/conf.d/'.$d.'.conf 2>/dev/null | head -n 1 | awk {\'print $2\'}'));
@@ -152,3 +152,11 @@ file_put_contents('/etc/exim/sni_certs.db.tmp', $lsearch_certs);
 file_put_contents('/etc/exim/sni_keys.db.tmp',  $lsearch_keys);
 shell_exec("if ! cmp -s /etc/exim/sni_certs.db.tmp /etc/exim/sni_certs.db; then /bin/mv /etc/exim/sni_certs.db.tmp /etc/exim/sni_certs.db; else /bin/rm -f /etc/exim/sni_certs.db.tmp; fi");
 shell_exec("if ! cmp -s /etc/exim/sni_keys.db.tmp /etc/exim/sni_keys.db; then /bin/mv /etc/exim/sni_keys.db.tmp /etc/exim/sni_keys.db; else /bin/rm -f /etc/exim/sni_keys.db.tmp; fi");
+
+/* The static mail-client autoconfiguration files (Thunderbird / Outlook)
+   depend on exactly the same inputs as the SNI configuration above -- the
+   certificate SANs and /etc/exim/domains -- so regenerate them here. Doing it
+   from this one place means every caller of update_email_sni covers them too:
+   email enable/disable in edit_account.php, certificate issue and renewal in
+   update_ssl.php and reissue_letsencrypt_cert*.sh, and rename_hostname.sh. */
+shell_exec(__DIR__.'/update_autoconfig --quiet 2>&1');

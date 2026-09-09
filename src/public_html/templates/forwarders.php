@@ -296,8 +296,8 @@
               <div class="col-lg-12">
                 <div class="mb-3" id="pwd-container">
                   <label class="form-label">Pipe to program:</label>
-                  <input type="text" class="form-control" name="pipe" id="pipe2" placeholder="/full/path/to/script" autocomplete="off" aria-describedby="forwardHelpBlock" required pattern="/.*" maxlength="256">
-				  <div class="invalid-feedback" id="invalid-forward3"></div>
+                  <input type="text" class="form-control" name="pipe" id="pipe2" placeholder="/full/path/to/script" autocomplete="off" aria-describedby="forwardHelpBlock" pattern="/.*" maxlength="256">
+				  <div class="invalid-feedback" id="invalid-forward6"></div>
 				  <small id="userHelpBlock" class="form-text text-muted" style="display:block;margin-top:8px;">
 					Optional. The script need to be executable and will receive the emails as input (stdin).
 				  </small>
@@ -513,20 +513,37 @@ jQuery(document).ready(function () {
 
 	$("#edit-forwarder").submit(function(event) {
 		event.preventDefault();
-		if ($('#edit-forwarder')[0].checkValidity() === false) {
-			if(!$('#user2').is(':valid')) {
+		// Validate field by field (like the create form): the pipe is optional, so
+		// a whole-form checkValidity() would fail on an empty pipe with no branch
+		// left to report it — the click would silently do nothing.
+		var okUser  = $('#user2').is(':valid');
+		var okFwd   = $('#forward2').is(':valid');
+		var okPipe  = $('#pipe2').is(':valid');
+		var hasFwd  = $.trim($('#forward2').val()) !== '';
+		var hasPipe = $.trim($('#pipe2').val()) !== '';
+		if (!okUser || !okPipe || (!hasFwd && !hasPipe) || (hasFwd && !okFwd)) {
+			if(!okUser) {
 				$('#invalid-forward4').html('User is not corrent.');
 				$('#user2').addClass('is-invalid');
 				$('#user2').removeClass('was-validated');
 				$("#edit-forwarder").removeClass('was-validated');
-			} else if(!$('#forward2').is(':valid')) {
+				$('#user2').focus();
+			} else if(!okPipe) {
+				$('#invalid-forward6').html('Pipe must be a full path starting with /.');
+				$('#pipe2').addClass('is-invalid');
+				$('#pipe2').removeClass('was-validated');
+				$("#edit-forwarder").removeClass('was-validated');
+				$('#pipe2').focus();
+			} else {
 				$('#invalid-forward5').html('Forward address is not corrent.');
 				$('#forward2').addClass('is-invalid');
 				$('#forward2').removeClass('was-validated');
 				$("#edit-forwarder").removeClass('was-validated');
+				$('#forward2').focus();
 			}
 			event.stopPropagation();
 		} else {
+			$('#user2, #forward2, #pipe2').removeClass('is-invalid');
 			$("#edit-forwarder").addClass('was-validated');
 			$('#submit-btn2').prop('disabled', true);
 //			console.log('submit');

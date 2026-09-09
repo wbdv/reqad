@@ -16,37 +16,45 @@ if($user=='' || $dbname=='' || strlen($password)<8) {
 
 #echo '<pre>'; print_r($_POST); exit;
 
-if(preg_match('/[a-z0-9]+[a-z0-9\-\.]+[a-z0-9]+\.[a-z]{2,}/', $dbname)) {
-	$mysql_databases = array();
-	$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SHOW DATABASES'"))), true);
-	foreach($mysql_array["row"] as $mysql_array2) {
-		$mysql_databases[] = $mysql_array2["field"];
-	}
-	#echo "Databases: ".var_export($mysql_databases, true);
-	if(in_array($dbname, $mysql_databases)) {
-		$errmsg = "Database ".$dbname." already exists. Please choose a different database name.";
+/* These two become bare SQL identifiers in CREATE DATABASE / GRANT below, where
+   no amount of quoting makes an arbitrary string safe -- so restrict them to
+   the characters MySQL identifiers actually need. This gate used to be
+   valid_domain($dbname), which made no sense for a database name and, being
+   unanchored, also skipped the duplicate check for every ordinary name. */
+if($errmsg == '' && !valid_mysql_identifier($dbname)) {
+	$errmsg = "Error: Database name may only contain letters, numbers and underscores.";
+}
+if($errmsg == '' && !valid_mysql_identifier($dbuser)) {
+	$errmsg = "Error: Database user may only contain letters, numbers and underscores.";
+}
+if($errmsg == '' && !valid_username($user)) {
+	$errmsg = "Error: Invalid account user.";
+}
+
+if($errmsg == '') {
+	$mysql_databases = mysql_rows('SHOW DATABASES');
+	if(in_array($user.'_'.$dbname, $mysql_databases)) {
+		$errmsg = "Database ".$user."_".$dbname." already exists. Please choose a different database name.";
 	}
 }
 
 if($errmsg == '') {
-	$mysql_users = array();
-	$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SELECT User FROM mysql.user'"))), true);
-	foreach($mysql_array["row"] as $mysql_array2) {
-		$mysql_users[] = $mysql_array2["field"];
-	}
-	#echo "Users: ".var_export($mysql_users, true);
-	if(in_array($dbuser, $mysql_users)) {
-		$errmsg = "User ".$dbuser." already exists. Please choose a different user name.";
+	$mysql_users = mysql_rows('SELECT User FROM mysql.user');
+	if(in_array($user.'_'.$dbuser, $mysql_users)) {
+		$errmsg = "User ".$user."_".$dbuser." already exists. Please choose a different user name.";
 	}
 }
 
 if($errmsg == '') {
     // All ok, create database.
     error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." create database ".$user."_".$dbname."\n", 3, '../log/route_log');
-    $output = shell_exec("sudo mysql -e 'CREATE DATABASE ".$user."_".$dbname."' 2>&1");
+    $output = mysql_exec('CREATE DATABASE `'.$user.'_'.$dbname.'`');
     error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." create user ".$user."_".$dbuser."\n", 3, '../log/route_log');
-    $output = shell_exec("sudo mysql -e 'GRANT ALL ON ".$user."_".$dbname.".* TO ".$user."_".$dbuser."@localhost IDENTIFIED BY \"".addslashes($password)."\"'  2>&1");
-	#die("sudo mysql -e 'GRANT ALL ON ".$user."_".$dbname.".* TO ".$user."_".$dbuser."@localhost IDENTIFIED BY \"".addslashes($password)."\"'  2>&1");
+    $output = mysql_exec('GRANT ALL ON `'.$user.'_'.$dbname.'`.* TO `'.$user.'_'.$dbuser.'`@`localhost` IDENTIFIED BY '.mysql_quote($password));
+    /* mysql_exec() folds stderr in, so any output at all means the statement
+       failed -- this used to be captured and silently thrown away. */
+    if(trim($output) != '')
+        $errmsg = "Error: ".$output;
 }
 
 if($errmsg == '') {

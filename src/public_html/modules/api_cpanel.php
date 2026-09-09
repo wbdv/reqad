@@ -1,4 +1,4 @@
-<?
+<?php
 $api_user   = $settings["cpanel-username"];
 $api_token  = $settings["cpanel-api-token"];
 $api_server = $settings["cpanel-server"];
@@ -15,8 +15,7 @@ function cpanel_whm_api($api_query, $parse_to_array = false, $method = 'GET', $d
         curl_setopt($curl, CURLOPT_STDERR, fopen(_PATH.'/log/debug_log', 'a'));
     }
 
-    curl_setopt($curl, CURLOPT_SSL_VERIFYHOST,0);
-    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER,0);
+    curl_set_tls($curl, 'cpanel');
     curl_setopt($curl, CURLOPT_RETURNTRANSFER,1);
 
     $header[0] = "Authorization: whm $api_user:$api_token";

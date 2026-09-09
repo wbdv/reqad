@@ -52,44 +52,23 @@ if ($errmsg == '') {
     $stmt->bindValue(':id',  $id,        SQLITE3_INTEGER);
     $stmt->execute();
 
-    $today    = date('Y-m-d');
-    $msg_file = '/etc/exim/autoreply/' . $domain . '/' . $user;
+    $today = date('Y-m-d');
     $should_activate = ($date_from == '' || $date_from <= $today)
                     && ($date_to   == '' || $date_to   >= $today);
 
-    if ($should_activate) {
-        autoresponder_write_msg($user, $domain, $subject, $message);
-    } else {
-        if (is_file($msg_file)) {
-            shell_exec('sudo rm -f ' . escapeshellarg($msg_file));
-        }
-    }
+    if ($should_activate)
+        $errmsg = autoresponder_apply($user, $domain, $subject, $message);
+    else
+        $errmsg = autoresponder_remove($user, $domain);
 
-    $successmsg = "Autoresponder for $user@$domain successfully updated.";
-    error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " edit autoresponder $user@$domain\n", 3, '../log/route_log');
+    if ($errmsg == '') {
+        $successmsg = "Autoresponder for $user@$domain successfully updated.";
+        error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " edit autoresponder $user@$domain\n", 3, '../log/route_log');
+    }
 }
 
-function autoresponder_write_msg($user, $domain, $subject, $message) {
-    $msg_dir  = '/etc/exim/autoreply/' . $domain;
-    $msg_file = $msg_dir . '/' . $user;
-    $tmp_file = tempnam(sys_get_temp_dir(), 'ar_');
-
-    // Sieve vacation filter — dedup handled automatically by Exim via sieve_vacation_directory
-    // File named after local part (no extension) so dsearch can detaint it
-    $subj_escaped = str_replace(['\\', '"'], ['\\\\', '\\"'], $subject);
-    $content  = "# Sieve filter\n";
-    $content .= "require [\"vacation\"];\n";
-    $content .= "vacation :days 1 :subject \"" . $subj_escaped . "\" text:\n";
-    foreach (explode("\n", $message) as $line) {
-        $content .= ($line === '.' ? '..' : $line) . "\n";
-    }
-    $content .= ".\n;\ndiscard;\n";
-
-    file_put_contents($tmp_file, $content);
-    shell_exec('sudo mkdir -p ' . escapeshellarg($msg_dir));
-    shell_exec('sudo chown exim:mail ' . escapeshellarg($msg_dir));
-    shell_exec('sudo chmod 750 ' . escapeshellarg($msg_dir));
-    shell_exec('sudo mv ' . escapeshellarg($tmp_file) . ' ' . escapeshellarg($msg_file));
-    shell_exec('sudo chown exim:mail ' . escapeshellarg($msg_file));
-    shell_exec('sudo chmod 640 ' . escapeshellarg($msg_file));
-}
+$msg_base = $_SERVER['REQUEST_SCHEME'] . '://' . $_SERVER['HTTP_HOST'] . '/autoresponders/';
+if ($errmsg != '')
+    msg_redirect($msg_base, $errmsg, 'error');
+else
+    msg_redirect($msg_base, $successmsg, 'success');

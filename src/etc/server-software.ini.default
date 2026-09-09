@@ -11,6 +11,7 @@ terminal=0
 transfer=0
 root_access=1
 filemanager=1
+addon_domains=0
 
 [web]
 php_versions=8.3

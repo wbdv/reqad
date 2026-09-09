@@ -10,9 +10,9 @@ $successmsg = '';
 
 #echo '<pre>'; print_r($_POST); exit;
 
-if(!preg_match('/[A-Za-z0-9\+\-_\.]{1,32}/', $user)) {
+if(!valid_email_user($user)) {
 	$errmsg = "Error: New user conains unallowed characters.";
-} else if(!preg_match('/[a-z0-9\-\.]{2,32}\.[a-z]{2,10}/', $domain)) {
+} else if(!valid_domain($domain)) {
 	$errmsg = "Error: New domain conains unallowed characters.";
 } else if(is_file("/etc/exim/forwards/".$domain)) {
 	$existing_forwards = explode("\n", shell_exec("sudo awk -F: {'print $1'} /etc/exim/forwards/".$domain));
@@ -20,7 +20,7 @@ if(!preg_match('/[A-Za-z0-9\+\-_\.]{1,32}/', $user)) {
 		$errmsg = "Error: User $user already has an forwarder, please edit existing one instead of adding a new one.";
 }
 if($errmsg == '') {
-	if(!preg_match('/[A-Za-z0-9\+\-_\.]{1,32}@[a-z0-9\-\.]{2,32}\.[a-z]{2,10}.*/', $forward) && $forward!='') {
+	if(!valid_forward_list($forward) && $forward!='') {
 		$errmsg = "Error: Forwarder should contain at least one email address.";
 	}
 }

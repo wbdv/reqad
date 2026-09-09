@@ -36,6 +36,9 @@ SESSION_DIR="/usr/local/reqad/tmp/sessions"   # private, reqad-only (0700) — n
 # Canonical disable_functions for the reqad panel: empty (no functions disabled).
 REQAD_DISABLE_FUNCTIONS=""
 
+# Upload limits for the panel's private php.ini (phpMyAdmin imports, file manager uploads).
+REQAD_UPLOAD_MAX="100M"
+
 echo "== reqad dedicated PHP-FPM setup (version: $REQAD_PHP_VER) =="
 
 # Provision only once: if the dedicated master is already set up, leave it (and any manual edits to
@@ -68,6 +71,18 @@ if [ ! -f "$PRIV_INI" ]; then
     fi
     cp -a "$SRC_INI" "$PRIV_INI"
     echo "  created $PRIV_INI from $SRC_INI"
+
+    # Raise the upload limits in the fresh snapshot: phpMyAdmin imports and the file manager
+    # run under this master, and the stock Remi defaults (2M/8M) are far too small.
+    # Only on creation — later manual edits to the private ini are preserved.
+    for k in upload_max_filesize post_max_size; do
+        if grep -qE "^;?[[:space:]]*${k}[[:space:]]*=" "$PRIV_INI"; then
+            sed -i "s|^;*[[:space:]]*${k}[[:space:]]*=.*|${k} = ${REQAD_UPLOAD_MAX}|" "$PRIV_INI"
+        else
+            echo "${k} = ${REQAD_UPLOAD_MAX}" >> "$PRIV_INI"
+        fi
+    done
+    echo "  set upload_max_filesize/post_max_size to ${REQAD_UPLOAD_MAX} in private php.ini"
 fi
 # Always pin disable_functions in the private ini (deterministic regardless of global state).
 if grep -qE "^;?[[:space:]]*disable_functions[[:space:]]*=" "$PRIV_INI"; then

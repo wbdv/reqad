@@ -1,4 +1,4 @@
-<?
+<?php
 	$errmsg 	= '';
 	$successmsg = '';
 
@@ -33,10 +33,11 @@
 
 	/* Post/Redirect/Get: carry the immediate flash via the queue, and (on success)
 	   the poll token in ?restoremsg= so the page can show the async result. */
-	$msg_base = $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/';
+	$msg_base = $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/?tab=local';
 	if($errmsg != '') {
 		msg_redirect($msg_base, $errmsg, 'error');
 	} else {
-		msg_redirect($msg_base.'?restoremsg='.$restoremsg, $successmsg, 'info');
+		/* & not ?: $msg_base already carries ?tab=local */
+		msg_redirect($msg_base.'&restoremsg='.$restoremsg, $successmsg, 'info');
 	}
 ?>

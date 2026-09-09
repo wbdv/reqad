@@ -1,4 +1,4 @@
-<?
+<?php
 $api_token   = $settings["cloudflare-api-token"];
 #$zone_id  	 = $settings["cloudflare-zone-id"];
 #$account_id  = $settings["cloudflare-account-id"];
@@ -15,8 +15,7 @@ function cloudflare_api($api_query, $parse_to_array = false, $method = 'GET', $d
         curl_setopt($curl, CURLOPT_STDERR, fopen(_PATH.'/log/debug_log', 'a'));
     }
 
-    curl_setopt($curl, CURLOPT_SSL_VERIFYHOST,0);
-    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER,0);
+    curl_set_tls($curl);
     curl_setopt($curl, CURLOPT_RETURNTRANSFER,1);
 
     $header[0] = "Authorization: Bearer $api_token";

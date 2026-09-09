@@ -10,6 +10,10 @@ src/public_html/defines.php
 # Panel auth (password hashes)
 src/nginx_auth
 
+# Live panel config — templates (*.default) ship instead
+src/etc/server-software.ini
+src/etc/mail-archive.conf
+
 # Logs & caches
 src/log/*
 !src/log/.gitkeep
@@ -26,6 +30,7 @@ src/public_html/webmail
 # Premium / separately-packaged modules
 src/public_html/plugins/
 src/scripts/wireguard/
+src/scripts/minecraft/
 
 # Throwaway dev scripts with hardcoded credentials — never publish
 src/scripts/cloudflare_add_domain.sh
@@ -36,6 +41,7 @@ src/scripts/test_api.php
 src/scripts/test_cpanel_api.php
 src/scripts/test_post_cpanel_api.sh
 src/scripts/backupdb.sh
+src/scripts/rblcheck
 
 # Home-dir cruft (the app root is also the reqad user's home)
 .ssh/
@@ -47,5 +53,9 @@ _test_/
 # Editor / OS cruft
 *.bak
 *.bak.*
+*.bak-*
+*.bkp
+*.orig
+*~
 *.swp
 .DS_Store

@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 // Rate limit: max 30 forwards per hour to prevent abuse
 $rate_file = '/usr/local/reqad/etc/reqad_rootmail_rate';

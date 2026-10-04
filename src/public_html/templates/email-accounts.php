@@ -26,6 +26,10 @@
 	   rendered when the dovecot master user is actually set up. */
 	$webmail_autologin = webmail_autologin_enabled();
 
+	/* Hostname a mail client should use, per domain. Looked up once per domain
+	   rather than per row: the fallback in mail_client_hostname() shells out. */
+	$client_hosts = array();
+
 	/* Domains offering email, plus each account's total disk usage in MB — the
 	   Usage column shows every mailbox as a share of its own account's total. */
 	$domains     = [];
@@ -110,7 +114,7 @@
 						foreach($emails2 as $email) {
 							$i++;
                     ?>
-                      <tr class="email-row" data-email="<?=$email['email'];?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?><?=$email['enabled']===false?'background-color:#FF000015;':'';?>">
+                      <tr class="email-row" data-email="<?=$email['email'];?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none;':'';?><?=$email['enabled']===false?'background-color:#FF000015;':'';?>">
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
@@ -186,15 +190,18 @@
 							  Webmail
                             </a>
                             <? } ?>
-                            <a href="/?action=ajax-mobileconfig&amp;email=<?=urlencode($email['email']);?>"
-                               class="btn btn-white btn-md" title="Download an Apple Mail setup profile for iPhone, iPad and Mac. It carries no password - the device asks for it on install.">
+                            <?	$dom_cs = strtolower(substr(strrchr($email['email'], '@'), 1));
+								if(!isset($client_hosts[$dom_cs])) $client_hosts[$dom_cs] = mail_client_hostname($dom_cs); ?>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-client-settings"
+                               data-bs-email="<?=htmlspecialchars($email['email']);?>" data-bs-host="<?=htmlspecialchars($client_hosts[$dom_cs]);?>"
+                               title="Server settings for setting up this mailbox in a mail client (Outlook, Thunderbird, Apple Mail, phones)">
 <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-device-mobile">
 	<path stroke="none" d="M0 0h24v24H0z" fill="none" />
 	<path d="M6 5a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-8a2 2 0 0 1 -2 -2v-14z" />
 	<path d="M11 4h2" />
 	<path d="M12 17v.01" />
 </svg>
-							  Apple Profile
+							  Client Setup
                             </a>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" data-bs-enabled="<?=$email['enabled']?1:0;?>">Change Password</a>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-email" data-bs-email="<?=$email['email'];?>">Delete</a>
@@ -384,6 +391,53 @@
     </div>
 </form>
 
+<style>
+  /* one click selects the whole value, ready to copy */
+  #modal-client-settings .cs-copy { font-family: var(--tblr-font-monospace, monospace); user-select: all; }
+  #modal-client-settings .cs-table td { padding-top: 3px; padding-bottom: 3px; }
+</style>
+<div class="modal modal-blur fade" id="modal-client-settings" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Mail client settings</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted">Use these settings to add <strong class="cs-email text-body"></strong> to Outlook, Thunderbird, Apple Mail or a phone.
+          The password is the mailbox password.</p>
+
+        <h4 class="mb-2"><b>Incoming mail server</b></h4>
+        <table class="sysinfo-table table table-sm w-100">
+          <tr><td class="text-muted w-10">Protocol</td><td>IMAP</td></tr>
+          <tr><td class="text-muted">Server</td><td class="cs-host cs-copy"></td></tr>
+          <tr><td class="text-muted">Port</td><td>993</td></tr>
+          <tr><td class="text-muted">Connection security</td><td>SSL/TLS</td></tr>
+          <tr><td class="text-muted">Username</td><td class="cs-email cs-copy"></td></tr>
+        </table>
+
+        <h4 class="mb-2"><b>Outgoing mail server</b></h4>
+        <table class="sysinfo-table table table-sm w-100">
+          <tr><td class="text-muted w-10">Protocol</td><td>SMTP</td></tr>
+          <tr><td class="text-muted">Server</td><td class="cs-host cs-copy"></td></tr>
+          <tr><td class="text-muted">Port</td><td>465</td></tr>
+          <tr><td class="text-muted">Connection security</td><td>SSL/TLS</td></tr>
+          <tr><td class="text-muted">Username</td><td class="cs-email cs-copy"></td></tr>
+          <tr><td class="text-muted">Authentication</td><td>Normal password</td></tr>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <a href="#" class="btn btn-link link-secondary me-auto" data-bs-dismiss="modal">Close</a>
+        <a href="#" id="cs-mobileconfig" class="btn btn-white"
+           title="Apple Mail setup profile for iPhone, iPad and Mac. It carries no password - the device asks for it on install.">
+          <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" /><path d="M7 11l5 5l5 -5" /><path d="M12 4l0 12" /></svg>
+          Download Apple profile
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
 <form method="post" action="/" id="delete-email" class="needs-validation" novalidate>
     <input type="hidden" name="action" value="delete-email">
     <input type="hidden" name="email" id="email-delete" value="">
@@ -568,6 +622,14 @@ jQuery(document).ready(function () {
 			$("#edit-email").unbind('submit').submit();
 		}
   	});
+
+	$('#modal-client-settings').on('show.bs.modal', function (event) {
+		var button = event.relatedTarget;
+		var email  = button.getAttribute('data-bs-email');
+		$(this).find('.cs-email').text(email);
+		$(this).find('.cs-host').text(button.getAttribute('data-bs-host'));
+		$('#cs-mobileconfig').attr('href', '/?action=ajax-mobileconfig&email=' + encodeURIComponent(email));
+	});
 
 	$('#delete-email').on('show.bs.modal', function (event) {
 		//console.log(event);

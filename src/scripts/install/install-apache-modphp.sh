@@ -199,7 +199,7 @@ pm.max_spare_servers = 1
     sed -i 's/opcache.memory_consumption=128/opcache.memory_consumption=1024/' /etc/php.d/10-opcache.ini
     sed -i 's/opcache.max_accelerated_files=4000/opcache.max_accelerated_files=1000000/' /etc/php.d/10-opcache.ini
 
-    chmod -R a+rwx /var/lib/php/session/
+    chmod 1733 /var/lib/php/session
 	dnf erase -y php-pecl-mysql
 	systemctl restart httpd
 ) >> ./install_reqad.log 2>&1

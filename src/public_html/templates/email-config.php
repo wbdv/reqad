@@ -27,9 +27,41 @@
 	$rbls    = ($which === 'exim') ? exim_dnslists_read() : array();
 	$dead    = exim_dnslist_dead();
 
+	/* Skip-RBL: the exemption list the blocklist checks consult first. Read
+	   from the generated file rather than from the catalogue, so the page
+	   reports the exemptions exim is actually serving. */
+	$skip_prov  = ($which === 'exim') ? skiprbl_providers() : array();
+	$skip_off   = ($which === 'exim') ? skiprbl_disabled()     : array();
+	$skip_on    = ($which === 'exim') ? skiprbl_enabled_keys() : array();
+	$skip_grp   = ($which === 'exim') ? skiprbl_groups()    : array();
+	$skip_meta  = ($which === 'exim') ? skiprbl_meta()      : array();
+	$skip_extra = ($which === 'exim') ? skiprbl_extra()     : '';
+	$skip_exim  = ($which === 'exim') ? skiprbl_exim_status($raw) : array('total' => 0, 'guarded' => 0);
+
+	/* Everything about limits lives on one tab: the per-domain sending policy,
+	   which has live counters to show alongside it, and the server-wide message
+	   and connection ceilings that used to sit in the Settings form. Both are
+	   lifted out of $groups so they are not rendered twice.
+
+	   Exim only: dovecot has a group called 'limits' too (Client limits), and
+	   lifting that one would delete it from the page -- it has no tab to move
+	   to. */
+	$limit_groups = array();
+	if ($which === 'exim') {
+		foreach (array('sendlimits', 'limits') as $gid) {
+			if (isset($groups[$gid])) $limit_groups[$gid] = $groups[$gid];
+			unset($groups[$gid]);
+		}
+	}
+
 	$tab = isset($_GET['tab']) ? clean($_GET['tab']) : 'settings';
-	if (!in_array($tab, array('settings', 'blocklists', 'advanced'), true)) $tab = 'settings';
+	if (!in_array($tab, array('settings', 'blocklists', 'limits', 'advanced'), true)) $tab = 'settings';
 	if ($tab === 'blocklists' && $which !== 'exim') $tab = 'settings';
+	if ($tab === 'limits' && ($which !== 'exim' || !$limit_groups)) $tab = 'settings';
+
+	$limits_on   = ($which === 'exim') ? exim_limits_installed() : false;
+	$limit_rows  = ($tab === 'limits' && $limits_on) ? exim_limits_counters() : array();
+	$limit_now   = ($tab === 'limits') ? mail_settings_current($which) : array();
 
 	/* The command whose verdict decides whether a save is allowed through --
 	   named in the page text so the admin can run it themselves. */
@@ -170,6 +202,9 @@
         <li class="nav-item"><a class="nav-link <?=($tab=='settings'?'active':'');?>" href="<?=h(mailcfg_tab_url($which,'settings'));?>">Settings</a></li>
         <?php if ($which === 'exim') { ?>
         <li class="nav-item"><a class="nav-link <?=($tab=='blocklists'?'active':'');?>" href="<?=h(mailcfg_tab_url($which,'blocklists'));?>">Blocklists (RBL)</a></li>
+        <?php if ($limit_groups) { ?>
+        <li class="nav-item"><a class="nav-link <?=($tab=='limits'?'active':'');?>" href="<?=h(mailcfg_tab_url($which,'limits'));?>">Limits</a></li>
+        <?php } ?>
         <?php } ?>
         <li class="nav-item"><a class="nav-link <?=($tab=='advanced'?'active':'');?>" href="<?=h(mailcfg_tab_url($which,'advanced'));?>">Advanced</a></li>
       </ul>
@@ -179,13 +214,14 @@
 <?php if ($tab === 'settings') { ?>
     <div class="tab-pane active show mailcfg-pane" id="tab-settings">
     <div class="card-body">
+<!--		
       <p class="text-muted" style="margin-left:5px;margin-top:10px;">
         Editing <code><?=h($target['path']);?></code>. Every change is checked with
         <code><?=h($checker);?></code> before it is written, the previous
         version is kept, and the file is restored automatically if
         <?=h($info['service']);?> rejects it.
       </p>
-
+-->
       <form method="post" action="/email-config/<?=h($which);?>/" id="mailcfg-form">
         <input type="hidden" name="action" value="save-mail-settings">
         <input type="hidden" name="which" value="<?=h($which);?>">
@@ -211,6 +247,11 @@
                           echo '</div>';
                       }
                   }
+                  /* The switch is only a macro; the forwards router has to read
+                     it. Without the router change it saves fine and does nothing. */
+                  if ($gid === 'forwarding' && $which === 'exim'
+                      && strpos($raw, 'eq{REQAD_NO_FORWARD_SPAM}{yes}') === false)
+                      echo '<div class="alert alert-warning">The forwards router is not wired to this switch yet, so it has no effect. Run <code>'.h(_PATH.'/scripts/update/setup_forward_spam_gate.sh').'</code> as root.</div>';
                 ?>
                 <?php foreach ($g['keys'] as $key => $def)
                         mailcfg_field($key, $def,
@@ -230,24 +271,178 @@
     </div>
 
     </div>
+<?php } elseif ($tab === 'limits') { ?>
+    <div class="tab-pane active show mailcfg-pane" id="tab-limits">
+    <div class="card-body">
+
+<!--
+      <p class="text-muted" style="margin-top:10px;">
+        Editing <code><?=h($target['path']);?></code>. Every change is checked with
+        <code><?=h($checker);?></code> before it is written, the previous version is kept, and
+        the file is restored automatically if <?=h($info['service']);?> rejects it.
+      </p>
+-->
+
+      <?php if (!$limits_on) { ?>
+        <div class="alert alert-warning">
+          <h4 class="alert-title">Per-domain limits are not installed yet</h4>
+          The rules behind <strong>Outbound sending limits</strong> are not in
+          <code><?=h($target['path']);?></code>, so those settings are not shown. Install them
+          once, as root:
+          <pre class="mt-2 mb-0">bash <?=h(_PATH);?>/scripts/update/setup_mail_limits.sh</pre>
+          The message and connection limits below are part of exim itself and work either way.
+        </div>
+      <?php }
+        /* Without the managed block the sending-limit macros are read by nothing,
+           so hide that group rather than offer fields that do nothing -- but keep
+           the rest of the tab usable. */
+        $show = $limit_groups;
+        if (!$limits_on) unset($show['sendlimits']);
+      ?>
+
+      <div class="row">
+        <div class="col-md-7">
+          <form method="post" action="/email-config/exim/?tab=limits" id="mailcfg-limits-form">
+            <input type="hidden" name="action" value="save-mail-settings">
+            <input type="hidden" name="which" value="exim">
+            <input type="hidden" name="tab" value="limits">
+
+            <?php foreach ($show as $gid => $g) { ?>
+              <div class="card mb-3" style="border:none;padding:0;">
+                <div class="card-header" style="border:none;padding:5px;">
+                  <h3 class="card-title" style="margin:10px 0 0 0;font-weight:bold"><?=$g['title'];?></h3>
+                </div>
+                <div class="card-body" style="padding:5px;">
+                  <?php if ($gid === 'sendlimits') { ?>
+                    <p class="text-muted" style="margin-bottom:15px;">
+                      How much mail one of your domains may send in an hour, and how many of
+                      those deliveries may fail, before exim acts. Counted per <strong>sending
+                      domain</strong>, from the mailbox that authenticated — one setting for the
+                      whole server, not one per domain.
+                    </p>
+                  <?php } ?>
+                  <?php if ($gid === 'limits') { ?>
+                    <p class="text-muted" style="margin-bottom:15px;">
+                      Server-wide ceilings that apply to every message exim handles, inbound as well
+                      as outbound. Leave a field empty to use exim's own default.
+                    </p>
+                  <?php } ?>
+                  <?php foreach ($g['keys'] as $key => $def)
+                          mailcfg_field($key, $def,
+                                        isset($limit_now[$key]) ? $limit_now[$key] : '',
+                                        isset($defaults[$key])  ? $defaults[$key]  : ''); ?>
+                </div>
+              </div>
+            <?php } ?>
+
+            <div class="btn-list">
+              <button type="submit" class="btn btn-primary">Save and reload exim</button>
+              <a href="/email-config/exim/?tab=limits" class="btn btn-white">Discard changes</a>
+            </div>
+          </form>
+        </div>
+
+        <?php if ($limits_on) { ?>
+        <div class="col-md-5">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">This hour</h3>
+              <?php if ($limit_rows) { ?>
+              <div class="card-actions">
+                <form method="post" action="/email-config/exim/?tab=limits"
+                      onsubmit="return confirm('Clear every sending counter?');">
+                  <input type="hidden" name="action" value="reset-mail-limit">
+                  <button type="submit" class="btn btn-sm btn-white">Clear all</button>
+                </form>
+              </div>
+              <?php } ?>
+            </div>
+            <div class="card-body p-0">
+              <?php if (!$limit_rows) { ?>
+                <p class="text-muted p-3 mb-0">Nothing counted yet. A domain appears here the first
+                time one of its mailboxes sends, or one of its messages bounces.</p>
+              <?php } else { ?>
+              <div class="table-responsive">
+              <table class="table table-vcenter card-table">
+                <thead><tr><th>Domain</th><th class="text-end">Sent</th><th class="text-end">Failed</th><th></th></tr></thead>
+                <tbody>
+                <?php
+                  $lim_h = (int)(isset($limit_now['REQAD_MAX_HOURLY'])   ? $limit_now['REQAD_MAX_HOURLY']   : 0);
+                  $lim_f = (int)(isset($limit_now['REQAD_MAX_FAILURES']) ? $limit_now['REQAD_MAX_FAILURES'] : 0);
+                  foreach ($limit_rows as $dom => $row) {
+                      /* over the limit is the whole point of the table, so it
+                         is the one thing coloured */
+                      $over_h = ($lim_h > 0 && $row['hourly']   !== null && $row['hourly']   >= $lim_h);
+                      $over_f = ($lim_f > 0 && $row['failures'] !== null && $row['failures'] >= $lim_f);
+                ?>
+                  <tr>
+                    <td><?=h($dom);?><br><small class="text-muted"><?=h($row['updated']);?></small></td>
+                    <td class="text-end<?=($over_h ? ' text-danger fw-bold' : '');?>">
+                      <?=($row['hourly'] === null ? '—' : h(number_format($row['hourly'], 1)));?>
+                    </td>
+                    <td class="text-end<?=($over_f ? ' text-danger fw-bold' : '');?>">
+                      <?=($row['failures'] === null ? '—' : h(number_format($row['failures'], 1)));?>
+                    </td>
+                    <td class="text-end">
+                      <?php foreach (array('hourly' => 'sent', 'failures' => 'failed') as $kind => $word) {
+                              if ($row[$kind] === null) continue; ?>
+                        <form method="post" action="/email-config/exim/?tab=limits" style="display:inline">
+                          <input type="hidden" name="action" value="reset-mail-limit">
+                          <input type="hidden" name="kind" value="<?=h($kind);?>">
+                          <input type="hidden" name="domain" value="<?=h($dom);?>">
+                          <button type="submit" class="btn btn-sm btn-white" title="Clear the <?=h($word);?> counter for <?=h($dom);?>">Clear <?=h($word);?></button>
+                        </form>
+                      <?php } ?>
+                    </td>
+                  </tr>
+                <?php } ?>
+                </tbody>
+              </table>
+              </div>
+              <?php } ?>
+            </div>
+            <div class="card-footer text-muted">
+              These are exim's own rate counters, and a rate is smoothed over the hour rather
+              than tallied — two messages back to back read as 1.9, and the figure decays as the
+              hour passes. It is the number exim compares against the limit.
+            </div>
+          </div>
+        </div>
+        <?php } ?>
+      </div>
+
+      <?php if ($limits_on) { ?>
+      <p class="text-muted mt-3 mb-0">
+        Everything the per-domain limits do is logged whatever the mode, so
+        <code>grep 'REQAD LIMIT' /var/log/exim/main.log</code> shows what has been held or
+        refused.
+      </p>
+      <?php } ?>
+    </div>
+
+    </div>
 <?php } elseif ($tab === 'blocklists') { ?>
     <div class="tab-pane active show mailcfg-pane" id="tab-blocklists">
     <div class="card-body">
 
+<!--
       <p class="text-muted" style="margin-top:10px;">
         DNS blocklists exim consults while accepting mail. A blocklist that no longer answers
         does not fail quietly — every lookup waits for a DNS timeout, on every message — so
         remove any marked <span class="badge bg-red-lt">dead</span>.
       </p>
+-->
 
+      <div class="row">
       <?php foreach ($rbls as $i => $list) {
               $is_auth = ($i === 0 && count($rbls) > 1);
       ?>
+        <div class="col-md-6">
         <div class="card mb-3" style="border:0;">
           <div class="card-header" style="border:0;padding:5px;">
             <h3 class="card-title" style="margin:10px 0 0 0;font-weight:bold">
               <?=$is_auth ? 'Authenticated senders' : 'Incoming mail (RCPT)';?>
-              <small class="text-muted d-block">exim.conf line <?=(int)($list['line'] + 1);?></small>
+<!--              <small class="text-muted d-block">exim.conf line <?=(int)($list['line'] + 1);?></small> -->
             </h3>
           </div>
           <div class="card-body" style="padding:5px;">
@@ -268,10 +463,162 @@
             </form>
           </div>
         </div>
+        </div>
       <?php } ?>
+      </div>
       <?php if (!$rbls) { ?>
         <div class="alert alert-info">No DNS blocklists are configured in <code><?=h($target['path']);?></code>.</div>
       <?php } ?>
+
+      <hr style="margin:22px 0 18px 0;">
+
+      <h3 style="font-weight:bold;margin-bottom:4px;">Trusted senders (skip RBL)</h3>
+      <p class="text-muted" style="margin-bottom:14px;">
+        A blocklist hit is evidence, not proof, and the large providers get listed routinely &mdash;
+        one compromised customer is enough to put a shared outbound range on a list for a day.
+        Addresses below are exempted from the checks above, so mail from them is judged on its own
+        content instead. The exemption is tested <em>before</em> the lookups, so an exempt sender
+        costs one local file match rather than a round of DNS queries.
+      </p>
+
+      <?php if (!$skip_meta['exists']) { ?>
+        <div class="alert alert-warning">
+          <strong>Not built yet.</strong> <code><?=h(SKIPRBL_FILE);?></code> does not exist.
+          Use <strong>Rebuild now</strong> below to generate it.
+        </div>
+      <?php } ?>
+
+      <!-- where it stands: is exim consulting the list at all -->
+      <div class="card mb-3">
+        <div class="card-body" style="padding:12px 14px;">
+          <div class="row align-items-center">
+            <div class="col">
+              <?php if ($skip_exim['total'] === 0) { ?>
+                <span class="badge bg-secondary-lt">no blocklist checks</span>
+                <span class="text-muted ms-2">There are no <code>dnslists</code> conditions to exempt anything from.</span>
+              <?php } elseif ($skip_exim['guarded'] === 0) { ?>
+                <span class="badge bg-red-lt">not applied</span>
+                <span class="text-muted ms-2">
+                  None of the <?=(int)$skip_exim['total'];?> blocklist checks consult this list &mdash;
+                  every sender is being judged on blocklist hits.
+                </span>
+              <?php } elseif ($skip_exim['guarded'] < $skip_exim['total']) { ?>
+                <span class="badge bg-yellow-lt">partly applied</span>
+                <span class="text-muted ms-2">
+                  <?=(int)$skip_exim['guarded'];?> of <?=(int)$skip_exim['total'];?> blocklist checks consult this list.
+                </span>
+              <?php } else { ?>
+                <span class="badge bg-green-lt">applied</span>
+                <span class="text-muted ms-2">
+                  All <?=(int)$skip_exim['total'];?> blocklist check<?=($skip_exim['total'] === 1 ? '' : 's');?>
+                  consult this list first.
+                </span>
+              <?php } ?>
+              <?php if ($skip_meta['exists']) { ?>
+                <div class="text-muted" style="margin-top:6px;font-size:90%;">
+                  <?=(int)$skip_meta['total'];?> addresses
+                  (<?=(int)$skip_meta['esp'];?> from providers) &middot;
+                  built <?=h($skip_meta['generated']);?>
+                </div>
+              <?php } ?>
+            </div>
+            <div class="col-auto">
+              <?php if ($skip_exim['total'] > 0) { ?>
+                <form method="post" action="/email-config/exim/" style="display:inline;">
+                  <input type="hidden" name="action" value="save-mail-skiprbl">
+                  <input type="hidden" name="op" value="exim">
+                  <input type="hidden" name="enable" value="<?=($skip_exim['guarded'] >= $skip_exim['total'] ? '0' : '1');?>">
+                  <button type="submit" class="btn <?=($skip_exim['guarded'] >= $skip_exim['total'] ? 'btn-outline-secondary' : 'btn-primary');?>">
+                    <?=($skip_exim['guarded'] >= $skip_exim['total'] ? 'Stop using the list' : 'Apply to every blocklist check');?>
+                  </button>
+                </form>
+              <?php } ?>
+              <form method="post" action="/email-config/exim/" style="display:inline;">
+                <input type="hidden" name="action" value="save-mail-skiprbl">
+                <input type="hidden" name="op" value="rebuild">
+                <button type="submit" class="btn btn-outline-primary" title="Walk every provider's SPF records again. Takes a few seconds.">Rebuild now</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+
+        <!-- the ESP catalogue -->
+        <div class="col-lg-7">
+          <form method="post" action="/email-config/exim/">
+            <input type="hidden" name="action" value="save-mail-skiprbl">
+            <input type="hidden" name="op" value="providers">
+            <div class="card mb-3">
+              <div class="card-header" style="padding:8px 14px;">
+                <h3 class="card-title" style="font-weight:bold;margin:0;">Email service providers</h3>
+              </div>
+              <div class="card-body" style="padding:10px 14px;">
+                <p class="text-muted" style="font-size:90%;">
+                  Ranges are read from each provider's published SPF records, so they follow the
+                  provider rather than needing to be chased by hand. An address claimed by more than
+                  one provider is listed once, under the first that claims it &mdash; which is why a
+                  provider that resells another's infrastructure can show a small count.
+                </p>
+                <div class="row">
+                <?php
+                  foreach ($skip_prov as $pkey => $prov) {
+                      $on    = skiprbl_is_on($pkey, $prov, $skip_off, $skip_on);
+                      $count = isset($skip_grp[$prov['label']]) ? count($skip_grp[$prov['label']]) : 0;
+                ?>
+                  <div class="col-md-6">
+                    <label class="form-check" style="margin-bottom:4px;">
+                      <input class="form-check-input" type="checkbox" name="provider[]"
+                             value="<?=h($pkey);?>"<?=($on ? ' checked' : '');?>>
+                      <span class="form-check-label">
+                        <?=h($prov['label']);?>
+                        <?php if (!$on) { ?>
+                          <span class="badge bg-secondary-lt ms-1"<?=($prov['default'] === 'off' ? ' title="Shipped switched off in the catalogue."' : '');?>>off<?=($prov['default'] === 'off' ? ' by default' : '');?></span>
+                        <?php } elseif ($count > 0) { ?>
+                          <span class="badge bg-green-lt ms-1"><?=(int)$count;?></span>
+                        <?php } else { ?>
+                          <span class="badge bg-yellow-lt ms-1" title="Nothing to add: every range this provider publishes is already listed under another provider, or its SPF cannot be enumerated.">0</span>
+                        <?php } ?>
+                      </span>
+                    </label>
+                  </div>
+                <?php } ?>
+                </div>
+                <button type="submit" class="btn btn-primary" style="margin-top:10px;">Save providers &amp; rebuild</button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <!-- the operator's own additions -->
+        <div class="col-lg-5">
+          <form method="post" action="/email-config/exim/">
+            <input type="hidden" name="action" value="save-mail-skiprbl">
+            <input type="hidden" name="op" value="extra">
+            <div class="card mb-3">
+              <div class="card-header" style="padding:8px 14px;">
+                <h3 class="card-title" style="font-weight:bold;margin:0;">Additional addresses</h3>
+              </div>
+              <div class="card-body" style="padding:10px 14px;">
+                <p class="text-muted" style="font-size:90%;">
+                  Your own exemptions &mdash; a customer's office, a partner's relay, a smarthost.
+                  One IP or CIDR range per line. Add <code>#</code> and a note to record why: the
+                  note is kept in the generated file, so the next person to read it does not have to
+                  guess.
+                </p>
+                <div class="mb-2">
+                  <textarea class="form-control" name="extra" rows="12" spellcheck="false"
+                            style="font-family:monospace;font-size:90%;"
+                            placeholder="203.0.113.7  # branch office&#10;198.51.100.0/24  # partner relay"><?=h($skip_extra);?></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Save addresses &amp; rebuild</button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+      </div>
     </div>
 
     </div>

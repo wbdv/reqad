@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 /* Dump a domain's DNS zone to a JSON file using the configured DNS provider.
  * Called by scripts/backup.sh. Provider-agnostic: uses export_zone_records()

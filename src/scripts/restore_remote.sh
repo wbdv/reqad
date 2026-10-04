@@ -114,9 +114,26 @@ valid_date "${DATE}"     || usage_die "invalid --date (expected YYYY-MM-DD)"
 if [ "${MODE}" = database ]; then
 	valid_db "${DB}" || usage_die "invalid --db"
 	# a database may only be restored into the account that owns it — the same
-	# rule backup.sh uses when it decides what to dump ("<user>_%")
-	[ "${DB}" = "${USER_ARG}" ] || [[ "${DB}" == "${USER_ARG}_"* ]] \
-		|| usage_die "database '${DB}' does not belong to account '${USER_ARG}'"
+	# rule backup.sh uses when it decides what to dump: "<user>_%", or a database
+	# assigned to the account on the Databases page (db_owners). An assigned
+	# database that has since been dropped lost its row with it, so a name with
+	# no owner at all is accepted too, once the account's backup index shows it
+	# was backed up with the account (checked below, after connecting) — never
+	# just any unowned database on this server.
+	DB_OWNER=$(${SQLITE} "${DB_FILE}" "SELECT user FROM db_owners WHERE dbname='${DB}'" 2>/dev/null)
+	DB_PREFIX="${DB%%_*}"
+	if [ -n "${DB_OWNER}" ]; then
+		[ "${DB_OWNER}" = "${USER_ARG}" ] \
+			|| usage_die "database '${DB}' is assigned to account '${DB_OWNER}', not '${USER_ARG}'"
+	elif [ "${DB}" = "${USER_ARG}" ] || [[ "${DB}" == "${USER_ARG}_"* ]]; then
+		:
+	elif [ "${DB_PREFIX}" != "${DB}" ] \
+		&& [ "$(${SQLITE} "${DB_FILE}" "SELECT count(*) FROM accounts WHERE user='${DB_PREFIX}'" 2>/dev/null)" != "0" ]; then
+		usage_die "database '${DB}' belongs to account '${DB_PREFIX}', not '${USER_ARG}'"
+	else
+		DB_NEED_INDEX=1
+		DB_ASSIGN=1
+	fi
 fi
 [ -n "${TOKEN}" ] && { [[ "${TOKEN}" =~ ^[0-9a-f]{16}$ ]] || usage_die "invalid --token"; }
 U="${USER_ARG}"
@@ -204,6 +221,10 @@ rsh true >/dev/null 2>&1 || die "cannot reach the backup server ${SSH_USER}@${SS
 rsh "test -d '${RD}'" || die "there is no ${DATE} backup on the backup server"
 if [ "${MODE}" != database ] || ! rsh "test -f '${GZ}'"; then
 	rsh "test -f '${ARCH}'" || die "the ${DATE} backup has no archive for account '${U}'"
+fi
+if [ "${DB_NEED_INDEX:-0}" -eq 1 ]; then
+	rsh "grep -q '^db ${DB} ' '${RD}/accounts/${U}.index'" 2>/dev/null \
+		|| die "database '${DB}' is not in the ${DATE} backup of '${U}'"
 fi
 
 # ===========================================================================
@@ -391,6 +412,13 @@ else
 		| ${MYSQL} "${DB}"
 	consumer_ok "import ${DB}" "${PIPESTATUS[@]}" || die "importing '${DB}' failed"
 	EARLY_EXIT_OK=0
+fi
+
+# a database outside the "<user>_" prefix only belongs to the account by
+# assignment — make sure it (still) does
+if [ "${DB_ASSIGN:-0}" -eq 1 ]; then
+	${SQLITE} "${DB_FILE}" "INSERT OR IGNORE INTO db_owners (dbname, user, created) VALUES ('${DB}', '${U}', strftime('%s','now'))" 2>/dev/null
+	log "database ${DB} assigned to ${U}"
 fi
 
 log "DONE"

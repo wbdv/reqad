@@ -138,19 +138,8 @@
                         	$i++;
 							if($row["disk_quota"] == 0)
 								$row["disk_quota"] = (int)($DISKSPACE/20);
-						  	$phpversion = $ini['php'];
-							foreach ($php_versions as $pv) {
-								$pv2=str_replace('.', '', $pv);
-								if(is_file('/etc/opt/remi/php'.$pv2.'/php-fpm.d/'.$row['domain'].'.conf'))
-									$phpversion = $pv;
-							}
-							$phphandler = 'mod_php';
-							if($is_apache) {
-								if($phpversion != $ini['php'])
-									$phphandler = 'fpm';
-								elseif(is_file('/etc/php-fpm.d/'.$row['domain'].'.conf'))
-									$phphandler = 'fpm';
-							}
+							// version/handler, or 'off'/'off' when PHP is disabled
+							list($phpversion, $phphandler) = account_php($row['domain']);
 							$domain = $row["domain"];
                     ?>
                       <tr class="account-row" data-domain="<?=h($domain);?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?>">
@@ -227,12 +216,16 @@
                         </td>
 					<? } ?>
                         <td class="text-muted" data-label="PHP Version">
+						<? if($phpversion == 'off'): ?>
+							<span class="badge bg-grey-lt border" style="color:#888;">PHP disabled</span>
+						<? else: ?>
 							<? $php_color = $php_version_colors[$phpversion] ?? $php_version_colors[substr($phpversion, 0, 1)] ?? '#aaa'; ?>
 							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($phpversion);?></span>
+						<? endif; ?>
                         </td>
 					<? if($is_apache): ?>
                         <td class="text-muted" data-label="Handler">
-							<span class="text-muted" style="font-size:0.85em;"><?=$phphandler == 'fpm' ? 'php-fpm' : $phphandler;?></span>
+							<span class="text-muted" style="font-size:0.85em;"><?=$phphandler == 'off' ? '-' : ($phphandler == 'fpm' ? 'php-fpm' : $phphandler);?></span>
                         </td>
 					<? endif; ?>
                         <td data-label="Created on" class="text-muted">
@@ -443,6 +436,7 @@
 					<br />
           			<label class="form-label">PHP version:</label>
 		            <select name="phpversion" id="phpversion" class="form-select">
+						<option value="off">Disable PHP</option>
 					<? if($is_apache): ?>
 						<option value="<?=$ini['php'];?>:mod_php">PHP <?=$ini['php'];?> (mod_php)</option>
 						<option value="<?=$ini['php'];?>:fpm">PHP <?=$ini['php'];?> (php-fpm)</option>
@@ -745,7 +739,7 @@ jQuery(document).ready(function () {
 		$('#diskquota-edit').next().html(disk_quota + ' MB');
 	<? } ?>
 	<?php if($is_apache): ?>
-		$('#phpversion').val(phpversion + ':' + phphandler);
+		$('#phpversion').val(phpversion == 'off' ? 'off' : phpversion + ':' + phphandler);
 	<?php else: ?>
 		$('#phpversion').val(phpversion);
 	<?php endif; ?>

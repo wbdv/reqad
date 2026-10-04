@@ -20,6 +20,12 @@
 # CREATE DATABASE and their grants still ride inside the account archive, so a
 # restore rebuilds the empty database and only the data is piped back in.
 #
+# What an account archive leaves out (Backup page > Exclusions): filesystems
+# mounted inside the home directory (sshfs, NFS, another disk), the rules with
+# scope "nightly" or "both", and folders holding a .nobackup file. backup.sh
+# works that out (via backup_excludes.sh) and records it as excludes.txt in
+# the archive and as "excl" lines in the .index. --dry-run lists it per account.
+#
 # Remote layout (dated directories straight in the ssh user's home by default,
 # since a per-server backup account already isolates this host; --dest adds a
 # prefix where one account holds several servers):
@@ -41,11 +47,18 @@
 #     --cool-load N     pause between accounts while load is >= N (default 8)
 #     --min-free-kb N   require N KB free on the backup server (default: as much
 #                       as /home currently uses)
-#     --keep N          after a successful run, delete all but the newest N date
-#                       directories under <dest>  (default: keep everything)
+#     --keep N          after a successful run, prune the dated directories under
+#                       <dest> to the N-rung ladder (1-9: newest days, 1st/15th
+#                       of this and past months — see rotation_keep below)
+#                       (default: keep everything)
 #     --no-system       skip the system/ bundles
 #     --no-db           skip databases entirely
 #     --mail ADDR       email a report to ADDR when the run fails
+#                       Without it the report goes to the contact email on the
+#                       panel's Settings page, unless "Notify on errors" was
+#                       switched off in the Nightly backup modal.
+#     --notify          mail the contact email even when that switch is off
+#     --no-notify       do not mail the contact email (manual test runs)
 #     --host / --port / --ssh-user / --key    override the defines.php settings
 #     --dry-run         show what would run, transfer nothing
 #
@@ -116,6 +129,7 @@ KEEP=0
 DO_SYSTEM=1
 DO_DB=1
 MAILTO=''
+NOTIFY=''   # '' = the panel setting decides, 1 = --notify, 0 = --no-notify
 DRY=0
 ONLY_USERS=()
 STAGE_BASE=/var/tmp/reqad-backup
@@ -132,16 +146,20 @@ while [ $# -gt 0 ]; do
         --no-system)   DO_SYSTEM=0; shift ;;
         --no-db)       DO_DB=0; shift ;;
         --mail)        MAILTO="$2"; shift 2 ;;
+        --notify)      NOTIFY=1; shift ;;
+        --no-notify)   NOTIFY=0; shift ;;
         --host)        SSH_HOST="$2"; shift 2 ;;
         --port)        SSH_PORT="$2"; shift 2 ;;
         --ssh-user)    SSH_USER="$2"; shift 2 ;;
         --key)         SSH_KEY="$2"; shift 2 ;;
         --stage-dir)   STAGE_BASE="$2"; shift 2 ;;
         --dry-run)     DRY=1; shift ;;
-        -h|--help)     sed -n '2,60p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,68p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+[[ "${KEEP}" =~ ^[0-9]+$ ]] || { echo "--keep needs a number, got: ${KEEP}" >&2; exit 2; }
 
 # No --dest: the dated directories live directly in the ssh user's home, which
 # is what a dedicated per-server backup account gives you already.
@@ -153,13 +171,78 @@ fi
 [ -n "${SSH_PORT}" ] || SSH_PORT=22
 
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# ─── retention ladder ───────────────────────────────────────────────────────
+# --keep N keeps the first N rungs, so every step up buys exactly one more
+# backup (when the rungs do not overlap):
+#   1-2  the newest 1-2 backups          6  + the 3rd newest
+#   3    + 1st of this month             7  + 15th of last month
+#   4    + 15th of this month            8  + the 4th newest
+#   5    + 1st of last month             9  + 1st of the month before last
+# "1st"/"15th" mean the earliest clean backup (MANIFEST says failed: none) in
+# days 1-14 / 15-31 of that month, so a failed or missed run on the 1st hands
+# the slot to the 2nd instead of leaving the month with nothing. Once picked it
+# stays picked: no later backup in the window can be earlier. A window with no
+# clean backup at all falls back to its earliest backup of any kind.
+KEEP_LADDER=( recent:1 recent:2 month:0:01 month:0:15 month:1:01 recent:3 month:1:15 recent:4 month:2:01 )
+
+rotation_keep() {   # $1 = N, $2 = today (YYYY-MM-DD); stdin "<date> ok|bad"; prints dates to keep
+    local n=$1 today=$2 lines slot kind a b ym from to win pick recent=0
+    lines=$(grep -E '^20[0-9]{2}-[0-9]{2}-[0-9]{2} (ok|bad)$' | sort)
+    for slot in "${KEEP_LADDER[@]:0:$n}"; do
+        IFS=: read -r kind a b <<< "${slot}"
+        if [ "${kind}" = recent ]; then
+            recent=${a}
+            continue
+        fi
+        ym=$(date -d "${today:0:7}-01 -${a} month" +%Y-%m)
+        if [ "${b}" = 01 ]; then from=${ym}-01; to=${ym}-14; else from=${ym}-15; to=${ym}-31; fi
+        win=$(echo "${lines}" | awk -v f="${from}" -v t="${to}" -v d="${today}" '$1>=f && $1<=t && $1<=d')
+        pick=$(echo "${win}" | awk '$2=="ok"{print $1; exit}')
+        [ -n "${pick}" ] || pick=$(echo "${win}" | awk 'NF{print $1; exit}')
+        [ -n "${pick}" ] && echo "${pick}"
+    done
+    [ "${recent}" -gt 0 ] && echo "${lines}" | awk -v d="${today}" 'NF && $1<=d{print $1}' | tail -n "${recent}"
+    return 0
+}
 die()  { log "ERROR: $*"; notify "backup aborted" "$*"; exit 1; }
+
+# Failure mail goes to the Settings contact email by default. The switch in the
+# Nightly backup modal is read here rather than written into the cron line, so
+# a schedule saved before the switch existed notifies too, and a new contact
+# email needs no re-save. backup-remote-notify is '0' only once someone has
+# switched it off; a missing row means on.
+CONTACT=''
+SMTP_RELAY=0
+if [ -r "${DB_FILE}" ]; then
+    CONTACT=$(setting email)
+    [ -n "$(setting smtp_server)" ] && [ -n "$(setting smtp_from)" ] && SMTP_RELAY=1
+    if [ -z "${MAILTO}" ] && [ "${NOTIFY}" != 0 ]; then
+        if [ "${NOTIFY}" = 1 ] || [ "$(setting backup-remote-notify)" != 0 ]; then
+            MAILTO="${CONTACT}"
+        fi
+    fi
+    [ "${NOTIFY}" = 1 ] && [ -z "${MAILTO}" ] \
+        && echo "[$(date '+%Y-%m-%d %H:%M:%S')] note: --notify given but no contact email is set — failures will not be emailed"
+fi
 
 FAILED=()
 notify() {   # $1 = subject tail, $2 = body
     [ -n "${MAILTO}" ] || return 0
-    printf 'To: %s\nSubject: [%s] Reqad remote backup: %s\n\n%s\n' \
-        "${MAILTO}" "${HOST_SHORT}" "$1" "$2" | /usr/sbin/sendmail -t 2>/dev/null
+    # Mail to the contact address goes out through the panel's sending method
+    # when one is set, like forwarded root mail — a VPS delivering straight to
+    # the MX is exactly the mail that lands in spam. forward_root_mail.php always
+    # sends to the contact email, so a different --mail address stays on sendmail.
+    # The [host] prefix is the full hostname because the relay adds one itself
+    # unless the subject already starts with it.
+    local msg
+    msg=$(printf 'To: %s\nSubject: [%s] Reqad remote backup: %s\n\n%s\n' \
+        "${MAILTO}" "$(hostname)" "$1" "$2")
+    if [ "${SMTP_RELAY}" -eq 1 ] && [ "${MAILTO}" = "${CONTACT}" ]; then
+        printf '%s\n' "${msg}" | "${REQAD}/scripts/forward_root_mail.php" >/dev/null 2>&1
+    else
+        printf '%s\n' "${msg}" | /usr/sbin/sendmail -t 2>/dev/null
+    fi
 }
 
 # ─── ssh plumbing ───────────────────────────────────────────────────────────
@@ -213,6 +296,11 @@ pipe_status_ok() {   # $1 = label  $2 = 1 if a tar warning is acceptable  $3.. =
 # meta/, no config, no databases. Refuse instead.
 grep -q -- '--stage-only' "${REQAD}/scripts/backup.sh" \
     || die "${REQAD}/scripts/backup.sh does not support --stage-only — update it (and restore.sh/backup_server.sh) on this server before backing up remotely"
+# Same trap for the exclusions: an older backup.sh ignores --scope, writes no
+# .tar-excludes, and every account would go out with everything in it again —
+# including sshfs/NFS mounts inside the home directories.
+grep -q -- '.tar-excludes' "${REQAD}/scripts/backup.sh" && [ -x "${REQAD}/scripts/backup_excludes.sh" ] \
+    || die "${REQAD}/scripts/backup.sh does not support backup exclusions (or scripts/backup_excludes.sh is missing) — update both on this server"
 
 # The helper scripts hardcode the sqlite3 they call. A HALF-deployed update (new
 # backup.sh, stale backup_server.sh) then dies mid-run on a server that has no
@@ -244,26 +332,19 @@ log "compressor    : ${GZIP%% *}"
 
 # csf: the outbound port has to be open or the ssh never leaves this box. That
 # failure looks exactly like a backup server that is down — the connection just
-# hangs and times out — so name the real cause instead of letting ssh guess.
-CSF_CONF=/etc/csf/csf.conf
-if [ -r "${CSF_CONF}" ]; then
-    csf_port_open() {   # $1 = port, $2 = a TCP_OUT-style list ("22,80,1000:2000")
-        local p="$1" r
-        local -a spec
-        IFS=',' read -ra spec <<< "$2"
-        for r in "${spec[@]}"; do
-            r="${r//[[:space:]]/}"
-            [ -n "${r}" ] || continue
-            case "${r}" in
-                *:*) [ "${p}" -ge "${r%%:*}" ] && [ "${p}" -le "${r##*:}" ] && return 0 ;;
-                *)   [ "${p}" = "${r}" ] && return 0 ;;
-            esac
-        done
-        return 1
-    }
-    TCP_OUT=$(sed -n 's/^[[:space:]]*TCP_OUT[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${CSF_CONF}" | tail -1)
-    if [ -n "${TCP_OUT}" ] && ! csf_port_open "${SSH_PORT}" "${TCP_OUT}"; then
-        die "csf blocks outbound port ${SSH_PORT} — add it to TCP_OUT in ${CSF_CONF} and run 'csf -r'"
+# hangs and times out — so open the port (a custom ssh port is usually missing
+# from TCP_OUT) instead of letting ssh guess. A dry run only reports it.
+CSF_OPEN="${REQAD}/scripts/csf_open_tcp_out.sh"
+if [ -f /etc/csf/csf.conf ]; then
+    if [ "${DRY}" -eq 1 ]; then
+        log "csf           : (dry run) would make sure outbound port ${SSH_PORT} is open"
+    elif [ -x "${CSF_OPEN}" ]; then
+        CSF_ST=$("${CSF_OPEN}" "${SSH_PORT}" 2>&1)
+        case "${CSF_ST}" in
+            updated)   log "csf           : opened outbound port ${SSH_PORT} (TCP_OUT) and reloaded csf" ;;
+            unchanged|nocsf) ;;
+            *)         die "csf blocks outbound port ${SSH_PORT} and opening it failed: ${CSF_ST//$'\n'/ } — add it to TCP_OUT in /etc/csf/csf.conf and run 'csf -r'" ;;
+        esac
     fi
 fi
 
@@ -380,6 +461,17 @@ for U in "${USERS[@]}"; do
 
     if [ "${DRY}" -eq 1 ]; then
         log "would stage ${U} and stream → ${REMOTE_DIR}/accounts/${U}.tar.gz"
+        # the same call backup.sh makes, so a dry run shows exactly what tonight's
+        # archive would leave out (mounts, rules, .nobackup markers)
+        XD=$(mktemp -d "${STAGE_BASE}.dry.XXXXXX" 2>/dev/null) || { mkdir -p "$(dirname "${STAGE_BASE}")"; XD=$(mktemp -d "${STAGE_BASE}.dry.XXXXXX"); }
+        "${REQAD}/scripts/backup_excludes.sh" build "${U}" nightly "${XD}" "${XD}/excludes.txt"
+        if [ -s "${XD}/excludes.txt" ]; then
+            grep -v '^#' "${XD}/excludes.txt" | while IFS=$'\t' read -r k w d; do log "  would exclude ${k}: ${w}  (${d})"; done
+        else
+            log "  nothing excluded"
+        fi
+        for xdb in $("${REQAD}/scripts/backup_excludes.sh" dbs "${U}" nightly); do log "  would exclude db: ${xdb}  (restored empty)"; done
+        rm -rf "${XD}"
         continue
     fi
 
@@ -390,7 +482,7 @@ for U in "${USERS[@]}"; do
     DBFLAG=()
     [ "${DO_DB}" -eq 1 ] && DBFLAG=( -d --db-max-mb "${DB_MAX_MB}" )
     STAGE_LOG="${STAGE}/.stage.log"
-    "${REQAD}/scripts/backup.sh" "${U}" -w -m "${DBFLAG[@]}" --stage-only "${STAGE}" > "${STAGE_LOG}" 2>&1
+    "${REQAD}/scripts/backup.sh" "${U}" -w -m "${DBFLAG[@]}" --scope nightly --stage-only "${STAGE}" > "${STAGE_LOG}" 2>&1
     STAGE_RC=$?
     # exit 0 is not enough: backup.sh exits 0 on "user does not exist" too, and an
     # empty tree means the archive would be a homedir with no account metadata —
@@ -404,6 +496,16 @@ for U in "${USERS[@]}"; do
     fi
     rm -f "${STAGE_LOG}"
 
+    # What backup.sh decided to leave out of the homedir (Exclusions tab rules,
+    # filesystems mounted inside it, .nobackup markers). The patterns are all
+    # "<user>/..." and --anchored, so they cannot touch the staged tree, and the
+    # flags file is whitelisted rather than trusted.
+    mapfile -t XFLAGS < <(grep -xE -- '--exclude-tag=\.nobackup|--exclude-caches' "${STAGE}/.tar-flags" 2>/dev/null)
+    XREC="${STAGE}/backup-${U}/excludes.txt"
+    if [ -s "${XREC}" ]; then
+        grep -v '^#' "${XREC}" | while IFS=$'\t' read -r k w d; do log "  excluded ${k}: ${w}  (${d})"; done
+    fi
+
     # staged tree + /home/<user> in ONE tar, straight into the ssh pipe. The
     # transform rewrites /home/<user> to backup-<user>/homedir/ exactly the way
     # backup.sh does, so restore.sh sees the archive it expects; S/H keep symlink
@@ -415,6 +517,7 @@ for U in "${USERS[@]}"; do
     # `tar --occurrence=1` after reading a few hundred MB instead of all 48 GB.
     # Swap these two sources and that restore silently becomes a full-archive read.
     tar cf - --warning=no-file-changed --warning=no-file-removed \
+        --anchored --exclude-from="${STAGE}/.tar-excludes" "${XFLAGS[@]}" \
         -C "${STAGE}" "backup-${U}" \
         --transform "s,^${U}/,backup-${U}/homedir/,SH" \
         --transform "s,^${U}\$,backup-${U}/homedir,SH" \
@@ -455,17 +558,27 @@ for U in "${USERS[@]}"; do
             # one du of the whole homedir — enough for the restore space check.
             # A du per top-level entry would re-walk the biggest homedirs a second
             # time every night, which is not worth a prettier listing.
-            echo "home_kb $(du -sk "/home/${U}" 2>/dev/null | cut -f1)"
-            # top-level homedir entries: what a partial restore can be offered for
+            echo "home_kb $(du -skx "/home/${U}" 2>/dev/null | cut -f1)"
+            # top-level homedir entries: what a partial restore can be offered for.
+            # A mount point was left out of the archive, so it is not offered —
+            # and it is skipped BEFORE the -e test, which would stat a possibly
+            # dead sshfs.
+            declare -A XMOUNT=()
+            [ -s "${XREC}" ] && while IFS=$'\t' read -r k w d; do
+                [ "${k}" = mount ] && XMOUNT["${w}"]=1
+            done < <(grep -v '^#' "${XREC}")
             for e in "/home/${U}"/*; do
-                [ -e "${e}" ] || continue
                 n=$(basename "${e}")
+                [ -n "${XMOUNT[${n}]:-}" ] && continue
+                [ -e "${e}" ] || continue
                 if   [ -L "${e}" ]; then t=link
                 elif [ -d "${e}" ]; then t=dir
                 else                     t=file
                 fi
                 echo "home ${n} ${t}"
             done
+            # what was left out: "excl <kind> <path>" (path last, it may hold spaces)
+            [ -s "${XREC}" ] && grep -v '^#' "${XREC}" | awk -F'\t' '{print "excl " $1 " " $2}'
             # databases, and WHICH of the two places each dump ended up in
             if [ -d "${STAGE}/backup-${U}/databases" ]; then
                 for f in "${STAGE}/backup-${U}/databases"/*.sql; do
@@ -490,7 +603,15 @@ for U in "${USERS[@]}"; do
 done
 
 # ─── manifest + rotation ────────────────────────────────────────────────────
-if [ "${DRY}" -eq 0 ]; then
+# A --user run is a partial one (a test, or one account redone). Writing its
+# MANIFEST over tonight's would make that dated directory claim to hold only
+# those accounts, so an existing MANIFEST is left alone.
+KEEP_MANIFEST=0
+if [ "${DRY}" -eq 0 ] && [ ${#ONLY_USERS[@]} -gt 0 ] && rsh "test -s '${REMOTE_DIR}/MANIFEST.txt'"; then
+    KEEP_MANIFEST=1
+    log "partial run (--user): kept the existing ${REMOTE_DIR}/MANIFEST.txt"
+fi
+if [ "${DRY}" -eq 0 ] && [ "${KEEP_MANIFEST}" -eq 0 ]; then
     {
         echo "Reqad full remote backup"
         echo "host    : $(hostname -f 2>/dev/null || hostname)"
@@ -506,11 +627,27 @@ if [ "${DRY}" -eq 0 ]; then
     # Rotation runs only on a clean run: pruning old backups right after a run
     # that half failed is how you end up with nothing to restore from.
     if [ "${KEEP}" -gt 0 ] && [ ${#FAILED[@]} -eq 0 ]; then
-        OLD=$(rsh "ls -1d '${DEST:-.}'/20*-*-* 2>/dev/null | sort | head -n -${KEEP}")
-        if [ -n "${OLD}" ]; then
-            log "rotating: removing $(echo "${OLD}" | wc -l) old backup(s)"
+        if [ "${KEEP}" -gt ${#KEEP_LADDER[@]} ]; then
+            log "rotation: --keep ${KEEP} is more than the ${#KEEP_LADDER[@]} the ladder has, using ${#KEEP_LADDER[@]}"
+            KEEP=${#KEEP_LADDER[@]}
+        fi
+        # one ssh for the whole inventory: "<date> ok|bad" per dated directory
+        INVENTORY=$(rsh "cd '${DEST:-.}' 2>/dev/null || exit 0
+            for d in 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+                [ -d \"\$d\" ] || continue
+                if grep -qE '^failed *: *none\$' \"\$d/MANIFEST.txt\" 2>/dev/null
+                then echo \"\$d ok\"; else echo \"\$d bad\"; fi
+            done")
+        KEEP_SET=$(echo "${INVENTORY}" | rotation_keep "${KEEP}" "${DATE}")
+        OLD=$(echo "${INVENTORY}" | awk '{print $1}' | grep -vxF -f <(echo "${KEEP_SET}") | grep -E '^20[0-9]{2}-')
+        # tonight's backup is always the newest one, so a keep list without it
+        # means the inventory is not what we think it is — delete nothing
+        if ! echo "${KEEP_SET}" | grep -qxF "${DATE}"; then
+            log "rotation skipped — ${DATE} not found in the backup listing"
+        elif [ -n "${OLD}" ]; then
+            log "rotating: keeping $(echo ${KEEP_SET}), removing $(echo ${OLD})"
             echo "${OLD}" | while read -r d; do
-                [ -n "${d}" ] && rsh "rm -rf '${d}'"
+                [ -n "${d}" ] && rsh "rm -rf '${DEST:-.}/${d}'"
             done
         fi
     elif [ "${KEEP}" -gt 0 ]; then

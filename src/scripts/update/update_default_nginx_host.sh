@@ -52,6 +52,7 @@ server {
 
     root /var/www/html;
     index index.php index.html index.htm;
+    include /etc/nginx/reqad-error-pages.conf;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$args;

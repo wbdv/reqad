@@ -12,7 +12,7 @@ if($domain=='' || !isset($domain) || $user=='' || !isset($user)) {
 	exit;
 }
 
-/* Alias domains to seed into server_name. create_account.php sets $account_aliases
+/* Alias domains to seed into server_name. account_create() (app/functions/accounts.php) sets $account_aliases
    (e.g. array('www.<domain>') when the "Create www alias" box is checked, or an
    empty array when unchecked). The CLI adduserdomain path doesn't set it, so default
    to www.<domain> for backward compatibility. */
@@ -21,7 +21,7 @@ $alias_str = '';
 foreach($alias_list as $__al) $alias_str .= ' '.$__al;
 /* mail.<domain> is added to server_name only when the account has email (matches
    account_server_names() used on alias add/remove). $has_email is set by
-   create_account.php; the CLI path leaves it unset -> no mail entry. */
+   account_create(); the old adduserdomain path leaves it unset -> no mail entry. */
 $mail_str = (isset($has_email) && $has_email) ? ' mail.'.$domain : '';
 
 $nginx_file = '/etc/nginx/conf.d/'.$domain.'.conf';
@@ -59,6 +59,7 @@ server {
    	root        /home/'.$user.'/public_html;
    	autoindex   off;
    	index       index.php index.html index.htm;
+   	include /etc/nginx/reqad-error-pages.conf;
 
     # Rocket-Nginx configuration
     # include rocket-nginx/conf.d/default.conf;
@@ -80,10 +81,23 @@ server {
 
         try_files $uri $uri/ /index.php$is_args$args;
 
+        # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
+        location ~ /\. {
+            deny all;
+        }
+
+        # Deny access to any files with a .php extension in the uploads directory
+        # Works in sub-directory installs and also in multisite network
+        # Must stay ABOVE the PHP handler: nested regex locations match in file
+        # order, so placed after `location ~ \.php$` this deny never fired.
+        location ~* /(?:uploads|files)/.*\.php$ {
+            deny all;
+        }
+
         location ~ \.php$ {
             try_files                   $uri =404;
             fastcgi_split_path_info     ^(.+\.php)(/.+)$;
-            fastcgi_intercept_errors    on;
+            fastcgi_intercept_errors    off;
 
             #NOTE: You should have "cgi.fix_pathinfo = 0;" in php.ini
             include         /etc/nginx/fastcgi_params;
@@ -117,17 +131,6 @@ server {
     	# location = /2x {
         #	return 200;
     	# }
-
-        # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
-        location ~ /\. {
-            deny all;
-        }
-
-        # Deny access to any files with a .php extension in the uploads directory
-        # Works in sub-directory installs and also in multisite network
-        location ~* /(?:uploads|files)/.*\.php$ {
-            deny all;
-        }
     }
 }
 ';
@@ -211,7 +214,7 @@ if($errmsg=='') {
         if(trim(shell_exec('dig +short a www.'.$domain))==$IP)
             $domain_www = true;
 
-        /* Optional message-queue token (set by create_account.php) — the script
+        /* Optional message-queue token (set by account_create()) — the script
            posts the issuance result to messages.db under it so the accounts list
            can show a toast when the cert is ready. Token is hex, safe to pass. */
         $ssltok = isset($sslmsgtoken) && $sslmsgtoken !== '' ? ' '.$sslmsgtoken : '';
@@ -232,7 +235,10 @@ if($errmsg=='') {
     }
 }
 
-if(php_sapi_name() == "cli") {
+/* Standalone CLI use prints the result and stops. account_create() (app/
+   functions/accounts.php) includes this template mid-function and needs control
+   back, so it defines REQAD_TEMPLATE_RETURN and reads $errmsg itself. */
+if(php_sapi_name() == "cli" && !defined('REQAD_TEMPLATE_RETURN')) {
 	echo $errmsg;
 	exit;
 }

@@ -10,6 +10,7 @@ shift 2>/dev/null
 
 if [ "${USER}" == "" ]; then
    echo "Usage: $(basename $0) user [-w] [-m] [-d] [--stage-only DIR] [--db-max-mb N]"
+   echo "                    [--scope nightly|manual] [--no-excludes]"
    echo "  -w website (files w/o mail, config, ssl, cron, meta, DNS zone)"
    echo "  -m email   (mail folder, exim/dovecot settings, email DNS records)"
    echo "  -d databases     (-f legacy alias for -w -m)"
@@ -18,6 +19,11 @@ if [ "${USER}" == "" ]; then
    echo "                    staged tree and the homedir straight into an ssh pipe"
    echo "  --db-max-mb N     do not dump databases larger than N MB; list them in"
    echo "                    databases/_streamed_separately.txt instead"
+   echo "  --scope S         which exclusion rules apply: manual (default) or nightly"
+   echo "                    (Backup page > Exclusions; see scripts/backup_excludes.sh)"
+   echo "  --no-excludes     ignore the exclusion rules and .nobackup markers - a full"
+   echo "                    copy; filesystems mounted in the home directory are still"
+   echo "                    skipped unless that is switched off on the Exclusions tab"
    exit 0
 fi
 
@@ -36,6 +42,8 @@ INCLUDE_MAIL=0
 INCLUDE_DB=0
 STAGE_ONLY=''
 DB_MAX_MB=0
+SCOPE=manual
+NO_EXCLUDES=''
 while [ $# -gt 0 ]; do
 	case "${1}" in
 		-w) INCLUDE_WEB=1 ;;
@@ -44,9 +52,12 @@ while [ $# -gt 0 ]; do
 		-f) INCLUDE_WEB=1; INCLUDE_MAIL=1 ;;
 		--stage-only) STAGE_ONLY="${2}"; shift ;;
 		--db-max-mb)  DB_MAX_MB="${2}"; shift ;;
+		--scope)      SCOPE="${2}"; shift ;;
+		--no-excludes) NO_EXCLUDES='--no-excludes' ;;
 	esac
 	shift
 done
+[ "${SCOPE}" == nightly ] || SCOPE=manual
 # default (no flag): website only, matching the previous "files only" default
 if [ ${INCLUDE_WEB} -eq 0 ] && [ ${INCLUDE_MAIL} -eq 0 ] && [ ${INCLUDE_DB} -eq 0 ]; then
 	INCLUDE_WEB=1
@@ -94,6 +105,20 @@ fi
 ROOT="${BUILD}/backup-${USER}"
 mkdir -p "${ROOT}"
 
+# ---- exclusions (Backup page > Exclusions, scripts/backup_excludes.sh) ------
+# excludes.txt at the archive root records everything left out, so restore.sh
+# can say what is missing instead of reporting a complete restore.
+EXCLUDES_HELPER="${REQAD}/scripts/backup_excludes.sh"
+EXCLUDED_REC="${ROOT}/excludes.txt"
+EXCLUDED_DBS=" "
+if [ -z "${NO_EXCLUDES}" ] && [ -x "${EXCLUDES_HELPER}" ]; then
+	EXCLUDED_DBS=" $(sudo "${EXCLUDES_HELPER}" dbs "${USER}" "${SCOPE}" 2>/dev/null | xargs) "
+fi
+record_excluded() {   # $1 kind  $2 what  $3 detail
+	[ -s "${EXCLUDED_REC}" ] || echo "# Left out of this backup. kind<TAB>what<TAB>detail" > "${EXCLUDED_REC}"
+	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "${EXCLUDED_REC}"
+}
+
 # helper: dump the DNS zone (or its email subset) if a provider is configured
 dump_dns() {   # $1 = out file, $2 = extra flag (--email-only or empty)
 	[ -z "${DOMAIN}" ] && return
@@ -112,7 +137,23 @@ if [ ${INCLUDE_DB} -eq 1 ]; then
 	echo -e "${WHITE}──────────────────────────────────────────────────────────────${NC}"
 
 	echo -n "Databases: "
-	DBS=$(${MYSQL} -Ns -e "show databases like \"${USER}\_%\"")
+	# The account's databases: "<user>_%" by name, plus the ones assigned to it
+	# on the Databases page (db_owners) -- minus any "<user>_" one assigned to a
+	# different account there, since an assignment wins over the prefix.
+	# Assigned names are re-checked against MySQL (the row can outlive the
+	# database) and against the identifier charset before reaching SQL.
+	OWNED_BY_OTHERS=" $(${SQLITE} "${DB_FILE}" "SELECT dbname FROM db_owners WHERE user<>'${USER}'" 2>/dev/null | xargs) "
+	ASSIGNED=''
+	for DB in $(${SQLITE} "${DB_FILE}" "SELECT dbname FROM db_owners WHERE user='${USER}'" 2>/dev/null); do
+		[[ "${DB}" =~ ^[A-Za-z0-9_]{1,64}$ ]] || continue
+		[ -n "$(${MYSQL} -Ns -e "SHOW DATABASES LIKE '${DB//_/\\_}'")" ] && ASSIGNED="${ASSIGNED} ${DB}"
+	done
+	DBS=''
+	for DB in $(${MYSQL} -Ns -e "show databases like \"${USER}\_%\"") ${ASSIGNED}; do
+		[[ "${OWNED_BY_OTHERS}" == *" ${DB} "* ]] && continue
+		DBS="${DBS} ${DB}"
+	done
+	DBS="${DBS# }"
 	if [ "${DBS}" == "" ]; then
 		echo '-'
 	else
@@ -126,6 +167,14 @@ if [ ${INCLUDE_DB} -eq 1 ]; then
 			# always rebuild the empty database.
 			read CS COL < <(${MYSQL} -Ns -e "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB}'")
 			echo "CREATE DATABASE IF NOT EXISTS \`${DB}\` CHARACTER SET ${CS:-utf8mb4} COLLATE ${COL:-utf8mb4_general_ci};" >> "${ROOT}/databases/_create_databases.sql"
+
+			# excluded on the Exclusions tab: like a --db-max-mb one, its CREATE
+			# DATABASE and grants are kept, so a restore rebuilds it empty
+			if [[ "${EXCLUDED_DBS}" == *" ${DB} "* ]]; then
+				echo "Skip database ${DB} (excluded from ${SCOPE} backups)"
+				EXCLUDED_DB_LIST="${EXCLUDED_DB_LIST} ${DB}"
+				continue
+			fi
 
 			# --db-max-mb: a big database is left out of the staged tree so the
 			# caller can stream its dump straight to the backup server instead of
@@ -147,11 +196,19 @@ if [ ${INCLUDE_DB} -eq 1 ]; then
 			fi
 		done
 
+		# restore.sh re-creates the assignment from this list
+		for DB in ${ASSIGNED}; do echo "${DB}"; done > "${ROOT}/databases/_assigned.txt"
+		[ -s "${ROOT}/databases/_assigned.txt" ] || rm -f "${ROOT}/databases/_assigned.txt"
+
 		# Grants scoped to THIS account's databases only (the old wp_/wc_ grep
 		# leaked grants from other accounts). Find every grantee that holds a
-		# privilege on a <user>_% database and export its CREATE USER + GRANTs.
+		# privilege on a <user>_% or an assigned database and export its
+		# CREATE USER + GRANTs. mysql.db holds an assigned name as given (foo_db)
+		# or LIKE-escaped (foo\_db, phpMyAdmin), so it is matched both ways.
+		DB_IN="''"   # never empty: IN () is a syntax error
+		for DB in ${ASSIGNED}; do DB_IN="${DB_IN},'${DB}','${DB//_/\\\\_}'"; done
 		: > "${ROOT}/databases/_grants.sql"
-		${MYSQL} -Ns -e "SELECT DISTINCT User, Host FROM mysql.db WHERE Db LIKE '${USER}\_%'" | \
+		${MYSQL} -Ns -e "SELECT DISTINCT User, Host FROM mysql.db WHERE Db LIKE '${USER}\_%' OR Db IN (${DB_IN})" | \
 		while IFS=$'\t' read -r GU GH; do
 			[ "${GU}" == "" ] && continue
 			echo "-- ${GU}@${GH}" >> "${ROOT}/databases/_grants.sql"
@@ -177,7 +234,9 @@ if [ ${INCLUDE_WEB} -eq 1 ]; then
 
 	# ---- SSL certificates -------------------------------------------------
 	mkdir -p "${ROOT}/ssl"
-	if [ -d "/etc/letsencrypt/live/${DOMAIN}" ]; then
+	# -n first: with no domain (a half-created account) the path is live/ itself,
+	# and every other domain's certificate AND private key would be copied in
+	if [ -n "${DOMAIN}" ] && [ -d "/etc/letsencrypt/live/${DOMAIN}" ]; then
 		# -L dereferences the live/ symlinks so the real cert + key are captured
 		sudo cp -rL "/etc/letsencrypt/live/${DOMAIN}" "${ROOT}/ssl/letsencrypt-${DOMAIN}"
 	fi
@@ -199,6 +258,10 @@ if [ ${INCLUDE_WEB} -eq 1 ]; then
 	getent group  "${USER}" > "${ROOT}/meta/group"
 	sudo grep "^${USER}:" /etc/shadow > "${ROOT}/meta/shadow" 2>/dev/null
 	${SQLITE} "${DB_FILE}" "SELECT id, user, domain, disk_quota, has_email, status, created_at, dkim_selector FROM accounts WHERE user='${USER}'" > "${ROOT}/meta/account.tsv" 2>/dev/null
+	# the account's own exclusion rules ride along so a restored account keeps
+	# them (the server-wide '*' rules belong to the server, not the account)
+	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO backup_excludes (user,kind,pattern,scope,note,created) VALUES ('||quote(user)||','||quote(kind)||','||quote(pattern)||','||quote(scope)||','||quote(note)||','||created||');' FROM backup_excludes WHERE user='${USER}'" > "${ROOT}/meta/backup_excludes.sql" 2>/dev/null
+	[ -s "${ROOT}/meta/backup_excludes.sql" ] || rm -f "${ROOT}/meta/backup_excludes.sql"
 
 	# ---- full DNS zone dump ----------------------------------------------
 	dump_dns "${ROOT}/dns/zone.json"
@@ -255,6 +318,25 @@ if [ ${INCLUDE_MAIL} -eq 1 ]; then
 fi
 
 # ===========================================================================
+# What the homedir tar leaves out — written for BOTH the local tarball below and
+# backup_remote.sh, which reads ${BUILD}/.tar-excludes + .tar-flags after a
+# --stage-only run. Outside ${ROOT}, so they are not part of the archive.
+# ===========================================================================
+: > "${BUILD}/.tar-excludes"; : > "${BUILD}/.tar-flags"
+if [ ${INCLUDE_HOME} -eq 1 ] && [ -x "${EXCLUDES_HELPER}" ]; then
+	sudo "${EXCLUDES_HELPER}" build "${USER}" "${SCOPE}" "${BUILD}" "${EXCLUDED_REC}" ${NO_EXCLUDES}
+	sudo chown "$(id -u):$(id -g)" "${BUILD}/.tar-excludes" "${BUILD}/.tar-flags" 2>/dev/null
+	[ -f "${EXCLUDED_REC}" ] && sudo chown "$(id -u):$(id -g)" "${EXCLUDED_REC}"
+fi
+for DB in ${EXCLUDED_DB_LIST}; do
+	record_excluded db "${DB}" "${SCOPE} exclusion - restored empty"
+done
+if [ -s "${EXCLUDED_REC}" ]; then
+	echo "Excluded from this backup:"
+	grep -v '^#' "${EXCLUDED_REC}" | sed 's/^/  /'
+fi
+
+# ===========================================================================
 # summary.txt — web stack + versions (best effort)
 # ===========================================================================
 {
@@ -289,7 +371,10 @@ fi
 	echo
 	if [ ${INCLUDE_HOME} -eq 1 ]; then
 		echo -n "Homedir usage: "
-		sudo du -skh "/home/${USER}" 2>/dev/null | awk '{print $1}'
+		sudo du -skhx "/home/${USER}" 2>/dev/null | awk '{print $1}'
+	fi
+	if [ -s "${EXCLUDED_REC}" ]; then
+		echo "Excluded: $(grep -vc '^#' "${EXCLUDED_REC}") item(s), listed in excludes.txt"
 	fi
 	if [ ${INCLUDE_DB} -eq 1 ] && [ "${DBS}" != "" ]; then
 		echo "Databases: $(echo ${DBS} | xargs echo | sed 's/ /, /g')"
@@ -319,7 +404,7 @@ if [ ${INCLUDE_HOME} -eq 1 ]; then
 	echo -e "${WHITE}Backup homedir files${NC}"
 	echo -e "${WHITE}──────────────────────────────────────────────────────────────${NC}"
 	echo -n "Disk usage: "
-	sudo du -skh "/home/${USER}"
+	sudo du -skhx "/home/${USER}"
 	echo -n "Creating archive $(basename ${ARCHIVE}) "
 
 	# /home/<user> is streamed straight into backup-<user>/homedir/ via --transform
@@ -329,11 +414,15 @@ if [ ${INCLUDE_HOME} -eq 1 ]; then
 	#   website+email  → full homedir
 	#   website only   → homedir excluding mail/
 	#   email only     → only mail/  (into homedir/mail/)
-	EXCLUDES=()
+	# --anchored comes FIRST: it applies to the excludes after it, and every one
+	# of them is "<user>/..." - unanchored, "<user>/mail" also dropped e.g.
+	# public_html/<user>/mail, and a rule could reach the staged tree.
+	mapfile -t TAR_FLAGS < <(grep -xE -- '--exclude-tag=\.nobackup|--exclude-caches' "${BUILD}/.tar-flags" 2>/dev/null)
+	EXCLUDES=( --anchored --exclude-from="${BUILD}/.tar-excludes" "${TAR_FLAGS[@]}" )
 	TRANSFORMS=( --transform "s,^${USER}/,backup-${USER}/homedir/,SH" --transform "s,^${USER}\$,backup-${USER}/homedir,SH" )
 	HOMESRC=( -C /home "${USER}" )
 	if [ ${INCLUDE_WEB} -eq 1 ] && [ ${INCLUDE_MAIL} -eq 0 ]; then
-		EXCLUDES=( --exclude "${USER}/mail" )
+		EXCLUDES+=( --exclude "${USER}/mail" )
 	elif [ ${INCLUDE_WEB} -eq 0 ] && [ ${INCLUDE_MAIL} -eq 1 ]; then
 		TRANSFORMS=( --transform "s,^${USER}/mail/,backup-${USER}/homedir/mail/,SH" --transform "s,^${USER}/mail\$,backup-${USER}/homedir/mail,SH" )
 		HOMESRC=( -C /home "${USER}/mail" )

@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 /* Generate the static mail-client autoconfiguration files served on every
  * hosted vhost.
@@ -75,13 +75,33 @@ function ac_cert_file($domain) {
 	return '';
 }
 
-/* Every name that certificate is valid for, lowercased. */
+/* Would a mail client accept this certificate? It must chain to the system
+   trust store and be in date. The file is also handed in as the untrusted
+   pool, since fullchain.pem carries the intermediates after the leaf.
+
+   Without this, a self-signed placeholder (the default vhost cert) counted as
+   "covering" its CN, and the domain was advertised to clients that then refuse
+   to connect. */
+function ac_cert_trusted($pem, $file) {
+	$bundle = '/etc/pki/tls/certs/ca-bundle.crt';
+	if(is_file($bundle))
+		return @openssl_x509_checkpurpose($pem, X509_PURPOSE_SSL_SERVER, array($bundle), $file) === true;
+
+	/* no trust store to check against: at least reject self-signed */
+	$info = @openssl_x509_parse($pem);
+	return is_array($info) && isset($info['subject'], $info['issuer']) && $info['subject'] != $info['issuer'];
+}
+
+/* Every name that certificate is valid for, lowercased. An untrusted
+   (self-signed, expired, broken chain) certificate is valid for nothing, so the
+   domain falls through to the server hostname. */
 function ac_cert_names($domain) {
 	$file = ac_cert_file($domain);
 	if($file == '') return array();
 
 	$pem = (string)@file_get_contents($file);
 	if(strpos($pem, '-----BEGIN CERTIFICATE-----') === false) return array();
+	if(!ac_cert_trusted($pem, $file)) return array();
 
 	$info = @openssl_x509_parse($pem);
 	if(!is_array($info)) return array();
@@ -114,7 +134,8 @@ function ac_cert_covers($names, $name) {
  *   1. the autoconfig-hostname setting, when the admin has forced one
  *   2. mail.<domain>, when the domain's certificate covers it
  *   3. <domain> itself, when the certificate covers it
- *   4. this server's hostname, which always has one
+ *   4. this server's hostname, which always has one -- also where a domain
+ *      with no certificate, or a self-signed/expired one, ends up
  *
  * update_email_sni gives dovecot a local_name block and exim an sni_certs.db
  * entry for both mail.<domain> and <domain>, so 2 and 3 are served correctly. */

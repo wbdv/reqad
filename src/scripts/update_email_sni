@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 chdir("/usr/local/reqad/scripts/");
 if(php_sapi_name() != "cli" || posix_getuid() != 0) {

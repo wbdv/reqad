@@ -85,9 +85,20 @@ function valid_domain($d) {
 	return preg_match('/^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)*\.[a-z]{2,}$/', $d) === 1;
 }
 
-/* Local part of an email address (the bit before the @). */
+/* Local part of an email address (the bit before the @).
+   The dot rules are not pedantry: the local part is concatenated into paths such
+   as /etc/exim/autoreply/<domain>/<user>, so a mailbox literally named ".." made
+   that resolve to the parent directory. No slash is allowed through, so it could
+   never climb more than one level, but "." and ".." are not addresses anyone can
+   send mail to either -- and RFC 5321 dot-atom already forbids a leading dot, a
+   trailing dot and two dots in a row. Rejecting them here closes both at once. */
 function valid_email_user($u) {
-	return preg_match('/^[A-Za-z0-9\+\-_\.]{1,64}$/', (string)$u) === 1;
+	$u = (string)$u;
+	if (preg_match('/^[A-Za-z0-9\+\-_\.]{1,64}$/', $u) !== 1)
+		return false;
+	if ($u[0] === '.' || substr($u, -1) === '.' || strpos($u, '..') !== false)
+		return false;
+	return true;
 }
 
 /* Full email address, for forwarder destinations. */
@@ -207,6 +218,149 @@ function valid_mysql_identifier($s) {
 }
 
 /* ===========================================================================
+   Databases page: system databases, optimize, remote access
+   ===========================================================================
+
+   Remote access is per (database, user, IP). MariaDB matches accounts on
+   (User, Host), so "wiki_user may connect from 203.0.113.7" is a separate
+   account wiki_user@203.0.113.7: it is cloned from wiki_user@localhost (same
+   credentials, taken from SHOW CREATE USER) and granted only the one database.
+   The firewall side is scripts/sync_mysql_remote_fw.sh, which rebuilds the
+   tagged csf.allow rules from the account list after every change.
+*/
+
+/* Databases the panel never lists or touches. */
+function db_hidden_databases() {
+	return array('information_schema', 'mysql', 'performance_schema', 'phpmyadmin', 'roundcube', 'sys');
+}
+
+/* A database the page manages: valid name, exists, not a system database. */
+function db_is_managed($dbname) {
+	return valid_mysql_identifier($dbname)
+		&& !in_array($dbname, db_hidden_databases(), true)
+		&& in_array($dbname, mysql_rows('SHOW DATABASES'), true);
+}
+
+/* Hosts that count as local, i.e. never "remote access". */
+function mysql_local_hosts_sql() {
+	return "('localhost','127.0.0.1','::1')";
+}
+
+/* SQL matching mysql.db.Db for $dbname. A grant made with the `_` wildcard
+   escaped (phpMyAdmin does this) is stored as wiki\_db, the panel's as wiki_db. */
+function mysql_db_match_sql($dbname) {
+	return 'Db IN ('.mysql_quote($dbname).', '.mysql_quote(str_replace('_', '\\_', $dbname)).')';
+}
+
+/* Literal IPv4/IPv6 address -> canonical text form, or false. IPv6 goes through
+   inet_ntop because MariaDB compares the client address against Host as text. */
+function db_remote_normalize_ip($ip) {
+	$ip = trim((string)$ip);
+	if (filter_var($ip, FILTER_VALIDATE_IP) === false)
+		return false;
+	$ip = inet_ntop(inet_pton($ip));
+	if (in_array($ip, array('127.0.0.1', '::1'), true))
+		return false;
+	return $ip;
+}
+
+/* Users holding a localhost grant on $dbname. */
+function db_local_users($dbname) {
+	return mysql_rows('SELECT DISTINCT User FROM mysql.db WHERE '.mysql_db_match_sql($dbname).
+		" AND Host = 'localhost' AND User <> '' ORDER BY User");
+}
+
+/* Remote hosts $dbuser is granted $dbname from. */
+function db_remote_hosts($dbname, $dbuser) {
+	return mysql_rows('SELECT DISTINCT Host FROM mysql.db WHERE '.mysql_db_match_sql($dbname).
+		' AND User = '.mysql_quote($dbuser).' AND Host NOT IN '.mysql_local_hosts_sql().' ORDER BY Host');
+}
+
+/* Grant $dbuser remote access to $dbname from $ip. Arguments must already be
+   validated. Returns '' on success or the error text. */
+function db_remote_add($dbname, $dbuser, $ip) {
+	$acct   = mysql_quote($dbuser).'@'.mysql_quote($ip);
+	$exists = mysql_rows('SELECT COUNT(*) FROM mysql.user WHERE User = '.mysql_quote($dbuser).' AND Host = '.mysql_quote($ip));
+	if (($exists[0] ?? '0') === '0') {
+		// Reuse the local account's authentication clause verbatim, so the
+		// remote login takes the same password whatever the auth plugin.
+		$create = mysql_rows('SHOW CREATE USER '.mysql_quote($dbuser)."@'localhost'");
+		$prefix = 'CREATE USER `'.$dbuser.'`@`localhost`';
+		$stmt   = $create[0] ?? '';
+		if (strpos($stmt, $prefix) !== 0)
+			return 'Cannot read the credentials of '.$dbuser.'@localhost.';
+		$out = trim(mysql_exec('CREATE USER '.$acct.substr($stmt, strlen($prefix))));
+		if ($out !== '')
+			return $out;
+	}
+	$out = trim(mysql_exec('GRANT ALL PRIVILEGES ON `'.$dbname.'`.* TO '.$acct));
+	return $out;
+}
+
+/* Revoke $dbuser's remote access to $dbname from $ip, dropping the remote
+   account once nothing else is granted to it. Returns '' or the error text. */
+function db_remote_remove($dbname, $dbuser, $ip) {
+	$acct = mysql_quote($dbuser).'@'.mysql_quote($ip);
+	$out  = trim(mysql_exec('REVOKE ALL PRIVILEGES ON `'.$dbname.'`.* FROM '.$acct));
+	if ($out !== '')
+		return $out;
+	mysql_drop_user_if_unused($dbuser, $ip);
+	return '';
+}
+
+/* DROP USER $user@$host when it holds no database or table grant. Grants on
+   $ignore_db are not counted (DROP DATABASE leaves its mysql.db rows behind). */
+function mysql_drop_user_if_unused($user, $host, $ignore_db = '') {
+	$u = mysql_quote($user);
+	$h = mysql_quote($host);
+	$left = mysql_rows('SELECT (SELECT COUNT(*) FROM mysql.db WHERE User = '.$u.' AND Host = '.$h.
+		($ignore_db !== '' ? ' AND NOT '.mysql_db_match_sql($ignore_db) : '').')'.
+		' + (SELECT COUNT(*) FROM mysql.tables_priv WHERE User = '.$u.' AND Host = '.$h.
+		($ignore_db !== '' ? ' AND NOT '.mysql_db_match_sql($ignore_db) : '').')');
+	if (($left[0] ?? '') !== '0')
+		return false;
+	mysql_exec('DROP USER IF EXISTS '.$u.'@'.$h);
+	return true;
+}
+
+/* Rebuild the csf MySQL allow rules. Returns nocsf|unchanged|updated|error. */
+function mysql_remote_fw_sync() {
+	$out = trim((string)shell_exec('sudo '._PATH.'/scripts/sync_mysql_remote_fw.sh 2>/dev/null'));
+	return $out !== '' ? $out : 'error';
+}
+
+/* Can remote clients reach MariaDB at all? Returns
+   port, listening (not bound to loopback / skip_networking),
+   firewall ('csf' or ''), port_public (port already open to everyone in csf). */
+function mysql_remote_status() {
+	$st  = array('port' => 3306, 'listening' => false, 'bind' => '', 'firewall' => '', 'port_public' => false);
+	$row = mysql_rows("SELECT @@port, IFNULL(@@bind_address, ''), @@skip_networking");
+	if ($row) {
+		$f = explode("\t", $row[0]);
+		$st['port']      = (int)$f[0];
+		$st['bind']      = $f[1] ?? '';
+		$st['listening'] = ($f[2] ?? '1') === '0'
+			&& !in_array($st['bind'], array('127.0.0.1', 'localhost', '::1'), true);
+	}
+	if (trim((string)shell_exec('sudo test -f /etc/csf/csf.conf && echo 1')) === '1') {
+		$st['firewall'] = 'csf';
+		$tcp_in = (string)shell_exec("sudo grep -E '^TCP_IN *=' /etc/csf/csf.conf");
+		if (preg_match('/"([^"]*)"/', $tcp_in, $m))
+			$st['port_public'] = in_array((string)$st['port'], array_map('trim', explode(',', $m[1])), true);
+	}
+	return $st;
+}
+
+/* OPTIMIZE every table of $dbname (validated by the caller). mysqlcheck does
+   the per-table work; InnoDB tables are rebuilt (recreate + analyze). */
+function db_optimize($dbname) {
+	$out    = (string)shell_exec('sudo mysqlcheck --optimize '.escapeshellarg($dbname).' 2>&1');
+	$tables = preg_match_all('/^'.preg_quote($dbname, '/').'\.\S+/m', $out);
+	$errors = preg_match_all('/^(error\s*:|mysqlcheck: Got error)/mi', $out);
+	return array('output' => $out, 'tables' => $tables, 'errors' => $errors);
+}
+
+/* ===========================================================================
    Writing values into php.ini / opcache.ini / apcu.ini with sed
    ===========================================================================
 
@@ -269,6 +423,259 @@ function setting_put($name, $value) {
 	return $ok !== false;
 }
 
+/* Read one key from the settings table; $default when the row is missing. */
+function setting_get($name, $default = '') {
+	global $db;
+	$stmt = $db->prepare('SELECT value FROM settings WHERE name = :name');
+	if (!$stmt)
+		return $default;
+	$stmt->bindValue(':name', (string)$name, SQLITE3_TEXT);
+	$res = $stmt->execute();
+	$row = $res ? $res->fetchArray(SQLITE3_NUM) : false;
+	$stmt->close();
+	return ($row !== false && $row[0] !== null) ? (string)$row[0] : $default;
+}
+
+/* ===========================================================================
+   Settings page — outgoing mail + nightly self-update
+   =========================================================================== */
+
+/* scripts/forward_root_mail.php silently drops the message when there is no
+   SMTP server, so forwarding is only worth enabling once one is set. */
+function smtp_configured() {
+	return setting_get('smtp_server') !== '' && setting_get('smtp_from') !== '';
+}
+
+/* Read from /etc/aliases rather than a stored flag, so the checkbox reflects
+   what exim will actually do. */
+function root_mail_forward_active() {
+	$aliases = @file_get_contents('/etc/aliases') ?: '';
+	return (bool)preg_match('/^root:.*forward_root_mail/mi', $aliases);
+}
+
+/* The nightly `dnf update 'reqad*'` (scripts/auto_update.sh). On/off is read
+   back from /etc/crontab, like the nightly remote backup, so the switch shows
+   what cron will actually do. The time is also kept in the settings table
+   (auto-update-time, "H:M"), so it survives the entry being switched off. The
+   last run comes from the start/end markers the script writes to its log. */
+/* Dashboard version label: "1.0.47 (R8, Sep 12, 2026)" from the installed
+   package — release number with the dist tag stripped, plus the build date.
+   A source checkout has no reqad package, so fall back to version.php's date. */
+function reqad_version_label($reqad_version) {
+	$out = trim((string)shell_exec("rpm -q --queryformat '%{VERSION}|%{RELEASE}|%{BUILDTIME}' reqad 2>/dev/null"));
+	if (preg_match('/^([\d.]+)\|(\d+)[^|]*\|(\d+)$/', $out, $m)) {
+		return array($m[1], 'R' . $m[2] . ', ' . date('M j, Y', (int)$m[3]));
+	}
+	return array($reqad_version[0], date('M j, Y', strtotime($reqad_version[1])));
+}
+
+function auto_update_status() {
+	/* spread the default minute per host, so installs left on the default do
+	   not all hit the repo in the same second */
+	$st = array('on' => false, 'hour' => '4', 'min' => (string)(crc32(gethostname()) % 60),
+	            'line' => '', 'last' => null, 'installed' => false);
+	/* a source checkout (dev boxes) has no reqad package for dnf to update; the
+	   add-ons it may carry (reqad-clamav…) do not make it an RPM install */
+	$st['installed'] = trim((string)shell_exec('rpm -q --quiet reqad && echo 1')) === '1';
+	if (preg_match('/^(\d{1,2}):(\d{1,2})$/', setting_get('auto-update-time'), $m)) {
+		$st['hour'] = $m[1];
+		$st['min']  = $m[2];
+	}
+
+	$line = trim((string)shell_exec("sudo grep -F 'auto_update.sh' /etc/crontab 2>/dev/null | grep -v '^\\s*#' | head -1"));
+	if ($line !== '' && preg_match('/^\s*(\d+)\s+(\d+)\s/', $line, $m)) {
+		$st['on']   = true;
+		$st['line'] = $line;
+		$st['min']  = $m[1];
+		$st['hour'] = $m[2];
+	}
+
+	/* only the tail matters; a run is a few KB */
+	$log = _PATH.'/log/auto_update.log';
+	$size = @filesize($log);
+	if ($size) {
+		$fh = @fopen($log, 'r');
+		if ($fh) {
+			fseek($fh, max(0, $size - 65536));
+			$tail = (string)stream_get_contents($fh);
+			fclose($fh);
+			$start = preg_match_all('/^=== (\S+ \S+) start$/m', $tail, $s) ? end($s[1]) : '';
+			if (preg_match_all('/^=== (\S+ \S+) end rc=(\d+) updated=(.*)$/m', $tail, $e)) {
+				$i = count($e[1]) - 1;
+				$st['last'] = array(
+					'time'    => $e[1][$i],
+					'rc'      => (int)$e[2][$i],
+					'updated' => $e[3][$i] === '' ? array() : explode(',', trim($e[3][$i])),
+					'running' => false,
+				);
+			}
+			/* a start with no end after it: running now, or killed mid-run */
+			if ($start !== '' && ($st['last'] === null || strcmp($start, $st['last']['time']) > 0))
+				$st['last'] = array('time' => $start, 'rc' => 0, 'updated' => array(), 'running' => true);
+		}
+	}
+	return $st;
+}
+
+/* Add or remove the auto_update.sh line in /etc/crontab. Same mechanics as
+   remote_backup_cron.php — strip our line, then append the new one — so the
+   entry also shows on the Cron page. Not /etc/cron.d/reqad: that file is an RPM
+   %config, and the very update this runs would fight us for it. Returns '' on
+   success, otherwise the error. */
+function auto_update_cron_write($enabled, $hour, $min) {
+	$script = '/usr/local/reqad/scripts/auto_update.sh';
+	/* the script logs to log/auto_update.log itself */
+	$line   = (int)$min.' '.(int)$hour.' * * * root '.$script.' > /dev/null 2>&1';
+
+	/* scratch file in /etc, not /tmp — see remote_backup_cron.php */
+	$err = '';
+	$strip = 'grep -vF '.escapeshellarg($script).' /etc/crontab > /etc/crontab.reqad_new'
+	       . ' && mv -f /etc/crontab.reqad_new /etc/crontab';
+	exec('sudo -n bash -c '.escapeshellarg($strip), $o, $rc);
+	if ($rc !== 0) {
+		$err = 'Could not update /etc/crontab.';
+	} elseif ($enabled) {
+		exec('echo '.escapeshellarg($line).' | sudo -n tee --append /etc/crontab > /dev/null', $o2, $rc2);
+		if ($rc2 !== 0) $err = 'Could not write the cron entry.';
+	}
+	exec('sudo -n chmod 644 /etc/crontab; sudo -n chown root:root /etc/crontab');
+	return $err;
+}
+
+/* dnf-automatic: system-wide unattended updates, on its own systemd timer (the
+   package's OnCalendar sets the time, not us). Four timer variants ship; any of
+   them enabled counts as on, and 'installs' says whether that variant actually
+   applies updates — dnf-automatic.timer only does when automatic.conf says
+   apply_updates = yes. */
+function dnf_automatic_status() {
+	$st = array('installed' => false, 'on' => false, 'timer' => '', 'installs' => false,
+	            'next' => '', 'last' => '');
+	$st['installed'] = trim((string)shell_exec('rpm -q --quiet dnf-automatic && echo 1')) === '1';
+	if (!$st['installed'])
+		return $st;
+
+	$out = (string)shell_exec('systemctl show -p Id -p UnitFileState -p ActiveState'
+		.' -p NextElapseUSecRealtime -p LastTriggerUSec'
+		.' dnf-automatic-install.timer dnf-automatic.timer dnf-automatic-download.timer dnf-automatic-notifyonly.timer 2>/dev/null');
+	foreach (preg_split('/\n\s*\n/', trim($out)) as $block) {
+		$u = array();
+		foreach (explode("\n", $block) as $kv) {
+			$p = strpos($kv, '=');
+			if ($p !== false) $u[substr($kv, 0, $p)] = trim(substr($kv, $p + 1));
+		}
+		if (($u['UnitFileState'] ?? '') !== 'enabled' && ($u['ActiveState'] ?? '') !== 'active')
+			continue;
+		$st['on']    = true;
+		$st['timer'] = $u['Id'] ?? '';
+		$st['next']  = $u['NextElapseUSecRealtime'] ?? '';
+		$st['last']  = $u['LastTriggerUSec'] ?? '';
+		break;
+	}
+
+	if ($st['timer'] === 'dnf-automatic-install.timer')
+		$st['installs'] = true;
+	elseif ($st['timer'] === 'dnf-automatic.timer') {
+		$conf = @file_get_contents('/etc/dnf/automatic.conf') ?: '';
+		$st['installs'] = (bool)preg_match('/^\s*apply_updates\s*=\s*(yes|true|1|on)\s*$/mi', $conf);
+	}
+	return $st;
+}
+
+/* Turn dnf-automatic on or off. On enables dnf-automatic-install.timer, which
+   installs regardless of automatic.conf, installing the package first if it is
+   missing. Off disables every variant, so it means off whichever one was used. */
+function dnf_automatic_set($enabled) {
+	if ($enabled) {
+		if (trim((string)shell_exec('rpm -q --quiet dnf-automatic && echo 1')) !== '1') {
+			exec('sudo -n dnf -y install dnf-automatic 2>&1', $o, $rc);
+			if ($rc !== 0) return 'Could not install dnf-automatic.';
+		}
+		exec('sudo -n systemctl enable --now dnf-automatic-install.timer 2>&1', $o, $rc);
+		return $rc === 0 ? '' : 'Could not enable dnf-automatic-install.timer.';
+	}
+	exec('sudo -n systemctl disable --now dnf-automatic-install.timer dnf-automatic.timer'
+		.' dnf-automatic-download.timer dnf-automatic-notifyonly.timer 2>&1', $o, $rc);
+	return $rc === 0 ? '' : 'Could not disable the dnf-automatic timers.';
+}
+
+/* The main form on /settings/ ($p = its fields): welcome screen, contact email +
+   root mail forwarding, the two automatic-update switches, telemetry. Returns
+   array(type, message) for msg_redirect(). Run by modules/settings.php, and by
+   the page's modals when the main form had unsaved changes — see
+   settings_modal_redirect(). */
+function settings_main_save($p) {
+	$email   = trim((string)($p['email'] ?? ''));
+	$forward = isset($p['root_mail_forward']);
+
+	if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL))
+		return array('error', 'Settings were not saved: that email address is not valid.');
+
+	setting_put('email', $email);
+	setting_put('welcome_dismissed', isset($p['show_welcome']) ? '0' : '1');
+	setting_put('telemetry', isset($p['telemetry']) ? '1' : '0');
+
+	/* only when the field was posted: the modals re-post just the main form's
+	   changed fields, and an absent key must not wipe the stored one */
+	if (isset($p['pagespeed_key'])) {
+		$psk = trim((string)$p['pagespeed_key']);
+		if ($psk !== '' && !preg_match('/^[A-Za-z0-9_-]{20,100}$/', $psk))
+			return array('error', 'Settings were not saved: that PageSpeed Insights API key does not look valid.');
+		setting_put('pagespeed-api-key', $psk);
+	}
+
+	/* forward_root_mail.php drops the message when there is no address or no SMTP
+	   server, so enabling it then would lose root's mail instead of forwarding it */
+	$warn = '';
+	if ($forward && $email === '')
+		$forward = false;
+	if ($forward && !smtp_configured()) {
+		$forward = false;
+		$warn = ' Root mail forwarding was not enabled: configure a sending method first.';
+	}
+
+	/* Only touch /etc/aliases when the state changes: the script deletes every
+	   root: line, so running "disable" on each save would also wipe a root alias
+	   that was set by hand. */
+	if ($forward !== root_mail_forward_active())
+		shell_exec('sudo -n /usr/local/reqad/scripts/setup_root_mail_alias.sh '.escapeshellarg($forward ? 'enable' : 'disable').' 2>&1');
+
+	/* The update switches, likewise only when they change: an unrelated save must
+	   not rewrite /etc/crontab or restart a timer. Both are read back from the
+	   system (crontab, systemd), so "changed" is against what is really there. */
+	$errs = array();
+	$upd = auto_update_status();
+	/* not an RPM install: the switch is disabled (so never posted) — leave the
+	   crontab alone rather than read that as "off" */
+	if ($upd['installed'] && isset($p['auto_update']) !== $upd['on'])
+		$errs[] = auto_update_cron_write(isset($p['auto_update']), $upd['hour'], $upd['min']);
+	if (isset($p['dnf_automatic']) !== dnf_automatic_status()['on'])
+		$errs[] = dnf_automatic_set(isset($p['dnf_automatic']));
+	$errs = array_filter($errs);
+	if ($errs)
+		return array('error', 'Settings were saved, but: '.implode(' ', $errs));
+
+	if ($warn !== '')
+		return array('warning', 'Settings were saved.'.$warn);
+	return array('success', 'Settings were saved.');
+}
+
+/* The modals on /settings/ (sending method, Reqad update time) are forms of
+   their own, so submitting one reloads the page — which used to drop anything
+   changed but not yet saved in the main form. The page now posts those changes
+   along as main[...], only when there are any. Save them after the modal's own
+   settings, which they may depend on (forwarding root mail needs a sending
+   method), then redirect with both outcomes in one message. */
+function settings_modal_redirect($url, $message, $type) {
+	if (isset($_POST['main']) && is_array($_POST['main'])) {
+		list($t, $m) = settings_main_save($_POST['main']);
+		$message .= ' '.$m;
+		$rank = array('success' => 0, 'info' => 0, 'warning' => 1, 'error' => 2);
+		if ($rank[$t] > ($rank[$type] ?? 0))
+			$type = $t;
+	}
+	msg_redirect($url, $message, $type);
+}
+
 /* ===========================================================================
    Remote backup (scripts/backup_remote.sh) — configuration + ssh plumbing
    ===========================================================================
@@ -305,9 +712,22 @@ function remote_backup_config() {
 	if ($cfg['key']  === '' && isset($backup_sshkey))  $cfg['key']  = (string)$backup_sshkey;
 
 	if ($cfg['port']  === '') $cfg['port']  = '22';
-	if ($cfg['keep']  === '') $cfg['keep']  = '6';
+	if ($cfg['keep']  === '') $cfg['keep']  = '4';
+	/* backup_remote.sh's retention ladder has 9 rungs; older installs saved
+	   "newest N" values above that, and the script clamps them the same way */
+	if (ctype_digit($cfg['keep']) && (int)$cfg['keep'] > 9) $cfg['keep'] = '9';
 	if ($cfg['dbmax'] === '') $cfg['dbmax'] = '1024';
 	return $cfg;
+}
+
+/* What backup_remote.sh --keep N holds on to, one phrase per rung of its
+   KEEP_LADDER (keep the two in step). */
+function remote_backup_keep_rungs() {
+	return array(
+		'the newest backup', 'the 2nd newest', '1st of this month', '15th of this month',
+		'1st of last month', 'the 3rd newest', '15th of last month', 'the 4th newest',
+		'1st of the month before last',
+	);
 }
 
 function remote_backup_configured($cfg) {
@@ -361,7 +781,22 @@ function remote_backup_ssh($cfg, $remote_cmd, &$rc = null) {
 	$out = array();
 	$rc  = 0;
 	exec(remote_backup_ssh_cmdline($cfg, $remote_cmd).' 2>&1', $out, $rc);
+	/* csf rejects (DROP_OUT=REJECT → "refused") or drops (→ timeout) outbound
+	   traffic to ports missing from TCP_OUT — typically a custom ssh port. Open
+	   it and try once more; the helper is a no-op when the port is already open. */
+	if ($rc === 255 && preg_match('/Connection refused|timed out|No route to host/i', implode("\n", $out))
+	    && csf_open_tcp_out($cfg['port']) === 'updated') {
+		$out = array();
+		exec(remote_backup_ssh_cmdline($cfg, $remote_cmd).' 2>&1', $out, $rc);
+	}
 	return implode("\n", $out);
+}
+
+/* Make sure csf allows outgoing TCP to $port. Returns nocsf|unchanged|updated|error. */
+function csf_open_tcp_out($port) {
+	if (!ctype_digit((string)$port)) return 'error';
+	$out = trim((string)shell_exec('sudo -n '._PATH.'/scripts/csf_open_tcp_out.sh '.escapeshellarg((string)$port).' 2>/dev/null'));
+	return $out !== '' ? strtok($out, "\n") : 'error';
 }
 
 /*
@@ -514,6 +949,9 @@ function remote_backup_date_detail($cfg, $date) {
 				if ($f[2] === 'home_kb' && isset($f[3])) $acct[$u]['home_kb'] = (int)$f[3];
 				if ($f[2] === 'home' && isset($f[4]))    $acct[$u]['home'][$f[3]] = $f[4];
 				if ($f[2] === 'db'   && isset($f[5]))    $acct[$u]['db'][$f[3]] = array('kb'=>(int)$f[4], 'src'=>$f[5]);
+				/* excl <kind> <path> — what the archive leaves out; the path is the
+				   rest of the line, it may hold spaces */
+				if ($f[2] === 'excl' && isset($f[4]))    $acct[$u]['excl'][] = array('kind'=>$f[3], 'path'=>implode(' ', array_slice($f, 4)));
 				break;
 			case 'DBGZ':
 				/* ground truth for a backup taken before .index existed */
@@ -925,6 +1363,9 @@ function ajax_required_feature($action) {
 		'ajax-fm-extract'         => 'filemanager',
 		'ajax-fm-download'        => 'filemanager',
 		'ajax-restore-server-status' => 'backup',
+		'ajax-backup-exclude-preview' => 'backup',
+		'ajax-backup-exclude-setting' => 'backup',
+		'ajax-backup-exclude-suggest' => 'backup',
 		'ajax-terminal-target'    => 'terminal',
 	);
 	if (isset($map[$action]))
@@ -1912,8 +2353,8 @@ function wp_nginx_cache_enable($ini, $user, $domain, $docroot) {
 	$new = implode("\n", $out);
 
 	// Cache dir (nginx creates sublevels itself, but needs the root to exist+own).
-	shell_exec('sudo mkdir -p /var/cache/nginx/fcgi-'.escapeshellarg($zone));
-	shell_exec('sudo chown nginx:nginx /var/cache/nginx/fcgi-'.$zone.' 2>/dev/null');
+	// 0700: other accounts must not be able to read or plant cache entries.
+	shell_exec('sudo install -d -o nginx -g nginx -m 0700 /var/cache/nginx/fcgi-'.escapeshellarg($zone).' 2>/dev/null');
 
 	// Snapshot the pre-change vhost into the Advanced Config version history so the
 	// admin can roll back the cache injection from that panel's "Version history".
@@ -1993,10 +2434,53 @@ function wp_cron_marker($user) {
 	return '# reqad-wpcron-'.wp_cache_zone($user);
 }
 
+/* The full crontab line for the "Disable WP-Cron" system cron. Output goes to
+   ~/logs/cron.log (the account's own logs dir, created with the account) instead
+   of /dev/null, so a wp-cli that cannot start -- e.g. PHP dying on a broken
+   OPcache ini -- leaves a trace instead of silently running nothing. */
+function wp_cron_line($user, $docroot) {
+	return '*/2 * * * * /usr/local/bin/wp cron event run --due-now --path='.$docroot
+	     . ' >> /home/'.$user.'/logs/cron.log 2>&1 '.wp_cron_marker($user);
+}
+
+/* Run one wp-cli command as $user. Returns array('out' => string, 'rc' => int).
+   stderr is folded into the output and the exit status is kept, because PHP can
+   die BEFORE wp-cli runs at all: a bad OPcache ini (interned_strings_buffer not
+   fitting in memory_consumption) aborts every PHP process for that version at
+   startup. Reading only stdout made that look like an empty, successful run. */
+function wp_cli_run($user, $args) {
+	$out = (string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp '.$args.' 2>&1; echo "|rc:$?"');
+	$rc  = 255;
+	$pos = strrpos($out, '|rc:');
+	if($pos !== false) {
+		$rc  = (int)substr($out, $pos + 4);
+		$out = substr($out, 0, $pos);
+	}
+	return array('out' => rtrim($out), 'rc' => $rc);
+}
+
+/* Turn a failed wp_cli_run() into something the user can act on. Returns '' when
+   the command succeeded. */
+function wp_cli_error($r) {
+	if($r['rc'] === 0)
+		return '';
+	$out = $r['out'];
+	if(stripos($out, 'interned strings buffer') !== false || stripos($out, 'Insufficient shared memory') !== false)
+		return 'PHP itself cannot start on this server: OPcache is misconfigured. '
+		     . 'opcache.interned_strings_buffer must be well below opcache.memory_consumption. '
+		     . 'Fix it under PHP Settings, then restart php-fpm.';
+	if(stripos($out, 'Fatal Error') !== false || stripos($out, 'PHP Fatal') !== false)
+		return 'wp-cli could not start: '.trim((string)strtok($out, "\n"));
+	if(trim($out) === '')
+		return 'wp-cli failed (exit '.$r['rc'].') with no output.';
+	return trim($out);
+}
+
 /* Live state of the "Disable WP-Cron" option: 'on' | 'off'. Considered ON only
    when BOTH the DISABLE_WP_CRON constant is true AND our system cron is present. */
 function wp_wpcron_state($user, $docroot) {
-	$has = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config get DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>/dev/null'));
+	$get = wp_cli_run($user, 'config get DISABLE_WP_CRON --path='.escapeshellarg($docroot));
+	$has = $get['rc'] === 0 ? trim($get['out']) : '';
 	$const_on = in_array(strtolower($has), array('1', 'true'), true);
 	$cron_on  = ((int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg(wp_cron_marker($user)).' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null'))) > 0;
 	return ($const_on && $cron_on) ? 'on' : 'off';
@@ -2007,25 +2491,42 @@ function wp_wpcron_state($user, $docroot) {
 function wp_wpcron_enable($user, $docroot) {
 	$log = '';
 	// 1) Constant. `wp config set` updates in place if it already exists.
-	$has = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config has DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>/dev/null; echo $?'));
-	if(substr($has, -1) === '0')
+	$has = wp_cli_run($user, 'config has DISABLE_WP_CRON --path='.escapeshellarg($docroot));
+	if($has['rc'] === 0)
 		$log .= "DISABLE_WP_CRON already present in wp-config.php.\n";
-	$set = (string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config set DISABLE_WP_CRON true --raw --type=constant --path='.escapeshellarg($docroot).' 2>&1');
-	$log .= $set."\n";
-	if(stripos($set, 'Error') === 0 || stripos($set, 'Error:') !== false)
-		return array('error' => 'Could not update wp-config.php: '.trim($set), 'success' => '', 'log' => $log);
+	$set = wp_cli_run($user, 'config set DISABLE_WP_CRON true --raw --type=constant --path='.escapeshellarg($docroot));
+	$log .= $set['out']."\n";
+	/* Bail out BEFORE installing the cron. wp-cli exiting non-zero (or dying in
+	   PHP startup) used to fall through to step 2, so the site ended up with a
+	   system cron and no DISABLE_WP_CRON constant -- double cron runs -- while
+	   the panel reported success. */
+	$err = wp_cli_error($set);
+	if($err === '' && stripos($set['out'], 'Error:') !== false)
+		$err = trim($set['out']);
+	if($err !== '')
+		return array('error' => 'Could not update wp-config.php: '.$err, 'success' => '', 'log' => $log);
 
-	// 2) System cron (per-user spool). Skip if our marked line already exists.
+	// 2) System cron (per-user spool). Skip if our exact line is already there;
+	// a marked line in an older form (>/dev/null, before cron.log) is replaced.
 	$marker = wp_cron_marker($user);
-	$exists = (int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg($marker).' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null'));
-	if($exists === 0) {
-		$line = '*/2 * * * * /usr/local/bin/wp cron event run --due-now --path='.$docroot.' >/dev/null 2>&1 '.$marker;
-		shell_exec('echo '.escapeshellarg($line).' | sudo tee --append /var/spool/cron/'.escapeshellarg($user).' > /dev/null');
-		shell_exec('sudo chown '.escapeshellarg($user).': /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null');
-		shell_exec('sudo chmod 600 /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null');
-		$log .= "Installed */2 wp-cron system cron.\n";
-	} else {
+	$line   = wp_cron_line($user, $docroot);
+	$spool  = '/var/spool/cron/'.escapeshellarg($user);
+	$cur    = trim((string)shell_exec('sudo grep -F '.escapeshellarg($marker).' '.$spool.' 2>/dev/null'));
+	if($cur === $line) {
 		$log .= "System cron already present.\n";
+	} else {
+		if($cur !== '') {
+			// same bare-slug delete as wp_wpcron_disable()
+			shell_exec('sudo sed -i '.escapeshellarg('/reqad-wpcron-'.wp_cache_zone($user).'/d').' '.$spool.' 2>/dev/null');
+			$log .= "Replaced the previous wp-cron system cron line.\n";
+		}
+		// logs/ exists on accounts created by the panel; make sure, as the user,
+		// or the >> redirect fails and the job never runs.
+		shell_exec('sudo -u '.escapeshellarg($user).' mkdir -p '.escapeshellarg('/home/'.$user.'/logs').' 2>/dev/null');
+		shell_exec('echo '.escapeshellarg($line).' | sudo tee --append '.$spool.' > /dev/null');
+		shell_exec('sudo chown '.escapeshellarg($user).': '.$spool.' 2>/dev/null');
+		shell_exec('sudo chmod 600 '.$spool.' 2>/dev/null');
+		$log .= "Installed */2 wp-cron system cron (output: ~/logs/cron.log).\n";
 	}
 
 	log_debug('[wp-manage] wp-cron disabled (system cron installed) for '.$user);
@@ -2035,10 +2536,15 @@ function wp_wpcron_enable($user, $docroot) {
 /* Disable the option again: remove the constant and our system cron line. */
 function wp_wpcron_disable($user, $docroot) {
 	$log = '';
-	$has = trim((string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config has DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>/dev/null; echo $?'));
-	if(substr($has, -1) === '0') {
-		$del = (string)shell_exec('sudo -u '.escapeshellarg($user).' /usr/local/bin/wp config delete DISABLE_WP_CRON --path='.escapeshellarg($docroot).' 2>&1');
-		$log .= $del."\n";
+	$has = wp_cli_run($user, 'config has DISABLE_WP_CRON --path='.escapeshellarg($docroot));
+	if($has['rc'] === 0) {
+		$del = wp_cli_run($user, 'config delete DISABLE_WP_CRON --path='.escapeshellarg($docroot));
+		$log .= $del['out']."\n";
+		/* Leaving the constant behind while we drop the cron would stop cron
+		   entirely for the site, so report it instead of claiming success. */
+		$err = wp_cli_error($del);
+		if($err !== '')
+			return array('error' => 'Could not update wp-config.php: '.$err, 'success' => '', 'log' => $log);
 	}
 	// Remove our marked crontab line. Match the bare marker slug (no '#', no
 	// slashes) so '/'-delimited sed is safe.
@@ -2050,21 +2556,916 @@ function wp_wpcron_disable($user, $docroot) {
 	return array('error' => '', 'success' => 'WP-Cron re-enabled — the system cron was removed.', 'log' => $log);
 }
 
-/* Combined status for the Manage modal. Looks the account up in `wordpress` by
+/* Performance-tab status for a site. Looks the account up in `wordpress` by
    user, so the caller only supplies a (validated) username. Returns null if the
-   user is not a tracked WordPress install. */
-function wp_manage_status($db, $ini, $user) {
-	$res = $db->query('SELECT user, domain, path FROM wordpress WHERE user="'.$db->escapeString($user).'"');
-	$row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+   user is not a tracked WordPress install. Pass a wp_site_probe() result to
+   avoid a second wp-cli round trip. */
+function wp_manage_status($db, $ini, $user, $probe = null) {
+	$row = wp_site_row($db, $user);
 	if(!$row) return null;
 	$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
+	if($probe === null)
+		$probe = wp_site_probe($row['user'], $docroot);
+	$wp_ok = ($probe['error'] ?? 'x') === '';
+	$cron_on = ((int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg(wp_cron_marker($row['user'])).' /var/spool/cron/'.escapeshellarg($row['user']).' 2>/dev/null'))) > 0;
 	return array(
 		'user'        => $row['user'],
 		'domain'      => $row['domain'],
 		'is_nginx'    => wp_is_nginx($ini),
 		'nginx_cache' => wp_nginx_cache_state($ini, $row['domain']),
-		'wp_cron'     => wp_wpcron_state($row['user'], $docroot),
+		// same rule as wp_wpcron_state(): constant AND our system cron
+		'wp_cron'     => $wp_ok ? (($probe['disable_wp_cron'] && $cron_on) ? 'on' : 'off') : 'na',
+		'indexing'    => $wp_ok ? ($probe['blog_public'] === '0' ? 'off' : 'on') : 'na',
+		'maintenance' => wp_maintenance_state($docroot),
 	);
+}
+
+/* --- WP Toolkit site page (/wp-toolkit/<user>/) --------------------------- */
+
+/* The tracked install for an account, or false. $user must already be a
+   validated account name. */
+function wp_site_row($db, $user) {
+	$res = $db->query('SELECT * FROM wordpress WHERE user="'.$db->escapeString($user).'"');
+	return $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+}
+
+/* URL path prefix of a subdirectory install ('' for the docroot), safe to drop
+   into an nginx regex. Anything outside a plain path charset yields null. */
+function wp_site_url_prefix($path) {
+	$path = trim((string)$path, '/');
+	if($path === '') return '';
+	if(!preg_match('#^[A-Za-z0-9._/-]+$#', $path) || strpos($path, '..') !== false) return null;
+	return '/'.preg_quote($path, '#');
+}
+
+/* wordpress.org core stable-check (version => latest|outdated|insecure),
+   cached for an hour in wptoolkit/stable-check.json. Returns array($map, $err). */
+function wp_stable_versions() {
+	$file = _PATH.'/wptoolkit/stable-check.json';
+	$err  = '';
+	if(!is_file($file) || time() - filemtime($file) >= 3600) {
+		shell_exec('curl -s --max-time 10 https://api.wordpress.org/core/stable-check/1.0/ > '.escapeshellarg($file.'.tmp'));
+		$v = @json_decode((string)@file_get_contents($file.'.tmp'), true);
+		if(!empty($v))
+			@rename($file.'.tmp', $file);
+		else
+			$err = 'Error: Cannot download stable-check.json from wordpress.org website.';
+	}
+	$map = is_file($file) ? json_decode((string)file_get_contents($file), true) : array();
+	return array(is_array($map) ? $map : array(), $err);
+}
+
+/* PHP version an account's site runs on — inferred from which php-fpm.d dir
+   holds its pool (same rule as the accounts pages); falls back to the default. */
+function wp_site_php_version($ini, $domain) {
+	if(function_exists('account_php_disabled') && account_php_disabled($domain))
+		return 'disabled';
+	$ver = $ini['php'] ?? '';
+	foreach(array_map('trim', explode(',', $ini['php_versions'] ?? '')) as $pv) {
+		if($pv !== '' && is_file('/etc/opt/remi/php'.str_replace('.', '', $pv).'/php-fpm.d/'.$domain.'.conf'))
+			$ver = $pv;
+	}
+	return $ver;
+}
+
+/* One wp-cli round trip that reads everything the site page shows: header
+   cards plus the WordPress-side state of the Performance/Security options.
+   Every wp-cli start costs 1-2s, so this replaces a string of `config get`s.
+   Runs as the site's own user (tenant PHP never enters the panel process). */
+function wp_site_probe($user, $docroot) {
+	$code = <<<'EOT'
+$t = wp_get_theme();
+if (!function_exists('get_plugins')) require_once ABSPATH.'wp-admin/includes/plugin.php';
+$all = get_plugins();
+$act = (array)get_option('active_plugins');
+$up  = get_site_transient('update_plugins');
+$weak = 0;
+foreach (array('AUTH_KEY','SECURE_AUTH_KEY','LOGGED_IN_KEY','NONCE_KEY','AUTH_SALT','SECURE_AUTH_SALT','LOGGED_IN_SALT','NONCE_SALT') as $k)
+	if (!defined($k) || strlen(constant($k)) < 32 || constant($k) === 'put your unique phrase here') $weak++;
+echo "\n##REQAD##".json_encode(array(
+	'wp_version'      => get_bloginfo('version'),
+	'title'           => get_bloginfo('name'),
+	'tagline'         => get_bloginfo('description'),
+	'site_url'        => home_url('/'),
+	'theme'           => $t->get('Name'),
+	'theme_version'   => $t->get('Version'),
+	'plugins_total'   => count($all),
+	'plugins_active'  => count(array_intersect($act, array_keys($all))),
+	'plugins_updates' => (is_object($up) && !empty($up->response)) ? count($up->response) : 0,
+	'disable_wp_cron' => defined('DISABLE_WP_CRON') && DISABLE_WP_CRON,
+	'file_edit_off'   => defined('DISALLOW_FILE_EDIT') && DISALLOW_FILE_EDIT,
+	'concat_off'      => defined('CONCATENATE_SCRIPTS') && !CONCATENATE_SCRIPTS,
+	'ping_status'     => get_option('default_ping_status'),
+	'pingback_flag'   => (string)get_option('default_pingback_flag'),
+	'blog_public'     => (string)get_option('blog_public'),
+	'weak_salts'      => $weak,
+	'hide_login'      => is_plugin_active('wps-hide-login/wps-hide-login.php'),
+	'login_slug'      => (string)get_option('whl_page'),
+));
+EOT;
+	// --skip-plugins: everything read here is options, constants and plugin
+	// headers, none of which needs plugin code — halves the time on busy sites
+	$r = wp_cli_run($user, 'eval '.escapeshellarg($code).' --skip-themes --skip-plugins --path='.escapeshellarg($docroot));
+	$pos = strrpos($r['out'], '##REQAD##');
+	$d = ($pos !== false) ? json_decode(substr($r['out'], $pos + 9), true) : null;
+	if(!is_array($d))
+		return array('error' => wp_cli_error($r) ?: 'Could not read the WordPress site.');
+	$d['error'] = '';
+	// last good probe, so the site page can render its switches at once and
+	// refresh them afterwards (wp-cli needs ~1s just to start)
+	$cache = wp_site_probe_file($user);
+	@mkdir(dirname($cache), 0775, true);
+	@file_put_contents($cache, json_encode($d));
+	return $d;
+}
+
+function wp_site_probe_file($user) {
+	return _PATH.'/wptoolkit/cache/probe-'.wp_cache_zone($user).'.json';
+}
+
+/* Last good wp_site_probe() result, or a placeholder whose error keeps every
+   WordPress-dependent option "pending" (rendered as N/A until the refresh). */
+function wp_site_probe_cached($user) {
+	$d = @json_decode((string)@file_get_contents(wp_site_probe_file($user)), true);
+	return is_array($d) ? $d : array('error' => 'pending');
+}
+
+/* Empty a site's nginx FastCGI cache (no-op when there is none). Used when an
+   option changes what anonymous visitors must see (maintenance, robots.txt). */
+function wp_nginx_cache_purge_all($user) {
+	$zone = wp_cache_zone($user);
+	if($zone !== '')
+		shell_exec('sudo rm -rf /var/cache/nginx/fcgi-'.escapeshellarg($zone).'/* 2>/dev/null');
+}
+
+/* --- Search engine indexing (Settings > Reading > "Discourage search engines") */
+
+function wp_indexing_set($user, $docroot, $enable) {
+	$r = wp_cli_run($user, 'option update blog_public '.($enable ? '1' : '0').' --path='.escapeshellarg($docroot));
+	$err = wp_cli_error($r);
+	if($err !== '')
+		return array('error' => 'Could not change search engine indexing: '.$err, 'success' => '', 'log' => $r['out']);
+	wp_nginx_cache_purge_all($user);   // robots.txt is generated by WP and may be cached
+	return array('error' => '', 'log' => $r['out'],
+		'success' => $enable ? 'Search engines may now index the site.' : 'Search engines are now asked not to index the site.');
+}
+
+/* --- Maintenance mode ----------------------------------------------------
+   A must-use plugin rather than WordPress's own .maintenance file: that one
+   expires after 10 minutes and locks the admin out too. This one answers
+   visitors with a 503 + Retry-After while logged-in editors (and wp-login,
+   wp-admin, cron, REST) keep working, so the panel's Login button still does. */
+
+function wp_maintenance_file($docroot) {
+	return $docroot.'/wp-content/mu-plugins/reqad-maintenance.php';
+}
+
+function wp_maintenance_state($docroot) {
+	return trim((string)shell_exec('sudo test -f '.escapeshellarg(wp_maintenance_file($docroot)).' && echo on')) === 'on' ? 'on' : 'off';
+}
+
+function wp_maintenance_set($user, $docroot, $enable) {
+	$file = wp_maintenance_file($docroot);
+	$asuser = 'sudo -u '.escapeshellarg($user).' ';
+	if($enable) {
+		$src = _PATH.'/scripts/templates/wordpress-maintenance.php';
+		shell_exec($asuser.'mkdir -p '.escapeshellarg(dirname($file)).' 2>&1');
+		// cat as root into a file created by the user, so ownership stays the tenant's
+		shell_exec('sudo cat '.escapeshellarg($src).' | '.$asuser.'tee '.escapeshellarg($file).' > /dev/null');
+	} else {
+		shell_exec('sudo rm -f '.escapeshellarg($file));
+	}
+	wp_nginx_cache_purge_all($user);   // cached pages would otherwise bypass it
+	if(wp_maintenance_state($docroot) !== ($enable ? 'on' : 'off'))
+		return array('error' => 'Could not '.($enable ? 'create' : 'remove').' '.$file.'.', 'success' => '', 'log' => '');
+	return array('error' => '', 'log' => '',
+		'success' => $enable ? 'Maintenance mode is on — visitors get a "back soon" page, logged-in users see the site.'
+		                     : 'Maintenance mode is off.');
+}
+
+/* --- Reqad must-use plugins ------------------------------------------------
+   Small single-file plugins copied from scripts/templates/ into the site's
+   wp-content/mu-plugins/ (always loaded, cannot be disabled from wp-admin).
+   The file's presence is the state. Written through the site user so it
+   stays tenant-owned. */
+
+function wp_muplugin_path($docroot, $file) {
+	return $docroot.'/wp-content/mu-plugins/'.$file;
+}
+
+function wp_muplugin_state($docroot, $file) {
+	return trim((string)shell_exec('sudo test -f '.escapeshellarg(wp_muplugin_path($docroot, $file)).' && echo on')) === 'on' ? 'on' : 'off';
+}
+
+/* Returns '' or an error. */
+function wp_muplugin_set($user, $docroot, $file, $src, $enable) {
+	$dst = wp_muplugin_path($docroot, $file);
+	if($enable) {
+		$asuser = 'sudo -u '.escapeshellarg($user).' ';
+		shell_exec($asuser.'mkdir -p '.escapeshellarg(dirname($dst)).' 2>&1');
+		shell_exec('sudo cat '.escapeshellarg(_PATH.'/scripts/templates/'.$src).' | '.$asuser.'tee '.escapeshellarg($dst).' > /dev/null');
+	} else {
+		shell_exec('sudo rm -f '.escapeshellarg($dst));
+	}
+	return wp_muplugin_state($docroot, $file) === ($enable ? 'on' : 'off') ? '' : 'Could not '.($enable ? 'create' : 'remove').' '.$dst.'.';
+}
+
+/* --- Site screenshot -----------------------------------------------------
+   Headless Chromium renders the live home page. It runs as the site's own
+   user with the sandbox on — the page is tenant-controlled content and the
+   panel user has passwordless sudo — and only the finished PNG crosses back. */
+
+function wp_screenshot_file($user) {
+	return _PATH.'/wptoolkit/screenshots/'.wp_cache_zone($user).'.jpg';
+}
+
+function wp_chromium_bin() {
+	foreach(array('/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/bin/google-chrome') as $b)
+		if(is_file($b)) return $b;
+	return '';
+}
+
+function wp_screenshot_make($user, $url) {
+	$bin = wp_chromium_bin();
+	if($bin === '')
+		return 'Chromium is not installed on this server (dnf install chromium-headless or chromium).';
+	$work = '/home/'.$user.'/tmp/.reqad-shot';
+	$asuser = 'sudo -u '.escapeshellarg($user).' ';
+	shell_exec('sudo rm -rf '.escapeshellarg($work));
+	shell_exec($asuser.'mkdir -p '.escapeshellarg($work));
+	shell_exec($asuser.'timeout 45 '.$bin.' --headless --disable-gpu --hide-scrollbars --no-first-run'
+		.' --user-data-dir='.escapeshellarg($work.'/profile').' --window-size=1280,800 --virtual-time-budget=4000'
+		.' --screenshot='.escapeshellarg($work.'/shot.png').' '.escapeshellarg($url).' >/dev/null 2>&1');
+	$png = (string)shell_exec('sudo cat '.escapeshellarg($work.'/shot.png').' 2>/dev/null');
+	shell_exec('sudo rm -rf '.escapeshellarg($work));
+	if($png === '')
+		return 'Chromium could not render '.$url.'.';
+	return wp_screenshot_save($user, $png);
+}
+
+/* Store image bytes (PNG/JPEG/WebP) as the site's 640px-wide JPEG thumbnail.
+   Returns '' or an error. */
+function wp_screenshot_save($user, $bytes) {
+	$dst = wp_screenshot_file($user);
+	@mkdir(dirname($dst), 0775, true);
+	$im = function_exists('imagecreatefromstring') ? @imagecreatefromstring($bytes) : false;
+	if($im === false)
+		return 'Could not decode the screenshot (PHP GD missing?).';
+	$w = 640; $hgt = (int)round(imagesy($im) * $w / max(1, imagesx($im)));
+	$th = imagecreatetruecolor($w, $hgt);
+	imagecopyresampled($th, $im, 0, 0, 0, 0, $w, $hgt, imagesx($im), imagesy($im));
+	imagejpeg($th, $dst, 82);
+	return '';
+}
+
+/* --- Google PageSpeed Insights --------------------------------------------
+   Scores (performance, accessibility, best practices, SEO) and the Core Web
+   Vitals lab metrics for mobile and desktop, plus the desktop run's final
+   screenshot, which becomes the site thumbnail — so servers without Chromium
+   still get one. Google fetches the site itself, so it must be public.
+   Anonymous use has a quota of 0 requests/day; a free API key (25k/day) is
+   kept in settings as `pagespeed-api-key`. To be replaced by Reqad's own API. */
+
+define('WP_PSI_ENDPOINT', 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed');
+
+function wp_pagespeed_key() {
+	return trim((string)setting_get('pagespeed-api-key'));
+}
+
+function wp_pagespeed_file($user) {
+	return _PATH.'/wptoolkit/pagespeed/'.wp_cache_zone($user).'.json';
+}
+
+/* Cached result from the last run, or null. */
+function wp_pagespeed_cached($user) {
+	$d = @json_decode((string)@file_get_contents(wp_pagespeed_file($user)), true);
+	return is_array($d) ? $d : null;
+}
+
+/* Reduce one runPagespeed response to what the page shows. Returns
+   array(error, result, screenshot-bytes). */
+function wp_pagespeed_parse($body, $http) {
+	$d = @json_decode((string)$body, true);
+	if(!is_array($d))
+		return array('PageSpeed Insights did not answer (HTTP '.$http.').', null, '');
+	if(isset($d['error']))
+		return array('PageSpeed Insights: '.($d['error']['message'] ?? 'error '.$http), null, '');
+	$lr = $d['lighthouseResult'] ?? array();
+	if(!empty($lr['runtimeError']['message']))
+		return array('PageSpeed Insights could not load the site: '.$lr['runtimeError']['message'], null, '');
+
+	$scores = array();
+	foreach(array('performance', 'accessibility', 'best-practices', 'seo') as $c) {
+		$s = $lr['categories'][$c]['score'] ?? null;
+		$scores[$c] = ($s === null) ? null : (int)round($s * 100);
+	}
+	$metrics = array();
+	foreach(array('first-contentful-paint' => 'First Contentful Paint', 'largest-contentful-paint' => 'Largest Contentful Paint',
+	              'total-blocking-time' => 'Total Blocking Time', 'cumulative-layout-shift' => 'Cumulative Layout Shift',
+	              'speed-index' => 'Speed Index') as $k => $label) {
+		$a = $lr['audits'][$k] ?? null;
+		if($a) $metrics[] = array('label' => $label, 'value' => (string)($a['displayValue'] ?? ''), 'score' => $a['score'] ?? null);
+	}
+
+	$shot = '';
+	$uri = (string)($lr['audits']['final-screenshot']['details']['data'] ?? '');
+	if(($p = strpos($uri, 'base64,')) !== false)
+		$shot = (string)base64_decode(substr($uri, $p + 7));
+
+	return array('', array('scores' => $scores, 'metrics' => $metrics), $shot);
+}
+
+/* Run mobile + desktop in parallel (each takes 15-40s at Google), cache the
+   result, save the desktop screenshot as the thumbnail. Returns array(error, data). */
+function wp_pagespeed_run($user, $url) {
+	$key = wp_pagespeed_key();
+	if($key === '')
+		return array('No Google PageSpeed Insights API key is set (Settings).', null);
+
+	$mh = curl_multi_init();
+	$ch = array();
+	foreach(array('mobile', 'desktop') as $strategy) {
+		$q = 'url='.rawurlencode($url).'&strategy='.$strategy.'&key='.rawurlencode($key)
+		   . '&category=performance&category=accessibility&category=best-practices&category=seo';
+		$c = curl_init(WP_PSI_ENDPOINT.'?'.$q);
+		curl_setopt_array($c, array(CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 150, CURLOPT_CONNECTTIMEOUT => 15));
+		curl_multi_add_handle($mh, $c);
+		$ch[$strategy] = $c;
+	}
+	do {
+		$st = curl_multi_exec($mh, $running);
+		if($running) curl_multi_select($mh, 1.0);
+	} while($running && $st == CURLM_OK);
+
+	$out = array('url' => $url, 'fetched' => time());
+	$errors = array();
+	foreach($ch as $strategy => $c) {
+		$body = curl_multi_getcontent($c);
+		$http = curl_getinfo($c, CURLINFO_HTTP_CODE);
+		if($body === '' || $body === null)
+			$errors[] = ucfirst($strategy).': '.(curl_error($c) ?: 'no response');
+		else {
+			list($err, $res, $shot) = wp_pagespeed_parse($body, $http);
+			if($err !== '') $errors[] = ucfirst($strategy).': '.$err;
+			else {
+				$out[$strategy] = $res;
+				if($strategy === 'desktop' && $shot !== '')
+					wp_screenshot_save($user, $shot);
+			}
+		}
+		curl_multi_remove_handle($mh, $c);
+		curl_close($c);
+	}
+	curl_multi_close($mh);
+
+	if(!isset($out['mobile']) && !isset($out['desktop']))
+		return array(implode(' ', array_unique($errors)), null);
+	$file = wp_pagespeed_file($user);
+	@mkdir(dirname($file), 0775, true);
+	file_put_contents($file, json_encode($out));
+	return array(implode(' ', $errors), $out);
+}
+
+/* --- Background jobs for the site page -----------------------------------
+   A screenshot (Chromium) or a PageSpeed test (Google, up to a minute) must
+   never hold the browser's request open: slow requests queued behind them and
+   the page's switches stopped answering. The AJAX call records the job,
+   answers at once, then keeps working after fastcgi_finish_request(); the
+   page polls wp_bg_job_get(). State: wptoolkit/jobs/<kind>-<user>.json. */
+
+function wp_bg_job_file($kind, $user) {
+	return _PATH.'/wptoolkit/jobs/'.$kind.'-'.wp_cache_zone($user).'.json';
+}
+
+function wp_bg_job_get($kind, $user) {
+	$j = @json_decode((string)@file_get_contents(wp_bg_job_file($kind, $user)), true);
+	if(!is_array($j)) return array('running' => false, 'error' => '', 'done' => 0);
+	// a worker killed mid-job must not look busy forever
+	if(!empty($j['running']) && time() - (int)($j['started'] ?? 0) > 300) {
+		$j['running'] = false;
+		$j['error'] = 'The job did not finish.';
+	}
+	return $j;
+}
+
+function wp_bg_job_put($kind, $user, $state) {
+	$file = wp_bg_job_file($kind, $user);
+	@mkdir(dirname($file), 0775, true);
+	file_put_contents($file, json_encode($state), LOCK_EX);
+}
+
+/* Start $fn as a background job unless one is already running. Sends the JSON
+   answer and closes the request BEFORE running it. */
+function wp_bg_job_run($kind, $user, $fn) {
+	$cur = wp_bg_job_get($kind, $user);
+	header('Content-Type: application/json');
+	if(!empty($cur['running'])) {
+		echo json_encode(array('ok' => true, 'running' => true));
+		return;
+	}
+	$started = time();
+	wp_bg_job_put($kind, $user, array('running' => true, 'started' => $started, 'error' => '', 'done' => 0));
+	echo json_encode(array('ok' => true, 'running' => true));
+	if(function_exists('fastcgi_finish_request'))
+		fastcgi_finish_request();
+	ignore_user_abort(true);
+	set_time_limit(300);
+	$err = '';
+	try { $err = (string)$fn(); }
+	catch(Throwable $e) { $err = $e->getMessage(); }
+	wp_bg_job_put($kind, $user, array('running' => false, 'started' => $started, 'error' => $err, 'done' => time()));
+}
+
+/* --- Security hardening ---------------------------------------------------
+   Server-side rules live in one include per site,
+   /etc/nginx/reqad-wp-security/<domain>.conf, pulled into the vhost's
+   `location /` right after try_files. It has to be there and not at server
+   level: the vhost nests `location ~ \.php$` inside `location /`, and nginx
+   tries a prefix location's nested regexes before any server-level regex, so a
+   server-level deny for wp-includes/*.php would never be reached. Inside
+   `location /` our blocks come first in file order and win.
+   The include file is the source of truth — one BEGIN/END block per option. */
+
+define('WP_SEC_INC_DIR', '/etc/nginx/reqad-wp-security');
+
+/* Option catalogue for the Security tab. type: nginx | wpconfig | option |
+   plugin | action (one-way: re-running is the only operation). */
+function wp_security_options() {
+	return array(
+		'xmlrpc' => array('type' => 'nginx', 'rec' => true, 'label' => 'Block access to xmlrpc.php',
+			'desc' => 'XML-RPC is a favourite target for password brute-forcing and pingback floods. Leave this off if you use Jetpack or the WordPress mobile app.'),
+		'wp_includes_php' => array('type' => 'nginx', 'rec' => true, 'label' => 'Forbid PHP execution in wp-includes',
+			'desc' => 'Core PHP files there are only ever included, never requested directly. Blocks planted backdoors and direct probing.'),
+		'uploads_php' => array('type' => 'nginx', 'rec' => true, 'label' => 'Forbid PHP execution in wp-content/uploads',
+			'desc' => 'The most common place for an uploaded web shell. Uploads are media — nothing there should ever run.'),
+		'cache_php' => array('type' => 'nginx', 'rec' => true, 'label' => 'Forbid PHP execution in cache directories',
+			'desc' => 'Same idea for wp-content/cache, which caching plugins keep writable.'),
+		'wp_config' => array('type' => 'nginx', 'rec' => true, 'label' => 'Block access to wp-config.php',
+			'desc' => 'Keeps the database credentials unreachable over HTTP even if PHP is ever misconfigured and serves source.'),
+		'sensitive_files' => array('type' => 'nginx', 'rec' => true, 'label' => 'Block access to sensitive files',
+			'desc' => 'readme.html, license.txt (they give away the WordPress version), wp-config-sample.php, wp-admin/install.php and setup-config.php (only needed before WordPress is installed), dot-files (.htaccess, .htpasswd, .git, .env) and backup/log/dump files (.sql, .bak, .log, .ini, .sh, *~ …).'),
+		'security_headers' => array('type' => 'nginx', 'rec' => true, 'label' => 'Add security headers',
+			'desc' => '<code>Strict-Transport-Security</code> (browsers use HTTPS only, for a year), <code>X-Frame-Options: SAMEORIGIN</code> (no framing by other sites, against clickjacking) and <code>X-Content-Type-Options: nosniff</code>. Copies WordPress or a plugin already sends are replaced, so each header appears once.'),
+		'admin_ip_allow' => array('type' => 'nginx', 'rec' => false, 'label' => 'Allow login and core updates only from these IPs',
+			'desc' => 'Only the addresses below (and this server) can open <code>wp-login.php</code>, <code>wp-admin/upgrade.php</code> and <code>wp-admin/update-core.php</code>; everyone else gets a 404 page. Stops password guessing completely. Visitors can still unlock password-protected posts. Use it only when nobody else needs to log in &mdash; customers, members or authors would be locked out, and so would &ldquo;Lost your password?&rdquo;. If your IP changes, the panel\'s Log in button still gets you in.'),
+		'author_scans' => array('type' => 'nginx', 'rec' => true, 'label' => 'Block author scans',
+			'desc' => 'Refuses <code>/?author=N</code>, which bots use to harvest login names.'),
+		'bad_bots' => array('type' => 'nginx', 'rec' => false, 'label' => 'Block aggressive crawlers',
+			'desc' => 'Answers 404 to SEO crawlers and scrapers (AhrefsBot, SemrushBot, MJ12bot, DotBot, Bytespider …) that eat CPU. Leave off if you rely on those SEO tools.'),
+		'file_edit' => array('type' => 'wpconfig', 'rec' => true, 'label' => 'Disable file editing in the WordPress dashboard',
+			'desc' => 'Sets <code>DISALLOW_FILE_EDIT</code>: a stolen admin login can no longer rewrite theme/plugin PHP from the browser.'),
+		'concatenate_scripts' => array('type' => 'wpconfig', 'rec' => true, 'label' => 'Disable script concatenation in wp-admin',
+			'desc' => 'Sets <code>CONCATENATE_SCRIPTS</code> to false, closing the load-scripts.php denial-of-service vector.'),
+		'pingbacks' => array('type' => 'option', 'rec' => true, 'label' => 'Turn off pingbacks',
+			'desc' => 'Pingbacks are mostly spam and are abused for DDoS reflection. Applies to new posts.'),
+		'hide_version' => array('type' => 'muplugin', 'rec' => true, 'label' => 'Hide the WordPress version',
+			'file' => 'reqad-hide-version.php', 'src' => 'wordpress-hide-version.php',
+			'desc' => 'Removes the <code>generator</code> tag from pages and feeds and replaces <code>?ver=&lt;version&gt;</code> on core scripts and styles with a hash, so scanners cannot match the site to known vulnerabilities by version. Pair it with <i>Block access to sensitive files</i> (readme.html).'),
+		'hide_login' => array('type' => 'plugin', 'rec' => false, 'label' => 'Hide wp-admin — move the login to a new URL',
+			'desc' => 'Installs the <a href="https://wordpress.org/plugins/wps-hide-login/" target="_blank">WPS Hide Login</a> plugin: <code>wp-login.php</code> and <code>/wp-admin</code> return 404 to visitors who are not logged in. The panel\'s Login button keeps working.'),
+		'security_keys' => array('type' => 'action', 'rec' => true, 'label' => 'Configure security keys',
+			'desc' => 'Makes sure all eight keys/salts in wp-config.php are set and strong. Regenerating signs every user out.'),
+		'permissions' => array('type' => 'action', 'rec' => true, 'label' => 'Restrict access to files and directories',
+			'desc' => 'wp-config.php becomes readable by the site owner only (600) and world-writable files/directories lose the o+w bit.'),
+	);
+}
+
+/* nginx fragment for one option. $p is the regex-safe URL prefix. */
+function wp_sec_nginx_rules($key, $p, $ctx = array()) {
+	// Everything answers 404, not 403: a blocked file must look exactly like a
+	// missing one (403 confirms it exists)
+	$php = '\.(php\d*|phtml|phar|pht)$';
+	switch($key) {
+		case 'xmlrpc':
+			return "location ~* ^$p/xmlrpc\.php\$ { return 404; access_log off; log_not_found off; }";
+		case 'wp_includes_php':
+			// wp-tinymce.php and ms-files.php are the two core files meant to be requested
+			return "location ~* ^$p/wp-includes/(?!js/tinymce/wp-tinymce\.php\$|ms-files\.php\$).+$php { return 404; }";
+		case 'uploads_php':
+			return "location ~* ^$p/wp-content/uploads/.*$php { return 404; }";
+		case 'cache_php':
+			return "location ~* ^$p/wp-content/cache/.*$php { return 404; }";
+		case 'wp_config':
+			return "location ~* ^$p/wp-config\.php\$ { return 404; }";
+		case 'sensitive_files':
+			// install.php / setup-config.php only matter before WordPress is
+			// installed; Reqad installs through wp-cli, so nothing needs them after
+			return "location ~* ^$p/(readme\.html|license\.txt|wp-config-sample\.php|wp-admin/(install|setup-config)\.php)\$ { return 404; }\n"
+			     . "location ~ /\.(?!well-known/) { return 404; }\n"
+			     . "location ~* (\.(sql|sql\.gz|bak|old|orig|save|swp|swo|log|ini|sh|inc|dist)|~)\$ { return 404; }";
+		case 'author_scans':
+			return "if (\$arg_author ~ \"^[0-9]\") { return 404; }";
+		case 'bad_bots':
+			return "if (\$http_user_agent ~* \"(AhrefsBot|AhrefsSiteAudit|SemrushBot|MJ12bot|DotBot|BLEXBot|SEOkicks|dataforseo|rogerbot|serpstatbot|SeekportBot|Timpibot|Bytespider|PetalBot|MegaIndex|Barkrowler)\") { return 404; }";
+		case 'security_headers':
+			return "# server-level: ".wp_sec_server_path($ctx['domain'] ?? '');
+		case 'admin_ip_allow':
+			/* These URIs must still run PHP for allowed clients, and nginx cannot
+			   fall through to the vhost's own `location ~ \.php$` once this one
+			   matched — so the handler body is copied from the vhost ($ctx['php']).
+			   The allow decision is a map (http level, see wp_sec_http_body) so the
+			   only `if` here is a bare return. */
+			$v = $ctx['var'];
+			return "location ~* ^$p/(wp-login\.php|wp-admin/(upgrade|update-core)\.php)\$ {\n"
+			     . "    if (\$${v}_deny) { return 404; }\n"
+			     . $ctx['php']
+			     . "}";
+	}
+	return '';
+}
+
+function wp_sec_inc_path($domain) {
+	return WP_SEC_INC_DIR.'/'.$domain.'.conf';
+}
+
+/* server-context companion (security headers) — add_header in `location /`
+   would stop every server-level add_header (e.g. the cache's X-FastCGI-Cache)
+   from being inherited, so headers go in at server level instead */
+function wp_sec_server_path($domain) {
+	return WP_SEC_INC_DIR.'/'.$domain.'.server.conf';
+}
+
+function wp_sec_server_line($domain) {
+	return '	include '.wp_sec_server_path($domain).'; # reqad-wp-security-server';
+}
+
+function wp_sec_server_body() {
+	return "# Managed by the Reqad WP Toolkit (Security tab) — changes here are overwritten.\n"
+	     . "# Drop the copies PHP (WordPress, plugins) may send, so each header appears once.\n"
+	     . "fastcgi_hide_header Strict-Transport-Security;\n"
+	     . "fastcgi_hide_header X-Frame-Options;\n"
+	     . "fastcgi_hide_header X-Content-Type-Options;\n"
+	     . "add_header Strict-Transport-Security \"max-age=31536000\" always;\n"
+	     . "add_header X-Frame-Options \"SAMEORIGIN\" always;\n"
+	     . "add_header X-Content-Type-Options \"nosniff\" always;\n";
+}
+
+/* http-context companion (the geo/map of the IP allowlist) */
+function wp_sec_http_path($domain) {
+	return WP_SEC_INC_DIR.'/'.$domain.'.http.conf';
+}
+
+function wp_sec_include_line($domain) {
+	return '        include '.wp_sec_inc_path($domain).'; # reqad-wp-security';
+}
+
+function wp_sec_http_line($domain) {
+	return 'include '.wp_sec_http_path($domain).'; # reqad-wp-security-http';
+}
+
+/* nginx variable prefix for a domain (map/geo names are global to nginx) */
+function wp_sec_var($domain) {
+	return 'reqad_wpip_'.preg_replace('/[^a-z0-9]/', '_', strtolower($domain));
+}
+
+/* nginx options currently enforced for a domain (include wired in + block present). */
+function wp_sec_nginx_enabled($domain) {
+	if(!preg_match('/# reqad-wp-security$/m', wp_read_conf(wp_nginx_conf_path($domain))))
+		return array();
+	preg_match_all('/^# BEGIN reqad-sec (\w+)/m', wp_read_conf(wp_sec_inc_path($domain)), $m);
+	return $m[1];
+}
+
+/* This server's own addresses. They are always allowed: WordPress's core
+   updater POSTs to wp-admin/upgrade.php over HTTP from the server itself. */
+function wp_sec_server_ips() {
+	$ips = array('127.0.0.1', '::1');
+	$out = (string)shell_exec("/usr/sbin/ip -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1");
+	foreach(preg_split('/\s+/', trim($out)) as $ip)
+		if(filter_var($ip, FILTER_VALIDATE_IP)) $ips[] = $ip;
+	return array_values(array_unique($ips));
+}
+
+/* One IP or CIDR, normalised; '' when invalid. */
+function wp_sec_valid_ip($s) {
+	$s = trim((string)$s);
+	if(filter_var($s, FILTER_VALIDATE_IP)) return $s;
+	if(preg_match('#^([0-9a-fA-F:.]+)/(\d{1,3})$#', $s, $m) && ($ip = filter_var($m[1], FILTER_VALIDATE_IP))) {
+		$max = strpos($ip, ':') !== false ? 128 : 32;
+		if((int)$m[2] >= 1 && (int)$m[2] <= $max) return $ip.'/'.(int)$m[2];
+	}
+	return '';
+}
+
+/* The admin-entered allowlist, read back from the http include. */
+function wp_sec_allowed_ips($domain) {
+	preg_match_all('/^\s*(\S+)\s+1;\s*# allowed$/m', wp_read_conf(wp_sec_http_path($domain)), $m);
+	return $m[1];
+}
+
+function wp_sec_http_body($domain, $ips) {
+	$v = wp_sec_var($domain);
+	$b = "# Managed by the Reqad WP Toolkit (Security tab) — changes here are overwritten.\n"
+	   . "# Who may reach wp-login.php, wp-admin/upgrade.php and wp-admin/update-core.php.\n"
+	   . "geo \$${v}_ip {\n    default 0;\n";
+	foreach(wp_sec_server_ips() as $ip) $b .= "    $ip 1; # server\n";
+	foreach($ips as $ip) $b .= "    $ip 1; # allowed\n";
+	$b .= "}\n"
+	   // password-protected posts POST their password to wp-login.php?action=postpass
+	   // — that one stays open to every visitor
+	   . "map \"\$${v}_ip:\$arg_action\" \$${v}_deny {\n    default 1;\n    \"~^1:\" 0;\n    \"0:postpass\" 0;\n}\n";
+	return $b;
+}
+
+/* Body of the vhost's first `location ~ \.php$ { ... }`, minus Reqad-managed
+   cache directives (they reference a cache zone that may be switched off
+   later) and its try_files (re-added). Returns '' when there is none. */
+function wp_sec_php_handler($vhost) {
+	if(!preg_match('/^([ \t]*)location[ \t]+~[ \t]+\\\\\.php\$[ \t]*\{/m', $vhost, $m, PREG_OFFSET_CAPTURE))
+		return '';
+	$i = strpos($vhost, '{', $m[0][1]);
+	$depth = 0; $end = -1;
+	for($j = $i; $j < strlen($vhost); $j++) {
+		if($vhost[$j] === '{') $depth++;
+		elseif($vhost[$j] === '}' && --$depth === 0) { $end = $j; break; }
+	}
+	if($end < 0) return '';
+	$body = substr($vhost, $i + 1, $end - $i - 1);
+	$body = preg_replace('/[ \t]*# BEGIN reqad-nginx-cache-fcgi\b.*?# END reqad-nginx-cache-fcgi[^\n]*\n?/s', '', $body);
+	$out = "    try_files \$uri =404;\n";
+	foreach(explode("\n", $body) as $ln) {
+		$t = trim($ln);
+		if($t === '' || $t[0] === '#' || strpos($t, 'try_files') === 0) continue;
+		if(strpos($t, '{') !== false || strpos($t, '}') !== false) return '';   // nested blocks: too custom to copy
+		$out .= "    $t\n";
+	}
+	return (strpos($out, 'fastcgi_pass') !== false) ? $out : '';
+}
+
+/* Pure text step of wp_sec_nginx_apply(): new vhost + both include bodies
+   ('' = file should not exist). Returns array(error, vhost, inc, http). */
+function wp_sec_nginx_render($orig_v, $domain, $p, $keys, $ips) {
+	$new_v = preg_replace('/^[^\n]*# reqad-wp-security(-http|-server)?[ \t]*\n/m', '', $orig_v);
+	if(empty($keys))
+		return array('', $new_v, '', '', '');
+
+	$ctx = array('var' => wp_sec_var($domain), 'php' => '', 'domain' => $domain);
+	$http = '';
+	if(in_array('admin_ip_allow', $keys, true)) {
+		if(empty($ips))
+			return array('Add at least one allowed IP before restricting the login page.', '', '', '', '');
+		$ctx['php'] = wp_sec_php_handler($orig_v);
+		if($ctx['php'] === '')
+			return array('Could not copy the PHP handler from the vhost (customised `location ~ \.php$`), so the login page cannot be IP-restricted here.', '', '', '', '');
+		$http = wp_sec_http_body($domain, $ips);
+	}
+
+	$inc = "# Managed by the Reqad WP Toolkit (Security tab) — changes here are overwritten.\n"
+	     . "# Included inside the vhost's `location /`, ahead of the PHP handler.\n";
+	foreach(array_keys(wp_security_options()) as $k)
+		if(in_array($k, $keys, true) && ($rule = wp_sec_nginx_rules($k, $p, $ctx)) !== '')
+			$inc .= "# BEGIN reqad-sec $k\n$rule\n# END reqad-sec $k\n";
+
+	$out = array(); $done = false;
+	foreach(explode("\n", $new_v) as $ln) {
+		$out[] = $ln;
+		if(!$done && preg_match('#^\s*try_files\s+\$uri\s+\$uri/\s+/index\.php#', $ln)) {
+			$out[] = wp_sec_include_line($domain);
+			$done = true;
+		}
+	}
+	if(!$done)
+		return array('Could not find the `try_files ... /index.php` line in the vhost to attach the security rules.', '', '', '', '');
+	$new_v = implode("\n", $out);
+
+	// security headers: server level, after the HTTPS server's `index` line
+	// (the port-80 server only redirects and has none)
+	$srv = '';
+	if(in_array('security_headers', $keys, true)) {
+		$out = array(); $done = false;
+		foreach(explode("\n", $new_v) as $ln) {
+			$out[] = $ln;
+			if(!$done && preg_match('/^\s*index\s+/', $ln)) {
+				$out[] = wp_sec_server_line($domain);
+				$done = true;
+			}
+		}
+		if(!$done)
+			return array('Could not find the `index` line in the vhost to attach the security headers.', '', '', '', '');
+		$new_v = implode("\n", $out);
+		$srv = wp_sec_server_body();
+	}
+
+	if($http !== '')
+		$new_v = wp_sec_http_line($domain)."\n".$new_v;   // conf.d files are http context
+	return array('', $new_v, $inc, $http, $srv);
+}
+
+/* Rewrite the site's includes to exactly $keys (wiring/unwiring the vhost),
+   test, reload — or put all three files back if nginx rejects the result. */
+function wp_sec_nginx_apply($user, $domain, $path, $keys, $ips = array()) {
+	$p = wp_site_url_prefix($path);
+	if($p === null)
+		return array('error' => 'Unsupported install path: '.$path, 'log' => '');
+	$vhost = wp_nginx_conf_path($domain);
+	$inc   = wp_sec_inc_path($domain);
+	$http  = wp_sec_http_path($domain);
+	$orig_v = wp_read_conf($vhost);
+	$orig_i = wp_read_conf($inc);
+	$orig_h = wp_read_conf($http);
+	$srvf   = wp_sec_server_path($domain);
+	$orig_s = wp_read_conf($srvf);
+	if(trim($orig_v) === '')
+		return array('error' => 'nginx vhost not found: '.$vhost, 'log' => '');
+
+	list($err, $new_v, $new_i, $new_h, $new_s) = wp_sec_nginx_render($orig_v, $domain, $p, $keys, $ips);
+	if($err !== '')
+		return array('error' => $err, 'log' => '');
+	// nothing to change: skip the nginx test and reload
+	if($new_v === $orig_v && $new_i === $orig_i && $new_h === $orig_h && $new_s === $orig_s)
+		return array('error' => '', 'log' => "nginx security rules already up to date\n", 'changed' => false);
+
+	shell_exec('sudo mkdir -p '.WP_SEC_INC_DIR);
+	if($new_i !== '') wp_write_conf($inc, $new_i);
+	if($new_h !== '') wp_write_conf($http, $new_h);
+	if($new_s !== '') wp_write_conf($srvf, $new_s);
+	if($new_v !== $orig_v) {
+		save_config_backup($user, 'nginx', $vhost, $orig_v);
+		wp_write_conf($vhost, $new_v);
+	}
+	$test = (string)shell_exec('sudo nginx -t 2>&1');
+	if(stripos($test, 'test is successful') === false) {
+		if($new_v !== $orig_v) wp_write_conf($vhost, $orig_v);
+		wp_sec_restore_inc($inc, $orig_i);
+		wp_sec_restore_inc($http, $orig_h);
+		wp_sec_restore_inc($srvf, $orig_s);
+		return array('error' => 'nginx config test failed; nothing was changed. '.trim(preg_replace('/\s+/', ' ', $test)), 'log' => $test);
+	}
+	if($new_i === '') shell_exec('sudo rm -f '.escapeshellarg($inc));
+	if($new_h === '') shell_exec('sudo rm -f '.escapeshellarg($http));
+	if($new_s === '') shell_exec('sudo rm -f '.escapeshellarg($srvf));
+	shell_exec('sudo systemctl reload nginx 2>&1');
+	return array('error' => '', 'changed' => true, 'log' => "nginx security rules: ".(empty($keys) ? 'none' : implode(', ', $keys))
+		.(in_array('admin_ip_allow', $keys, true) ? ' (allowed IPs: '.implode(', ', $ips).')' : '')."\n");
+}
+
+function wp_sec_restore_inc($inc, $content) {
+	if(trim($content) === '') shell_exec('sudo rm -f '.escapeshellarg($inc));
+	else wp_write_conf($inc, $content);
+}
+
+/* Anything world-writable under the docroot? (stops at the first hit) */
+function wp_sec_world_writable($docroot) {
+	return trim((string)shell_exec('sudo find '.escapeshellarg($docroot).' -perm -0002 ! -type l -print -quit 2>/dev/null')) !== '';
+}
+
+function wp_sec_permissions_state($ini, $docroot) {
+	if(!wp_is_nginx($ini)) return 'na';   // mod_php reads wp-config.php as apache
+	$mode = trim((string)shell_exec('sudo stat -c %a '.escapeshellarg($docroot.'/wp-config.php').' 2>/dev/null'));
+	if($mode === '') return 'na';          // wp-config.php kept outside the docroot
+	return (in_array($mode, array('400', '600'), true) && !wp_sec_world_writable($docroot)) ? 'on' : 'off';
+}
+
+/* State of every Security option: 'on' | 'off' | 'na'. $probe = wp_site_probe(). */
+function wp_security_status($ini, $row, $probe) {
+	$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
+	$nginx   = wp_is_nginx($ini) ? wp_sec_nginx_enabled($row['domain']) : null;
+	$wp_ok   = ($probe['error'] ?? 'x') === '';
+	$st = array();
+	foreach(wp_security_options() as $k => $o) {
+		switch($o['type']) {
+			case 'nginx': $st[$k] = ($nginx === null) ? 'na' : (in_array($k, $nginx, true) ? 'on' : 'off'); break;
+			case 'muplugin': $st[$k] = wp_muplugin_state($docroot, $o['file']); break;
+			default:      $st[$k] = 'na';
+		}
+	}
+	if($wp_ok) {
+		$st['file_edit']           = $probe['file_edit_off'] ? 'on' : 'off';
+		$st['concatenate_scripts'] = $probe['concat_off'] ? 'on' : 'off';
+		// WordPress only allows pings when the value is exactly 'open' ('' counts as closed)
+		$st['pingbacks']           = ($probe['ping_status'] !== 'open' && $probe['pingback_flag'] !== '1') ? 'on' : 'off';
+		$st['hide_login']          = $probe['hide_login'] ? 'on' : 'off';
+		$st['security_keys']       = ((int)$probe['weak_salts'] === 0) ? 'on' : 'off';
+	}
+	$st['permissions'] = wp_sec_permissions_state($ini, $docroot);
+	return $st;
+}
+
+/* Validated custom login slug, or '' when unusable. */
+function wp_login_slug_valid($slug) {
+	$slug = strtolower(trim((string)$slug));
+	if(!preg_match('/^[a-z0-9][a-z0-9-]{3,39}$/', $slug)) return '';
+	if(in_array($slug, array('wp-admin', 'wp-login', 'admin', 'login', 'dashboard', 'wp-content', 'wp-includes', 'wp-json', 'feed'), true)) return '';
+	return $slug;
+}
+
+/* Apply the Security tab: $want = keys the admin left ticked. Only options whose
+   state actually differs are touched; nginx changes go in one reload.
+   Returns array(error => [..], log => string). */
+function wp_security_apply($ini, $row, $want, $login_slug, $regen_keys, $allow_ips = array()) {
+	$user    = $row['user'];
+	$docroot = wp_site_docroot($user, $row['path'] ?? '');
+	$wpp     = ' --path='.escapeshellarg($docroot);
+	$probe   = wp_site_probe($user, $docroot);
+	$cur     = wp_security_status($ini, $row, $probe);
+	$opts    = wp_security_options();
+	$errors  = array();
+	$log     = '';
+
+	$on = function($k) use ($want) { return in_array($k, $want, true); };
+	$wp = function($args, $what) use ($user, $wpp, &$errors, &$log) {
+		$r = wp_cli_run($user, $args.$wpp);
+		$log .= '$ wp '.$args."\n".$r['out']."\n";
+		$e = wp_cli_error($r);
+		if($e !== '') $errors[] = $what.': '.$e;
+		return $e === '';
+	};
+
+	// 1) nginx rules, all at once
+	if($on('admin_ip_allow') && $on('hide_login')) {
+		// WPS Hide Login serves the login form from index.php at the new URL,
+		// which an nginx rule on /wp-login.php never sees — pick one
+		return array('error' => array('Choose either "Hide wp-admin" or "Allow login only from these IPs" — with a hidden login URL the IP rule would not apply.'), 'log' => '');
+	}
+	if(wp_is_nginx($ini)) {
+		$ips = array();
+		foreach($allow_ips as $ip) {
+			if(trim($ip) === '') continue;
+			$v = wp_sec_valid_ip($ip);
+			if($v === '') return array('error' => array('Not a valid IP address or range: '.$ip), 'log' => '');
+			$ips[] = $v;
+		}
+		$ips = array_values(array_unique($ips));
+		$nk_cur = array(); $nk_want = array();
+		foreach($opts as $k => $o) {
+			if($o['type'] !== 'nginx') continue;
+			if($cur[$k] === 'on') $nk_cur[] = $k;
+			if($on($k)) $nk_want[] = $k;
+		}
+		/* Always re-render: besides a changed selection, this rewrites rules
+		   written by an older Reqad (e.g. 403 -> 404). An identical result is
+		   a no-op without nginx test or reload. */
+		{
+			$r = wp_sec_nginx_apply($user, $row['domain'], $row['path'] ?? '', $nk_want, $ips);
+			$log .= $r['log'];
+			if($r['error'] !== '') $errors[] = $r['error'];
+		}
+	}
+
+	if(($probe['error'] ?? '') !== '') {
+		$errors[] = 'WordPress options were not changed: '.$probe['error'];
+	} else {
+		// 2) wp-config constants
+		if($on('file_edit') && $cur['file_edit'] !== 'on')
+			$wp('config set DISALLOW_FILE_EDIT true --raw --type=constant', 'Disable file editing');
+		if(!$on('file_edit') && $cur['file_edit'] === 'on')
+			$wp('config delete DISALLOW_FILE_EDIT', 'Disable file editing');
+		if($on('concatenate_scripts') && $cur['concatenate_scripts'] !== 'on')
+			$wp('config set CONCATENATE_SCRIPTS false --raw --type=constant', 'Script concatenation');
+		if(!$on('concatenate_scripts') && $cur['concatenate_scripts'] === 'on')
+			$wp('config delete CONCATENATE_SCRIPTS', 'Script concatenation');
+
+		// 3) pingbacks
+		if($on('pingbacks') !== ($cur['pingbacks'] === 'on')) {
+			/* update_option() through eval, not `wp option update`: wp-cli runs the
+			   CURRENT value through sanitize_option() before comparing, which turns
+			   a stored '' into 'closed' — it then reports "unchanged" and writes
+			   nothing. Core update_option() compares the raw value. */
+			$ping = $on('pingbacks') ? 'closed' : 'open';
+			$flag = $on('pingbacks') ? '0' : '1';
+			$wp('eval '.escapeshellarg('update_option("default_ping_status", "'.$ping.'"); update_option("default_pingback_flag", "'.$flag.'");'
+				.' echo "default_ping_status=", get_option("default_ping_status"), " default_pingback_flag=", get_option("default_pingback_flag"), "\n";'), 'Pingbacks');
+		}
+
+		// 4) hidden login URL (WPS Hide Login)
+		if($on('hide_login')) {
+			$slug = wp_login_slug_valid($login_slug);
+			if($slug === '')
+				$errors[] = 'Hide wp-admin: the login URL must be 4-40 characters of a-z, 0-9 and dashes, and not a WordPress path.';
+			elseif($cur['hide_login'] !== 'on') {
+				if($wp('plugin install wps-hide-login --activate', 'Hide wp-admin'))
+					$wp('option update whl_page '.escapeshellarg($slug), 'Hide wp-admin');
+			} elseif($slug !== $probe['login_slug'])
+				$wp('option update whl_page '.escapeshellarg($slug), 'Hide wp-admin');
+		} elseif($cur['hide_login'] === 'on') {
+			$wp('plugin uninstall wps-hide-login --deactivate', 'Hide wp-admin');
+		}
+
+		// 4b) must-use plugins
+		foreach($opts as $k => $o) {
+			if($o['type'] !== 'muplugin' || $on($k) === ($cur[$k] === 'on')) continue;
+			$e = wp_muplugin_set($user, $docroot, $o['file'], $o['src'], $on($k));
+			$log .= ($on($k) ? 'Installed ' : 'Removed ').'mu-plugin '.$o['file']."\n";
+			if($e !== '') $errors[] = $o['label'].': '.$e;
+		}
+
+		// 5) keys — one-way
+		if(($on('security_keys') && $cur['security_keys'] !== 'on') || $regen_keys)
+			$wp('config shuffle-salts', 'Security keys');
+	}
+
+	// 6) permissions — one-way
+	if($on('permissions') && $cur['permissions'] === 'off') {
+		$asuser = 'sudo -u '.escapeshellarg($user).' ';
+		$log .= (string)shell_exec($asuser.'chmod 600 '.escapeshellarg($docroot.'/wp-config.php').' 2>&1');
+		$log .= (string)shell_exec($asuser.'find '.escapeshellarg($docroot).' -perm -0002 ! -type l -exec chmod o-w {} + 2>&1');
+		if(wp_sec_permissions_state($ini, $docroot) !== 'on')
+			$errors[] = 'Permissions: some files could not be fixed (owned by another user?).';
+		$log .= "Permissions tightened.\n";
+	}
+
+	log_debug('[wp-security] '.$user.' want='.implode(',', $want).' errors='.count($errors));
+	return array('error' => $errors, 'log' => $log);
 }
 
 /* ── Email filters (3-tier Sieve) ─────────────────────────────────────────────
@@ -3307,7 +4708,7 @@ function exim_filter_parse($src, $ctx = array()) {
 		   at all: it is how cPanel marks a mailbox whose incoming mail has been
 		   suspended. Say so, rather than reporting it as an unreadable rule. */
 		if (preg_match('/^fail\b/i', $l) || preg_match('/^save\s+"?\/dev\/null"?/i', $l)) {
-			$skip[] = array('raw' => $l, 'why' => 'this is cPanel\'s "suspend incoming mail" flag for the '
+			$skip[] = array('raw' => $l, 'why' => 'this is "suspend incoming mail" flag for the '
 			              . 'mailbox, not a filter — every message is refused unconditionally. Reqad has no '
 			              . 'equivalent, so nothing is imported; delete or disable the mailbox if you want '
 			              . 'that to continue');
@@ -3601,7 +5002,7 @@ function exim_filter_test($t, &$why, $ctx = array()) {
 		);
 		$why = 'tests ' . $kw . ' (' . $note[$kw] . '), which Sieve cannot express';
 		if ($kw === 'first_delivery' || $kw === 'error_message')
-			$why .= ' — this is cPanel boilerplate that guards against filtering bounces,'
+			$why .= ' — this is boilerplate that guards against filtering bounces,'
 			      . ' and dropping it is normally the right call';
 		return false;
 	}
@@ -5196,10 +6597,25 @@ function apply_mail_config($which, $content, $user = 'mail') {
 		return array('error' => 'Validation failed on the live config, reverted:'."\n".$live, 'success' => '');
 	}
 
+	/* A reload that the unit cannot do is worse than a restart: systemd answers
+	   "Job type reload is not applicable", the exit status is thrown away, and
+	   the panel cheerfully reports a saved setting that the running daemon has
+	   never read. Stock exim.service has no ExecReload at all (Reqad adds one
+	   in scripts/update/setup_exim_reload.sh), so check the status and fall
+	   back to a restart rather than lie about it. */
 	$verb = (isset($t['reload']) && $t['reload'] === 'restart') ? 'restart' : 'reload';
-	shell_exec('sudo systemctl '.$verb.' '.$t['service'].' >> '._PATH.'/log/debug_log 2>&1');
+	$rc   = 0;
+	exec('sudo systemctl '.$verb.' '.escapeshellarg($t['service']).' >> '._PATH.'/log/debug_log 2>&1', $ignored, $rc);
+	if ($rc !== 0 && $verb === 'reload') {
+		$verb = 'restart';
+		exec('sudo systemctl restart '.escapeshellarg($t['service']).' >> '._PATH.'/log/debug_log 2>&1', $ignored, $rc);
+	}
 	mail_stack_cache_clear();
-	log_debug('[mailconfig] '.$which.' saved + '.$verb.'ed '.$t['service']);
+	log_debug('[mailconfig] '.$which.' saved + '.$verb.' '.$t['service'].' rc='.$rc);
+	if ($rc !== 0)
+		return array('error' => $t['label'].' was saved, but '.$t['service'].' could not be '
+		                        .($verb === 'restart' ? 'restarted' : 'reloaded')
+		                        .' — it is still running the previous configuration.', 'success' => '');
 	return array('error' => '', 'success' => $t['label'].' saved and '.$t['service'].' '.($verb === 'restart' ? 'restarted' : 'reloaded').'.');
 }
 
@@ -5301,36 +6717,63 @@ function mail_compress_disable() {
 	return array('error' => '', 'success' => 'Mail compression disabled.');
 }
 
+/* ---- Dovecot imap/pop3 memory limit --------------------------------------
+   service imap { vsz_limit } is not a flat key=value line, so it cannot go
+   through mail_setting_write with the rest of the Dovecot page. It used to be
+   written by the compression helper into compress.conf, which meant the panel
+   field did nothing whenever compression was off -- the save was validated and
+   then dropped, and dovecot went on killing imap children at the 256M default.
+   It now has its own file and its own script, on the same "ask the script that
+   owns the file" footing as compression. */
+
+if (!defined('VSZ_HELPER'))
+	define('VSZ_HELPER', _PATH.'/scripts/update/setup_dovecot_vsz.sh');
+
+/* Read from `doveconf -n`, so this reports what dovecot is ENFORCING rather
+   than what some file says. '' means no explicit limit: dovecot's own default
+   is in force. Cached for the request. */
+function mail_vsz_status($refresh = false) {
+	static $cache = null;
+	if ($cache !== null && !$refresh) return $cache;
+	$out = array(); $rc = 0;
+	exec('sudo -n /usr/bin/bash '.escapeshellarg(VSZ_HELPER).' --status 2>&1', $out, $rc);
+	/* 'uniform' is whether imap, pop3 and indexer-worker all carry the same
+	   limit. They can differ on a server configured by hand, and the value
+	   reported above is imap's -- so without this flag a save that picks the
+	   value imap already has would be skipped as "no change" and leave
+	   indexer-worker sitting at the 256M default. Assume uniform when the
+	   script is too old to say, which is the pre-existing behaviour. */
+	$st = array('vsz' => '', 'uniform' => true, 'ok' => ($rc === 0));
+	foreach ($out as $line) {
+		$line = trim($line);
+		if (strpos($line, 'vsz=') === 0) {
+			$v = substr($line, 4);
+			$st['vsz'] = ($v === 'default') ? '' : $v;
+		}
+		if (strpos($line, 'uniform=') === 0)
+			$st['uniform'] = (substr($line, 8) !== 'no');
+	}
+	$cache = $st;
+	return $st;
+}
+
+/* The script validates this too, but a value that reaches a command line should
+   never have been free text here. It restarts dovecot -- a service{} setting is
+   read by the master at startup, and a reload would leave the old limit in force
+   while the file claimed otherwise. */
+function mail_vsz_set($vsz) {
+	if (!preg_match('/^\d{1,6}[KMG]?$/', $vsz))
+		return array('error' => 'Invalid memory limit.', 'success' => '');
+	$out = array(); $rc = 0;
+	exec('sudo -n /usr/bin/bash '.escapeshellarg(VSZ_HELPER).' --vsz '.escapeshellarg($vsz).' 2>&1', $out, $rc);
+	mail_vsz_status(true);
+	if ($rc !== 0)
+		return array('error' => 'Could not set the memory limit: '.h(implode(' ', array_slice($out, -3))), 'success' => '');
+	return array('error' => '', 'success' => 'IMAP/POP3 memory limit set to '.h($vsz).' and dovecot restarted.');
+}
+
 function mail_setting_defs($which) {
 	if ($which === 'exim') return array(
-		'tls' => array('title' => 'TLS &amp; ports', 'keys' => array(
-			'tls_min_version' => array(
-				'label' => 'Minimum TLS version', 'type' => 'select', 'virtual' => true,
-				'choices' => array('TLSv1.0' => 'TLS 1.0 (insecure)', 'TLSv1.1' => 'TLS 1.1 (insecure)', 'TLSv1.2' => 'TLS 1.2 (recommended)', 'TLSv1.3' => 'TLS 1.3 only'),
-				'help'  => 'Written as <code>openssl_options</code>. TLS 1.3 only will refuse mail from older servers — most of the internet still needs 1.2.'),
-			'tls_advertise_hosts' => array(
-				'label' => 'Advertise TLS to', 'type' => 'text', 'pattern' => '#^[A-Za-z0-9 :\.\*\!\+\@\-_/]{1,255}$#',
-				'help'  => 'Hosts offered STARTTLS. <code>*</code> means everyone; empty disables TLS entirely.'),
-			'tls_require_ciphers' => array(
-				'label' => 'Cipher list', 'type' => 'text', 'pattern' => '#^[A-Za-z0-9 :\.\!\+\-_@]{0,255}$#',
-				'help'  => 'OpenSSL cipher string. Leave as shipped unless you know you need to change it.'),
-			'daemon_smtp_ports' => array(
-				'label' => 'Listening ports', 'type' => 'text', 'pattern' => '#^[0-9 :]{1,64}$#',
-				'help'  => 'Colon-separated. 25 = server-to-server, 587 = submission, 465 = submission over implicit TLS.'),
-			'tls_on_connect_ports' => array(
-				'label' => 'Implicit-TLS ports', 'type' => 'text', 'pattern' => '#^[0-9 :]{0,64}$#',
-				'help'  => 'Ports where TLS starts immediately, without STARTTLS. Normally just 465.'),
-		)),
-		'limits' => array('title' => 'Limits &amp; throttling', 'keys' => array(
-			'message_size_limit' => array('label' => 'Maximum message size', 'type' => 'text', 'pattern' => '#^\d{1,9}[KMG]?$#i',
-				'help' => 'A number, optionally suffixed K, M or G. <code>0</code> means no limit.'),
-			'recipients_max' => array('label' => 'Maximum recipients per message', 'type' => 'number', 'min' => 0, 'max' => 100000),
-			'smtp_accept_max' => array('label' => 'Maximum simultaneous connections', 'type' => 'number', 'min' => 0, 'max' => 10000),
-			'smtp_accept_queue_per_connection' => array('label' => 'Messages per connection before queueing', 'type' => 'number', 'min' => 0, 'max' => 100000),
-			'remote_max_parallel' => array('label' => 'Parallel remote deliveries', 'type' => 'number', 'min' => 1, 'max' => 1000),
-			'smtp_receive_timeout' => array('label' => 'Receive timeout', 'type' => 'text', 'pattern' => EXIM_TIME_RE,
-				'help' => 'Time exim waits for the next SMTP command, e.g. <code>165s</code>, <code>5m</code> or <code>2m45s</code>.'),
-		)),
 		'identity' => array('title' => 'Identity &amp; logging', 'keys' => array(
 			'primary_hostname' => array('label' => 'Primary hostname', 'type' => 'text', 'pattern' => '#^[A-Za-z0-9\.\-]{0,253}$#',
 				'help' => 'The name exim calls itself in HELO and Received headers. Leave empty to use the system hostname.'),
@@ -5341,6 +6784,85 @@ function mail_setting_defs($which) {
 				'help' => 'Space-separated <code>+item</code> / <code>-item</code> flags controlling what lands in the exim log.'),
 			'disable_ipv6' => array('label' => 'Disable IPv6', 'type' => 'toggle',
 				'help' => 'Turn on only when the server has no working IPv6 — otherwise exim wastes a connection attempt per delivery.'),
+		)),
+		'tls' => array('title' => 'TLS &amp; ports', 'keys' => array(
+			'tls_min_version' => array(
+				'label' => 'Minimum TLS version', 'type' => 'select', 'virtual' => true,
+				'choices' => array('TLSv1.0' => 'TLS 1.0 (insecure)', 'TLSv1.1' => 'TLS 1.1 (insecure)', 'TLSv1.2' => 'TLS 1.2 (recommended)', 'TLSv1.3' => 'TLS 1.3 only'),
+				'help'  => 'Written as <code>openssl_options</code>. TLS 1.3 only will refuse mail from older servers — most of the internet still needs 1.2.'),
+			/* tls_advertise_hosts is deliberately NOT offered here. Exim's own
+			   default is `*`, so the only thing a change can do is narrow who
+			   is offered STARTTLS -- and clearing it turns STARTTLS off on 25
+			   and 587 outright, which means submission passwords in clear.
+			   The one historical reason to narrow it (ancient MTAs that broke
+			   on STARTTLS) is long gone. Still editable in the Advanced tab
+			   for anyone who genuinely needs it. */
+			'tls_require_ciphers' => array(
+				'label' => 'Cipher list', 'type' => 'text', 'pattern' => '#^[A-Za-z0-9 :\.\!\+\-_@]{0,255}$#',
+				'help'  => 'OpenSSL cipher string. Leave as shipped unless you know you need to change it.'),
+			'daemon_smtp_ports' => array(
+				'label' => 'Listening ports', 'type' => 'text', 'pattern' => '#^[0-9 :]{1,64}$#',
+				'help'  => 'Colon-separated. 25 = server-to-server, 587 = submission, 465 = submission over implicit TLS.'),
+			'tls_on_connect_ports' => array(
+				'label' => 'Implicit-TLS ports', 'type' => 'text', 'pattern' => '#^[0-9 :]{0,64}$#',
+				'help'  => 'Ports where TLS starts immediately, without STARTTLS. Normally just 465.'),
+		)),
+		'limits' => array('title' => 'Message &amp; connection limits', 'keys' => array(
+			'message_size_limit' => array('label' => 'Maximum message size', 'type' => 'text', 'pattern' => '#^\d{1,9}[KMG]?$#i',
+				'help' => 'A number, optionally suffixed K, M or G. <code>0</code> means no limit.'),
+			'recipients_max' => array('label' => 'Maximum recipients per message', 'type' => 'number', 'min' => 0, 'max' => 100000),
+			'smtp_accept_max' => array('label' => 'Maximum simultaneous connections', 'type' => 'number', 'min' => 0, 'max' => 10000),
+			'smtp_accept_queue_per_connection' => array('label' => 'Messages per connection before queueing', 'type' => 'number', 'min' => 0, 'max' => 100000),
+			'remote_max_parallel' => array('label' => 'Parallel remote deliveries', 'type' => 'number', 'min' => 1, 'max' => 1000),
+			'smtp_receive_timeout' => array('label' => 'Receive timeout', 'type' => 'text', 'pattern' => EXIM_TIME_RE,
+				'help' => 'Time exim waits for the next SMTP command, e.g. <code>165s</code>, <code>5m</code> or <code>2m45s</code>.'),
+		)),
+		/* Outbound sending limits. Every key here is an exim MACRO, not an
+		   option: the rules that read them live in acl_check_rcpt and in
+		   acl_reqad_fail / acl_reqad_notsmtp, installed once by
+		   scripts/update/setup_mail_limits.sh. That is what lets the whole
+		   feature be tuned through the ordinary settings path -- a macro is a
+		   `NAME = value` line at column zero like any other. `macro => true`
+		   marks them so a cleared field restores the default rather than
+		   deleting a line the ACL depends on. */
+		'sendlimits' => array('title' => 'Outbound sending limits', 'keys' => array(
+			'REQAD_LIMIT_MODE' => array(
+				'label' => 'When a domain is over its limit', 'type' => 'select', 'macro' => true, 'default' => 'freeze',
+				'choices' => array(
+					'freeze' => 'Log and freeze — accept, hold in the mail queue',
+					'defer'  => 'Temporary reject (451) — sender retries later',
+					'deny'   => 'Permanent reject (550) — sender gets a bounce'),
+				'help'  => '<strong>Freeze</strong> accepts the message and holds it, undelivered, on the <a href="/email/#queue">Mail Queue</a> page — nothing bounces and nothing is lost, and you release or delete it after a look. Note the sender is told the mail went out, and held mail is eventually discarded by <em>Discard frozen messages after</em> on the Settings tab. <strong>451</strong> leaves the mail with the sending client, which retries later; <strong>550</strong> bounces it. Every mode logs, so <code>grep "REQAD LIMIT" /var/log/exim/main.log</code> always shows what happened.'),
+			'REQAD_MAX_HOURLY' => array(
+				'label' => 'Maximum hourly email by domain relayed', 'type' => 'number', 'macro' => true,
+				'min' => 0, 'max' => 1000000, 'default' => '200',
+				'help'  => 'Recipients per hour per sending domain, counted from the mailbox that authenticated — not from the envelope sender, which is forgeable. <code>0</code> means no limit.'),
+			'REQAD_MAX_FAILURES' => array(
+				'label' => 'Maximum failed messages per hour', 'type' => 'number', 'macro' => true,
+				'min' => 0, 'max' => 1000000, 'default' => '25',
+				'help'  => 'Permanent delivery failures per hour per sending domain — a bounce, counted once, at the moment it is generated. Deferrals and the retries that follow them are <strong>not</strong> counted: mail to one over-quota mailbox is retried for days. <code>0</code> means no limit.'),
+			'REQAD_LOCALMAIL' => array(
+				'label' => 'Mail sent without authenticating', 'type' => 'select', 'macro' => true, 'default' => 'warn',
+				'choices' => array(
+					'accept' => 'Allow — no restriction',
+					'warn'   => 'Log only — record it, deliver anyway',
+					'deny'   => 'Block — require authenticated SMTP'),
+				'help'  => 'Covers PHP\'s <code>mail()</code>, cron jobs and anything pointed at <code>localhost:25</code> without a login — the traffic a hacked plugin uses, and the traffic no per-domain limit can see, because there is no domain to attribute it to. Blocking it forces applications onto authenticated SMTP on port 587, where they are counted. Root and system mail are always allowed. <strong>Leave this on log only until the log tells you which sites still use <code>mail()</code></strong> — blocking it breaks contact forms that have never been configured with SMTP credentials.'),
+			'reqad_nolimit' => array(
+				'label' => 'Exempt sending domains', 'type' => 'textarea', 'rows' => 2,
+				'line_key' => 'domainlist reqad_nolimit', 'macro' => true, 'default' => '',
+				'pattern' => '#^[A-Za-z0-9\.\-\*\?\+\@ :_/]{0,1024}$#', 'maxlen' => 1024, 'oneline' => true,
+				'help'  => 'Colon-separated list of domains that no limit applies to, e.g. <code>example.com : mail.example.net</code>. Leave empty for none.'),
+		)),
+		/* A macro read by the forwards router's condition, installed by
+		   scripts/update/setup_forward_spam_gate.sh. A toggle rather than a
+		   select: the script always writes the line, and a missing line means
+		   the router sees the bare macro name, never "yes" -- i.e. off, which
+		   is what the toggle then shows. */
+		'forwarding' => array('title' => 'Forwarding', 'keys' => array(
+			'REQAD_NO_FORWARD_SPAM' => array(
+				'label' => 'Don\'t forward mails marked as spam', 'type' => 'toggle', 'macro' => true,
+				'help'  => 'Mail that SpamAssassin tags as spam (<code>X-Spam-Flag: YES</code>) is not passed on by email forwarders. It is still delivered to the address\'s own mailbox if it has one; for a forward-only address it is discarded without a bounce. Forwarding spam to Gmail or Outlook gets this server\'s IP marked as a spam source, which hurts delivery of all mail sent from it. Nothing is scanned twice — the forwarder reads the verdict given when the message arrived.'),
 		)),
 		'queue' => array('title' => 'Queue behaviour', 'keys' => array(
 			'queue_run_max' => array('label' => 'Parallel queue runners', 'type' => 'number', 'min' => 0, 'max' => 1000),
@@ -5373,13 +6895,13 @@ function mail_setting_defs($which) {
 			'imap_idle_notify_interval' => array('label' => 'IMAP IDLE notify interval', 'type' => 'text', 'pattern' => '#^\d{1,6}\s*(secs?|mins?|hours?|s|m|h)?$#',
 				'help' => 'How often dovecot pings an idle client, e.g. <code>2 mins</code>.'),
 			'imap_max_line_length' => array('label' => 'IMAP max line length', 'type' => 'text', 'pattern' => '#^\d{1,12}\s*[kKmM]?$#'),
+			'mail_vsz_limit' => array('label' => 'Memory limit per mail process', 'type' => 'select', 'special' => 'vsz',
+				'choices' => array('256M' => '256 MB (dovecot default)', '512M' => '512 MB', '1024M' => '1 GB', '2048M' => '2 GB', '4096M' => '4 GB'),
+				'help' => 'Address space a single <code>imap</code>, <code>pop3</code> or <code>indexer-worker</code> process may use. A process that hits the ceiling is <strong>killed mid-session</strong> — the user sees the connection drop while opening a large message or running a search, and the mail log shows <code>child NNN returned error 83 (Out of memory (service imap { vsz_limit=256 MB }))</code>. Raise it if you see that. The full-text indexer is often the process that dies first, and it surfaces on the imap side as <code>Mailbox INBOX: indexer failed to index mailbox</code>, so all three are set together — raising one alone just moves the error somewhere else. This is address space, not RAM: a higher limit does not reserve memory, it stops dovecot refusing the mapping. Large mailboxes, full-text searches and reading compressed mail all push against it. Saving this <strong>restarts dovecot</strong>, because the limit is read by the master process at startup.'),
 		)),
 		'storage' => array('title' => 'Mail storage', 'keys' => array(
 			'mail_compression' => array('label' => 'Compress stored mail', 'type' => 'toggle', 'special' => 'compress',
 				'help' => 'Lets dovecot read gzipped messages, so old mail can be stored compressed — typically a 60-70% saving on a mail-heavy account. This switch only makes compressed mail <em>readable</em>; nothing is compressed until a mailbox is listed in <code>etc/mail-archive.conf</code>, which the nightly job reads. Turning it back off is refused while any mailbox still holds compressed mail, because those messages would reach clients as unreadable gzip data.'),
-			'mail_compress_vsz' => array('label' => 'Memory limit per IMAP/POP3 process', 'type' => 'select', 'special' => 'compress_vsz',
-				'choices' => array('256M' => '256 MB (dovecot default)', '512M' => '512 MB', '1024M' => '1 GB (recommended with compression)', '2048M' => '2 GB'),
-				'help' => 'Address space a single imap or pop3 process may use. Decompressing a message costs memory, and a process that hits the ceiling is killed mid-session — which the user sees as the connection dropping while opening a large old message. Only applies while compression is on; it is written to the same file.'),
 		)),
 		'webmail' => array('title' => 'Webmail', 'keys' => array(
 			'webmail_autologin' => array('label' => 'Enable webmail auto-login', 'type' => 'toggle', 'special' => 'webmail',
@@ -5425,7 +6947,7 @@ function mail_setting_defs($which) {
 			'trusted_networks' => array(
 				'label' => 'Trusted networks', 'type' => 'textarea', 'rows' => 3,
 				'pattern' => '#^[0-9a-fA-F:\.\*/! \t\n-]*$#', 'maxlen' => 16384, 'oneline' => true,
-				'help' => 'Mail relayed through these hosts is not blamed for the Received headers above them, so RBL checks stop firing on your own relays. Space-separated; <code>10.0.0.0/8</code>, <code>192.168.1.1</code> and <code>!1.2.3.4</code> (exclude) are all accepted. Leave empty and SpamAssassin guesses from the Received chain.'),
+				'help' => 'Mail relayed through these hosts is not blamed for the Received headers above them, so RBL checks stop firing on your own relays. Space-separated; <code>10.0.0.0/8</code>, <code>192.168.1.1</code> and <code>!1.2.3.4</code> (exclude) are all accepted. Leave empty and SpamAssassin guesses from the Received chain. Do not list email providers here (Gmail, Outlook, ESPs) — that disables SpamAssassin\'s RBL tests on them and awards ALL_TRUSTED; they are scored by the REQAD_ESP_* rules from Trusted senders (skip RBL) instead.'),
 			'internal_networks' => array(
 				'label' => 'Internal networks', 'type' => 'textarea', 'rows' => 3,
 				'pattern' => '#^[0-9a-fA-F:\.\*/! \t\n-]*$#', 'maxlen' => 16384, 'oneline' => true,
@@ -5558,8 +7080,9 @@ function mail_settings_current($which) {
 		if ($which === 'exim' && $k === 'tls_min_version') { $out[$k] = exim_tls_min_version($content); continue; }
 		if (!empty($d['special']) && $d['special'] === 'webmail') { $out[$k] = webmail_autologin_enabled() ? 'yes' : 'no'; continue; }
 		/* compress.conf, not local.conf — ask the script that owns it */
-		if (!empty($d['special']) && $d['special'] === 'compress')     { $out[$k] = mail_compress_enabled() ? 'yes' : 'no'; continue; }
-		if (!empty($d['special']) && $d['special'] === 'compress_vsz') { $st = mail_compress_status(); $out[$k] = $st['vsz']; continue; }
+		if (!empty($d['special']) && $d['special'] === 'compress') { $out[$k] = mail_compress_enabled() ? 'yes' : 'no'; continue; }
+		/* limits.conf, via doveconf -- what dovecot is actually enforcing */
+		if (!empty($d['special']) && $d['special'] === 'vsz')      { $st = mail_vsz_status(); $out[$k] = $st['vsz']; continue; }
 		$v = mail_setting_read($content, mail_setting_line_key($k, $d), $which);
 		/* A key the config file still spells by its deprecated name (SpamAssassin's
 		   `required_hits` for `required_score`) is the value in force -- show it,
@@ -5734,13 +7257,19 @@ function mail_settings_apply($which, $posted) {
 		if (!array_key_exists($key, $values)) continue;
 		$value = $values[$key];
 
-		/* Also not local.conf: both of these live in compress.conf, which one
-		   script call writes in full. Collect them and reconcile once after the
-		   loop — handling them inline would enable compression for the toggle
-		   and then immediately re-run the script for the memory limit, taking
-		   dovecot through two restarts for one save. */
-		if (!empty($def['special']) && $def['special'] === 'compress')     { $want_compress = ($value === 'yes'); continue; }
-		if (!empty($def['special']) && $def['special'] === 'compress_vsz') { $want_vsz = $value; continue; }
+		/* A macro is not an option with a daemon default behind it: the ACL
+		   text further down the file reads it BY NAME, so deleting the line --
+		   what a cleared field means everywhere else -- leaves exim expanding a
+		   token that no longer exists. Put the declared default back instead. */
+		if (!empty($def['macro']) && $value === '')
+			$value = isset($def['default']) ? (string)$def['default'] : '0';
+
+		/* Also not local.conf: each of these is written in full by the script
+		   that owns its file. Collect them and reconcile once after the loop,
+		   so a save that changes both does not take dovecot through two
+		   restarts. */
+		if (!empty($def['special']) && $def['special'] === 'compress') { $want_compress = ($value === 'yes'); continue; }
+		if (!empty($def['special']) && $def['special'] === 'vsz')      { $want_vsz = $value; continue; }
 
 		/* not a local.conf key: it owns a generated credential and a passdb
 		   block, so it has its own enable/disable path */
@@ -5772,9 +7301,11 @@ function mail_settings_apply($which, $posted) {
 			if ($cur === $value) continue;
 		} elseif ($current !== null && trim($current) === $value) {
 			continue;
-		} elseif ($value === '') {
+		} elseif ($value === '' && empty($def['macro'])) {
 			/* cleared: drop the line so the daemon default applies again. If it
-			   was not in the file to begin with there is nothing to do. */
+			   was not in the file to begin with there is nothing to do.
+			   Macros are exempt -- an empty one is written as `NAME =`, which
+			   is a legal empty value; deleting it is not (see above). */
 			if ($current === null) continue;
 			$content = mail_setting_remove($content, $lkey, $which);
 			if ($alias !== '') $content = mail_setting_remove($content, $alias, $which);
@@ -5790,36 +7321,45 @@ function mail_settings_apply($which, $posted) {
 		$changed++;
 	}
 
-	/* One reconciliation for both compression fields. The memory limit is only
-	   meaningful while compression is on (it is written to compress.conf, which
-	   does not exist otherwise), so turning compression off wins over any vsz
-	   choice submitted alongside it. */
-	if ($want_compress !== null || $want_vsz !== null) {
-		$st  = mail_compress_status();
-		$on  = $st['enabled'];
-		$want = ($want_compress === null) ? $on : $want_compress;
+	/* The memory limit is INDEPENDENT of compression. It used to be handled as
+	   part of it, written into compress.conf by the compression helper -- which
+	   meant that on a server with compression off this field was read, validated
+	   and then silently discarded, because the whole reconciliation went down
+	   the "compression stays off" branch and no file was ever written. That is
+	   the bug this split fixes: a limit raised on the panel now lands whether or
+	   not anything is compressed. '' from the select still means "leave it
+	   alone" (dovecot's default is in force and the admin did not pick). */
+	/* One exception to doing it here: when compression is being switched ON in
+	   the same save, hand the limit to the compression helper instead. It
+	   forwards the value to the very same script with --no-restart and picks the
+	   restart up itself, so a save that changes both settings still costs one
+	   dovecot restart rather than two -- restarting twice drops every IMAP
+	   connection twice for a single click. */
+	$vsz_via_compress = ($want_vsz !== null && $want_vsz !== ''
+	                     && $want_compress === true && !mail_compress_enabled());
 
-		if (!$want) {
-			if ($on) {
-				$r = mail_compress_disable();
-				if ($r['error'] !== '') return $r;
-				$special_msgs[] = $r['success'];
-			}
-		} else {
-			/* '' from the select means "leave it alone": keep what is in force,
-			   or the recommended value when switching compression on for the
-			   first time. Never silently drop back to the 256M default, which
-			   is the value compression makes inadequate. */
-			$vsz = ($want_vsz !== null && $want_vsz !== '')
-				? $want_vsz
-				: ($st['vsz'] !== '' ? $st['vsz'] : '1024M');
-			if (!$on || $vsz !== $st['vsz']) {
-				$r = mail_compress_enable($vsz);
-				if ($r['error'] !== '') return $r;
-				$special_msgs[] = $on
-					? 'Memory limit set to '.h($vsz).'.'
-					: $r['success'];
-			}
+	if ($want_vsz !== null && $want_vsz !== '' && !$vsz_via_compress) {
+		$st = mail_vsz_status();
+		/* !uniform means the three services disagree, so "the value is already
+		   what you picked" is only true of imap -- write anyway and bring the
+		   rest into line. */
+		if ($want_vsz !== $st['vsz'] || !$st['uniform']) {
+			$r = mail_vsz_set($want_vsz);
+			if ($r['error'] !== '') return $r;
+			$special_msgs[] = $r['success'];
+		}
+	}
+
+	/* Compression owns compress.conf only. Enabling it still makes sure the
+	   limit above is not left at a value decompression makes inadequate -- the
+	   helper asks setup_dovecot_vsz.sh for that, rather than writing a second
+	   copy of the setting into its own file. */
+	if ($want_compress !== null) {
+		$on = mail_compress_enabled();
+		if ($want_compress !== $on) {
+			$r = $want_compress ? mail_compress_enable() : mail_compress_disable();
+			if ($r['error'] !== '') return $r;
+			$special_msgs[] = $r['success'];
 		}
 	}
 
@@ -5832,6 +7372,84 @@ function mail_settings_apply($which, $posted) {
 	if ($r['error'] === '' && $special_msgs)
 		$r['success'] = implode(' ', $special_msgs).' '.$r['success'];
 	return $r;
+}
+
+/* ---- Exim outbound sending limits ---------------------------------------
+
+   The counters are exim's own ratelimit hints DB, written by the ACL rules
+   scripts/update/setup_mail_limits.sh installs. The panel keeps no count of
+   its own -- it reads and clears exim's, through the helper, because the DB is
+   exim:exim and its format is exim's business.
+
+   What `rate` means: ratelimit keeps an exponentially smoothed average over
+   the period, not a tally. Two messages back to back read as 1.92, not 2, and
+   the number decays as the hour passes. It is the same figure the ACL compares
+   against the limit, so it is what is actually being enforced -- but do not
+   present it as "messages sent". */
+
+define('LIMITS_HELPER', _PATH.'/scripts/mail/limits-helper.sh');
+
+function exim_limits_helper($args) {
+	if (!is_file(LIMITS_HELPER)) return null;
+	$out = shell_exec('sudo -n '.escapeshellarg(LIMITS_HELPER).' '.$args.' 2>/dev/null');
+	return ($out === null) ? null : (string)$out;
+}
+
+/* Is the managed block in exim.conf at all? The settings form is meaningless
+   without it -- the macros would be edited and nothing would read them. */
+function exim_limits_installed() {
+	static $known = null;
+	if ($known === null)
+		$known = (trim((string)exim_limits_helper('status')) === 'installed');
+	return $known;
+}
+
+/* domain => array('hourly' => rate|null, 'failures' => rate|null, 'updated' => text),
+   sorted with the busiest first. */
+function exim_limits_counters() {
+	$out  = (string)exim_limits_helper('list');
+	$rows = array();
+	foreach (explode("\n", $out) as $line) {
+		if (trim($line) === '') continue;
+		$f = explode("\t", $line);
+		if (count($f) < 4) continue;
+		list($dom, $kind, $rate, $when) = $f;
+		if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9\.\-]{0,252}$/', $dom)) continue;
+		if ($kind !== 'hourly' && $kind !== 'failures') continue;
+		if (!isset($rows[$dom]))
+			$rows[$dom] = array('hourly' => null, 'failures' => null, 'updated' => '');
+		$rows[$dom][$kind] = (float)$rate;
+		/* the later of the two timestamps is when this domain was last seen */
+		if (strtotime($when) > strtotime($rows[$dom]['updated'])) $rows[$dom]['updated'] = $when;
+	}
+	uasort($rows, function ($a, $b) {
+		$x = max((float)$a['hourly'], (float)$a['failures']);
+		$y = max((float)$b['hourly'], (float)$b['failures']);
+		if ($x == $y) return 0;
+		return ($x < $y) ? 1 : -1;
+	});
+	return $rows;
+}
+
+/* Clear one counter, or every counter when $domain is ''. $kind is the panel's
+   word, never a database key -- the helper builds the key itself. */
+function exim_limits_reset($kind, $domain) {
+	if ($domain === '' && $kind === '') {
+		exim_limits_helper('reset-all');
+		return array('error' => '', 'success' => 'All sending counters cleared.');
+	}
+	if ($kind !== 'hourly' && $kind !== 'failures')
+		return array('error' => 'Error: unknown counter.', 'success' => '');
+	if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9\.\-]{0,252}$/', (string)$domain))
+		return array('error' => 'Error: not a valid domain.', 'success' => '');
+
+	$out = shell_exec('sudo -n '.escapeshellarg(LIMITS_HELPER).' reset '
+	                  .escapeshellarg($kind).' '.escapeshellarg($domain).' 2>&1');
+	$out = trim((string)$out);
+	if ($out !== '')
+		return array('error' => 'Error: '.h($out), 'success' => '');
+	return array('error' => '',
+	             'success' => ($kind === 'hourly' ? 'Hourly' : 'Failure').' counter cleared for '.h($domain).'.');
 }
 
 /* ---- Exim DNS blocklists (RBLs) -----------------------------------------
@@ -5897,6 +7515,268 @@ function exim_dnslists_apply($idx, $hosts) {
 	}
 
 	return apply_mail_config('exim', implode("\n", $lines));
+}
+
+
+/* ---- Skip-RBL: senders exempt from the blocklist checks -------------------
+   A DNS blocklist listing is evidence, not proof, and the large ESPs get
+   listed routinely -- one compromised customer is enough to put a shared
+   outbound range on a list for a day. Rejecting on that means losing real
+   mail from Gmail or Microsoft 365, which is a worse failure than accepting
+   some spam, so their ranges are exempted from the lookup.
+
+   /etc/exim/skiprblhosts is generated by scripts/mail/build-skiprbl.sh from
+   the ESP catalogue in etc/skiprbl-providers.ini plus the addresses kept here
+   in the settings table. The file is output, never input: nothing reads a
+   value back out of it, so a hand edit is simply lost on the next run. */
+
+if (!defined('SKIPRBL_FILE'))    define('SKIPRBL_FILE',    '/etc/exim/skiprblhosts');
+if (!defined('SKIPRBL_INI'))     define('SKIPRBL_INI',     _PATH.'/etc/skiprbl-providers.ini');
+if (!defined('SKIPRBL_BUILDER')) define('SKIPRBL_BUILDER', _PATH.'/scripts/mail/build-skiprbl.sh');
+
+/* The ESP catalogue, in file order. */
+function skiprbl_providers() {
+	if (!is_readable(SKIPRBL_INI)) return array();
+	$ini = @parse_ini_file(SKIPRBL_INI, true, INI_SCANNER_RAW);
+	if (!is_array($ini)) return array();
+	$out = array();
+	foreach ($ini as $key => $sec) {
+		if (!is_array($sec)) continue;
+		/* INI_SCANNER_RAW is mandatory here: PHP's default ini scanner treats
+		   `off` as a reserved word and hands back "", which would read as "on"
+		   and silently exempt a provider shipped switched off. RAW keeps any
+		   quotes the value was written with, so strip those. */
+		$dflt = isset($sec['default']) ? strtolower(trim($sec['default'], " \t\"'")) : '';
+		$out[$key] = array(
+			'key'     => $key,
+			'label'   => isset($sec['label']) && $sec['label'] !== '' ? trim($sec['label']) : $key,
+			'spf'     => isset($sec['spf']) ? trim($sec['spf']) : '',
+			/* `default = off` ships a provider switched off -- a known spam
+			   source nobody wants exempted, catalogued so it can be seen and
+			   turned on deliberately rather than left out and forgotten. */
+			'default' => in_array($dflt, array('off', 'no', '0', 'false', 'disabled'), true) ? 'off' : 'on',
+		);
+	}
+	return $out;
+}
+
+function skiprbl_disabled() {
+	$raw = setting_get('skiprbl-disabled', '');
+	$out = array();
+	foreach (preg_split('/[\s,]+/', $raw) as $k) {
+		$k = trim($k);
+		if ($k !== '') $out[] = $k;
+	}
+	return $out;
+}
+
+function skiprbl_enabled_keys() {
+	$raw = setting_get('skiprbl-enabled', '');
+	$out = array();
+	foreach (preg_split('/[\s,]+/', $raw) as $k) {
+		$k = trim($k);
+		if ($k !== '') $out[] = $k;
+	}
+	return $out;
+}
+
+/* Three-way, matching provider_is_on() in build-skiprbl.sh: an explicit choice
+   wins, otherwise the catalogue's default decides. Storing both lists rather
+   than just the off one is what stops a preference saved today from switching
+   on a provider a later update adds to the catalogue. */
+function skiprbl_is_on($key, $prov, $off = null, $on = null) {
+	if ($off === null) $off = skiprbl_disabled();
+	if ($on  === null) $on  = skiprbl_enabled_keys();
+	if (in_array($key, $off, true)) return false;
+	if (in_array($key, $on,  true)) return true;
+	return !(isset($prov['default']) && $prov['default'] === 'off');
+}
+
+function skiprbl_extra() {
+	return (string)setting_get('skiprbl-extra', '');
+}
+
+/* One address per line, with an optional "# note". Exim ignores everything
+   from a # to end of line in a list file, so the note rides along into the
+   live list -- which is the whole point: the flat file this replaced had no
+   room to say why any address was in it. */
+function skiprbl_valid_entry($addr) {
+	$addr = trim((string)$addr);
+	if ($addr === '') return false;
+	if (strpos($addr, ':') !== false) {                       // IPv6
+		if (!preg_match('#^([0-9A-Fa-f:]+)(?:/(\d{1,3}))?$#', $addr, $m)) return false;
+		if (isset($m[2]) && $m[2] !== '' && (int)$m[2] > 128)  return false;
+		return (bool)@inet_pton($m[1]);
+	}
+	if (!preg_match('#^(\d{1,3}(?:\.\d{1,3}){3})(?:/(\d{1,2}))?$#', $addr, $m)) return false;
+	if (isset($m[2]) && $m[2] !== '' && (int)$m[2] > 32) return false;
+	foreach (explode('.', $m[1]) as $o)
+		if ((int)$o > 255) return false;
+	return true;
+}
+
+/* Split the textarea into validated "addr" / "addr  # note" lines, or report
+   the first line that is not an address. */
+function skiprbl_clean_extra($raw, &$error) {
+	$error = '';
+	$out   = array();
+	$seen  = array();
+	foreach (preg_split('/\r\n|\r|\n/', (string)$raw) as $line) {
+		$addr = $line;
+		$note = '';
+		$hash = strpos($line, '#');
+		if ($hash !== false) {
+			$addr = substr($line, 0, $hash);
+			$note = trim(substr($line, $hash + 1));
+		}
+		$addr = trim($addr);
+		if ($addr === '') continue;
+		if (!skiprbl_valid_entry($addr)) {
+			$error = 'Not a valid IP address or CIDR range: '.$addr;
+			return array();
+		}
+		if (isset($seen[$addr])) continue;
+		$seen[$addr] = true;
+		/* a note must not carry a newline back into a one-item-per-line file */
+		$note = trim(preg_replace('/\s+/', ' ', $note));
+		$out[] = ($note !== '') ? $addr.'  # '.$note : $addr;
+	}
+	return $out;
+}
+
+/* Parse the generated file back into groups, so the panel reports what exim is
+   actually serving rather than what we think we generated. */
+function skiprbl_groups() {
+	if (!is_readable(SKIPRBL_FILE)) return array();
+	$out   = array();
+	$label = '';
+	foreach (file(SKIPRBL_FILE, FILE_IGNORE_NEW_LINES) as $line) {
+		if (preg_match('/^#\s*===\s*(.+?)\s*===/', $line, $m)) {
+			$label = $m[1];
+			if (!isset($out[$label])) $out[$label] = array();
+			continue;
+		}
+		if ($label === '') continue;
+		if (preg_match('/^\s*(?:#|$)/', $line)) continue;
+		$out[$label][] = trim($line);
+	}
+	return $out;
+}
+
+/* Header facts: when it was built and how much of it is provider data. */
+function skiprbl_meta() {
+	$meta = array('generated' => '', 'esp' => 0, 'providers' => '', 'exists' => false, 'total' => 0);
+	if (!is_readable(SKIPRBL_FILE)) return $meta;
+	$meta['exists'] = true;
+	foreach (file(SKIPRBL_FILE, FILE_IGNORE_NEW_LINES) as $line) {
+		if (preg_match('/^#\s*Generated\s+(.+)$/', $line, $m))    $meta['generated'] = trim($m[1]);
+		elseif (preg_match('/^#\s*esp-entries:\s*(\d+)/', $line, $m)) $meta['esp'] = (int)$m[1];
+		elseif (preg_match('/^#\s*providers:\s*(.+)$/', $line, $m))   $meta['providers'] = trim($m[1]);
+		elseif (!preg_match('/^\s*(?:#|$)/', $line))                  $meta['total']++;
+	}
+	return $meta;
+}
+
+/* Regenerate. Slow -- it walks a few dozen SPF records over DNS -- so callers
+   run it from a POST, never from a page render. */
+function skiprbl_rebuild($force = false) {
+	if (!is_file(SKIPRBL_BUILDER))
+		return array('error' => 'Builder script not installed: '.SKIPRBL_BUILDER, 'success' => '');
+
+	$cmd = 'sudo -n '.escapeshellarg(SKIPRBL_BUILDER).($force ? ' --force' : '').' 2>&1';
+	$out = array(); $rc = 0;
+	exec($cmd, $out, $rc);
+	$txt = trim(implode("\n", $out));
+
+	if ($rc === 2)
+		return array('error' => "The rebuilt list was rejected as implausible, so the live one was kept:\n".$txt, 'success' => '');
+	if ($rc !== 0)
+		return array('error' => "Rebuild failed:\n".($txt !== '' ? $txt : 'exit status '.$rc), 'success' => '');
+
+	$meta = skiprbl_meta();
+	return array('error' => '', 'success' => 'Skip-RBL list rebuilt: '.$meta['total'].' addresses ('.$meta['providers'].' providers).');
+}
+
+/* --- the exim side -------------------------------------------------------
+   The exemption is a plain `!hosts =` condition placed immediately BEFORE the
+   `dnslists =` it guards. Order is load-bearing: exim evaluates ACL conditions
+   as written, so in front of the lookup a known sender costs one local file
+   match, while behind it the DNS round trips happen first and are then thrown
+   away. */
+
+function skiprbl_exim_marker() {
+	return '# exempt known senders before the lookup (Reqad: skip-RBL)';
+}
+
+/* Returns total uncommented dnslists conditions and how many are guarded. */
+function skiprbl_exim_status($content = null) {
+	if ($content === null) $content = (string)mail_config_read('exim');
+	$lines   = explode("\n", str_replace("\r\n", "\n", $content));
+	$total   = 0;
+	$guarded = 0;
+	$prev_guard = false;
+	foreach ($lines as $l) {
+		if (preg_match('/^\s*!\s*hosts\s*=\s*'.preg_quote(SKIPRBL_FILE, '/').'\s*$/', $l)) {
+			$prev_guard = true;
+			continue;
+		}
+		if (preg_match('/^\s*#/', $l)) continue;              // comments do not break the pairing
+		if (preg_match('/^\s*dnslists\s*=/', $l)) {
+			$total++;
+			if ($prev_guard) $guarded++;
+		}
+		$prev_guard = false;
+	}
+	return array('total' => $total, 'guarded' => $guarded);
+}
+
+/* Add the guard to every dnslists condition, or take every guard out again.
+   Goes through apply_mail_config(), so the result is checked with `exim -bV`
+   and reverted if exim dislikes it. */
+function skiprbl_exim_apply($enable) {
+	$content = str_replace("\r\n", "\n", (string)mail_config_read('exim'));
+	if ($content === '')
+		return array('error' => 'Could not read the exim configuration.', 'success' => '');
+
+	$marker    = skiprbl_exim_marker();
+	$guard_re  = '/^\s*!\s*hosts\s*=\s*'.preg_quote(SKIPRBL_FILE, '/').'\s*$/';
+	$stripped  = array();
+
+	/* always start from a clean slate, so re-running never stacks guards */
+	foreach (explode("\n", $content) as $l) {
+		if (preg_match($guard_re, $l))   continue;
+		if (trim($l) === $marker)        continue;
+		$stripped[] = $l;
+	}
+
+	$lines = $stripped;
+	if ($enable) {
+		if (!is_readable(SKIPRBL_FILE))
+			return array('error' => 'The list is not built yet: '.SKIPRBL_FILE.' does not exist. Rebuild it first.', 'success' => '');
+		$lines = array();
+		foreach ($stripped as $l) {
+			if (preg_match('/^(\s*)dnslists\s*=/', $l, $m) && !preg_match('/^\s*#/', $l)) {
+				$lines[] = $m[1].$marker;
+				$lines[] = $m[1].'!hosts = '.SKIPRBL_FILE;
+			}
+			$lines[] = $l;
+		}
+	}
+
+	$new = implode("\n", $lines);
+	if ($new === $content)
+		return array('error' => '', 'success' => $enable
+			? 'Every blocklist check already consults the skip-RBL list.'
+			: 'No blocklist check was consulting the skip-RBL list.');
+
+	$r = apply_mail_config('exim', $new);
+	if ($r['error'] === '') {
+		$st = skiprbl_exim_status($new);
+		$r['success'] = $enable
+			? 'Skip-RBL list applied to '.$st['total'].' blocklist check'.($st['total'] === 1 ? '' : 's').'.'
+			: 'Skip-RBL exemption removed from every blocklist check.';
+	}
+	return $r;
 }
 
 /* ---- Webmail auto-login (dovecot master user + Roundcube) ----------------
@@ -6284,7 +8164,7 @@ function addon_write_root_file($path, $content) {
 /* apache only: add/remove the <FilesMatch \.php$> SetHandler block that sends
    PHP to the domain's own fpm socket. Removing it drops the vhost back to
    mod_php. Mirrors apache_vhost_add_fpm()/apache_vhost_remove_fpm() in
-   edit_account.php, but with the per-domain socket. */
+   app/functions/accounts.php, but with the per-domain socket. */
 function addon_vhost_set_fpm($ini, $domain, $user, $enable) {
 	$file    = addon_vhost_path($ini, $domain);
 	$content = @file_get_contents($file);
@@ -6298,4 +8178,210 @@ function addon_vhost_set_fpm($ini, $domain, $user, $enable) {
 	}
 	addon_write_root_file($file, $content);
 	return true;
+}
+
+/* --- SMTP delivery failures ----------------------------------------------
+   These used to be INSERTed into an `errors` table in the panel database.
+   That was the wrong store: the rows are a rolling tail of whatever exim's
+   main.log still holds, they are never queried by anything but one page, and
+   they are re-derived from scratch on every run -- so the database carried
+   write traffic every minute, grew without bound and had to be vacuumed, all
+   to hold data that is already a log. They live in a log file now.
+
+   Format is one failure per line, `date|recipient|reason`, oldest first, so
+   the file appends cleanly and the tail is the newest. The reason is kept
+   verbatim (a log has room for it); only the page truncates. */
+
+if (!defined('SMTP_ERRORS_LOG'))   define('SMTP_ERRORS_LOG',   _PATH.'/log/smtp_errors.log');
+if (!defined('SMTP_ERRORS_MAX'))   define('SMTP_ERRORS_MAX',   5000);   // lines kept after a trim
+
+/* Parse one exim main.log permanent-failure line ("**") into date/email/reason,
+   or null when it is not one. Exim writes the recipient differently depending
+   on the transport, hence the three shapes:
+
+     ... ** user@example.com R=dnslookup T=remote_smtp: SMTP error ...
+     ... ** |/path/to/script <root@host>: retry timeout exceeded      (pipe)
+     ... ** old@example.com <new@example.com> R=...: ...              (alias) */
+function smtp_error_parse($line) {
+	if (!preg_match('/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \S+ \*\* (.*)$/', $line, $m))
+		return null;
+
+	$when = $m[1];
+	$rest = $m[2];
+
+	/* The routed target, then any parents exim expanded through, then the
+	   address it settled on -- the last of those is the one worth reporting,
+	   and for a pipe or file delivery it is the only address on the line. */
+	if (!preg_match('/^(\S+)((?:\s+\([^)]*\))*)(?:\s+<([^>]*)>)?(.*)$/', $rest, $m2))
+		return null;
+
+	$email = (isset($m2[3]) && $m2[3] !== '') ? $m2[3] : ltrim(rtrim($m2[1], ':'), '|');
+	$rest  = isset($m2[4]) ? $m2[4] : '';
+
+	/* Drop exim's routing breadcrumbs (R=router T=transport H=host ...); what
+	   is left after them is the reason the delivery failed. */
+	$rest = preg_replace('/^\s*(?:[A-Z]+=\S+\s*)*/', '', $rest);
+	$rest = trim(preg_replace('/\s+/', ' ', ltrim($rest, ": \t")));
+
+	if ($email === '' || $rest === '') return null;
+
+	/* `|` is the field separator, so it must not survive in the first two
+	   fields -- the reason is last and may keep its own. */
+	return array('date'   => $when,
+	             'email'  => str_replace('|', ' ', $email),
+	             'errmsg' => $rest);
+}
+
+/* The last $n lines of a file, read from the end so a trimmed-but-still-large
+   log does not have to be pulled into memory whole. */
+function smtp_errors_tail($file, $n) {
+	$fh = @fopen($file, 'rb');
+	if (!$fh) return array();
+
+	$buf = '';
+	fseek($fh, 0, SEEK_END);
+	$pos = ftell($fh);
+	while ($pos > 0 && substr_count($buf, "\n") <= $n) {
+		$read = min(8192, $pos);
+		$pos -= $read;
+		fseek($fh, $pos);
+		$buf = fread($fh, $read).$buf;
+	}
+	fclose($fh);
+
+	$buf = trim($buf, "\n");
+	if ($buf === '') return array();
+	return array_slice(explode("\n", $buf), -$n);
+}
+
+/* Failures for the SMTP statistics page: one line per recipient, newest first.
+   The page is a "who is bouncing" summary rather than a delivery trace, which
+   is what the old `GROUP BY email` in the SQL was reaching for. */
+function smtp_errors_read($limit = 500) {
+	$latest = array();
+	foreach (smtp_errors_tail(SMTP_ERRORS_LOG, SMTP_ERRORS_MAX) as $line) {
+		$f = explode('|', $line, 3);
+		if (count($f) < 3) continue;
+		/* the file is oldest-first, so a later line legitimately overwrites */
+		$latest[$f[1]] = array('date' => $f[0], 'email' => $f[1], 'errmsg' => $f[2]);
+	}
+
+	$rows = array_values($latest);
+	usort($rows, function($a, $b) { return strcmp($b['date'], $a['date']); });
+	return array_slice($rows, 0, $limit);
+}
+
+/* Append failures that are not logged yet.
+
+   exim's main.log is rescanned in full every minute, so almost everything the
+   parser hands us is already on disk. Dedup uses the newest timestamp in the
+   log as a high-water mark: anything older was seen on an earlier run, and
+   anything at that exact second is compared line for line, because several
+   deliveries can fail within the same second. Returns the number appended. */
+function smtp_errors_append($entries) {
+	$high = '';
+	$seen = array();
+	foreach (smtp_errors_tail(SMTP_ERRORS_LOG, 500) as $line) {
+		$ts = substr($line, 0, 19);
+		if ($ts > $high) { $high = $ts; $seen = array(); }
+		if ($ts === $high) $seen[$line] = true;
+	}
+
+	$new = array();
+	foreach ($entries as $e) {
+		if ($high !== '' && $e['date'] < $high) continue;
+		$line = $e['date'].'|'.$e['email'].'|'.$e['errmsg'];
+		if (isset($seen[$line])) continue;
+		$seen[$line] = true;                      // also collapses dups within this batch
+		$new[] = $line;
+	}
+	if (!$new) return 0;
+
+	if (@file_put_contents(SMTP_ERRORS_LOG, implode("\n", $new)."\n", FILE_APPEND | LOCK_EX) === false)
+		return 0;
+	@chmod(SMTP_ERRORS_LOG, 0644);                // cron writes as root, the panel reads as reqad
+	return count($new);
+}
+
+/* Keep the log bounded. Same shape as the trim in scripts/auto_update.sh:
+   rewrite via a temp file so a reader never sees a half-written log. */
+function smtp_errors_trim($max = SMTP_ERRORS_MAX) {
+	if (!is_file(SMTP_ERRORS_LOG)) return false;
+
+	$lines = @file(SMTP_ERRORS_LOG, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+	if ($lines === false || count($lines) <= $max) return false;
+
+	$tmp = SMTP_ERRORS_LOG.'.tmp';
+	if (@file_put_contents($tmp, implode("\n", array_slice($lines, -$max))."\n") === false)
+		return false;
+	@chmod($tmp, 0644);
+	return @rename($tmp, SMTP_ERRORS_LOG);
+}
+
+/* ---- Shared by app/functions/*.php (web modules, bin/reqad, API) ----------
+   The account/database/email operations live in app/functions/ and are called
+   from more than one front-end, so nothing in them may assume a web request. */
+
+/* Append one line to log/route_log. Web requests log the client address and the
+   nginx basic-auth user; the CLI logs "cli" and the invoking system user, so
+   route_log still says who did what. Absolute path: the CLI has no fixed CWD. */
+function route_log($message) {
+	if (isset($_SERVER['REMOTE_ADDR'])) {
+		$remote = $_SERVER['REMOTE_ADDR'];
+		$who    = isset($_SERVER['USER']) ? $_SERVER['USER'] : '-';
+	} else {
+		$remote = 'cli';
+		$pw     = function_exists('posix_getpwuid') ? posix_getpwuid(posix_geteuid()) : false;
+		$who    = $pw ? $pw['name'] : (string)getenv('USER');
+	}
+	error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$remote." ".$who." ".$message."\n", 3, _PATH.'/log/route_log');
+}
+
+/* Load the configured DNS provider (api_<provider>.php), once per process.
+
+   The provider files read $settings at their top level and their functions pull
+   the results back in with `global`. Included from inside a function, those
+   top-level assignments would land in the function's local scope and every
+   API call would run with empty credentials -- so the names are bound to the
+   globals here first, which makes the include write to the real globals. */
+function dns_provider_load($db) {
+	global $settings, $api_token, $api_user, $api_server, $powerdns_server, $powerdns_api_key, $dns_provider_name, $_debug;
+
+	if (!is_array($settings))
+		$settings = array();
+	$res = $db->query('SELECT name, value FROM settings');
+	while ($res && ($row = $res->fetchArray(SQLITE3_ASSOC)))
+		$settings[$row['name']] = $row['value'];
+
+	$prov = isset($settings['dns-provider']) ? $settings['dns-provider'] : '';
+	if (!in_array($prov, array('cloudflare', 'cpanel', 'powerdns'), true))
+		$prov = 'none';
+	include_once(__DIR__.'/api_'.$prov.'.php');
+	return $prov;
+}
+
+/* Uniform return value of the app/functions/ operations.
+   ok       -- the operation happened (possibly with warnings)
+   message  -- one-line human summary
+   warnings -- non-fatal problems after the change was made (e.g. a Let's
+               Encrypt certificate that could not be requested yet)
+   error    -- why nothing was changed (ok = false)
+   data     -- machine-readable details for the CLI --json / API */
+function result_ok($message, $data = array(), $warnings = array()) {
+	return array('ok' => true, 'message' => $message, 'warnings' => array_values(array_unique(array_filter($warnings, 'strlen'))), 'error' => '', 'data' => $data);
+}
+
+function result_error($error, $data = array()) {
+	return array('ok' => false, 'message' => '', 'warnings' => array(), 'error' => $error, 'data' => $data);
+}
+
+/* Web wrapper helper: show a result on the next page (Post/Redirect/Get). A
+   change that went through but left warnings is shown as a warning, with the
+   success line first so the admin knows it was not rolled back. */
+function result_redirect($url, $r) {
+	if (!$r['ok'])
+		msg_redirect($url, $r['error'], 'error');
+	if ($r['warnings'])
+		msg_redirect($url, $r['message'].' '.implode(' ', $r['warnings']), 'warning');
+	msg_redirect($url, $r['message'], 'success');
 }

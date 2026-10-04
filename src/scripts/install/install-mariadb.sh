@@ -99,7 +99,7 @@ sed -i "s/LimitNOFILE=32768/LimitNOFILE=512231/" /usr/lib/systemd/system/mariadb
 			PASSWORD=$(echo "${PASSWORD}" | sed 's"/"\\\/"g')
 			sed -i "s/\$cfg\['Servers'\]\[\$i\]\['password'\] = ''/\$cfg['Servers'][\$i]['password'] = '${PASSWORD}'/" /usr/local/reqad/public_html/phpmyadmin/config.inc.php
 			mkdir -p /var/lib/php/session
-			chmod -R a+rwx /var/lib/php/session
+			chmod 1733 /var/lib/php/session
 			mysql < /usr/local/reqad/public_html/phpmyadmin/sql/create_tables.sql
 		) >> ./install_reqad.log 2>&1
     	echo -e "[ ${GREEN}OK${NC} ]"

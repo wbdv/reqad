@@ -1,7 +1,7 @@
 <?php
 /* Change the PHP version / handler of an addon domain (created with
    scripts/adddomain). Same mechanics as the account PHP switch in
-   edit_account.php — move/create/delete the pool file, restart the affected
+   account_switch_php() in app/functions/accounts.php — move/create/delete the pool file, restart the affected
    php-fpm services — except the pool is named after the addon domain and
    listens on its own per-domain socket. */
 

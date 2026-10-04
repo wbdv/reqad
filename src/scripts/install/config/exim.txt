@@ -461,6 +461,12 @@ add_environment = PATH=/usr/bin::/bin
 #         Specifies access control lists for incoming SMTP mail      #
 ######################################################################
 
+### --- Reqad managed (forward-spam) --- ###
+# yes = the forwards router does not pass on mail tagged X-Spam-Flag: YES.
+# Edited from the panel: Email > Exim > Settings > Forwarding.
+REQAD_NO_FORWARD_SPAM = yes
+### --- end Reqad managed (forward-spam) --- ###
+
 begin acl
 
 acl_smtp_auth:
@@ -1059,7 +1065,9 @@ forwards:
   driver = redirect
   domains = dsearch;/etc/exim/forwards
   data = ${lookup{$local_part}lsearch{/etc/exim/forwards/${domain_data}}}
-  condition = ${if !eq {$received_protocol}{spam-scanned}}
+  # Reqad: skip the forward when the message is marked as spam and
+  # REQAD_NO_FORWARD_SPAM is yes. Declining (not :blackhole:) keeps unseen working.
+  condition = ${if or{{eq{$received_protocol}{spam-scanned}}{and{{eq{REQAD_NO_FORWARD_SPAM}{yes}}{eqi{$h_X-Spam-Flag:}{YES}}}}}{no}{yes}}
   pipe_transport = address_pipe
   unseen
 
@@ -1138,7 +1146,7 @@ system_aliases:
   data = ${lookup{$local_part}lsearch{/etc/aliases}}
 # user = exim
   file_transport = address_file
-  pipe_transport = address_pipe
+  pipe_transport = system_alias_pipe
 
 
 # This router handles forwarding using traditional .forward files in users'
@@ -1383,6 +1391,22 @@ local_delivery:
 # to complete normally. You can set different transports for aliases and
 # forwards if you want to - see the references to address_pipe in the routers
 # section above.
+
+# Pipes that come out of /etc/aliases. They cannot use address_pipe, which
+# derives its user from the recipient domain's owner in /etc/exim/userdomains:
+# mail to root is addressed to the server's own hostname, which has no owner, so
+# the lookup yields "" and the delivery defers. /etc/aliases is root-writable
+# only, so a fixed user is safe here in a way it is not for the .forward pipes
+# that keep using address_pipe.
+#
+# return_fail_output rather than return_output: the forwarder is silent on
+# success, and returning output on a success would mail it to the sender — who,
+# for root's own cron mail, is root, straight back through this same alias.
+system_alias_pipe:
+  driver = pipe
+  user = reqad
+  group = reqad
+  return_fail_output
 
 address_pipe:
   driver = pipe

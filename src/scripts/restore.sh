@@ -121,6 +121,19 @@ if [ -d "${R}/databases" ]; then
 	done
 	[ -f "${R}/databases/_grants.sql" ] && ${MYSQL} < "${R}/databases/_grants.sql"
 
+	# databases without the "<user>_" prefix that were assigned to the account
+	# on the Databases page: give them back to it (unless another account has
+	# been given the same name here in the meantime)
+	if [ -f "${R}/databases/_assigned.txt" ]; then
+		while read -r adb; do
+			[[ "${adb}" =~ ^[A-Za-z0-9_]{1,64}$ ]] || continue
+			${SQLITE} "${DB_FILE}" "INSERT OR IGNORE INTO db_owners (dbname, user, created) VALUES ('${adb}', '${USER}', strftime('%s','now'))" 2>/dev/null
+			AOWN=$(${SQLITE} "${DB_FILE}" "SELECT user FROM db_owners WHERE dbname='${adb}'" 2>/dev/null)
+			if [ "${AOWN}" = "${USER}" ]; then echo "assigned ${adb} to ${USER}"
+			else echo -e "${RED}note: ${adb} is assigned to '${AOWN}' on this server, left as it is${NC}"; fi
+		done < "${R}/databases/_assigned.txt"
+	fi
+
 	# backup_remote.sh leaves databases over --db-max-mb out of the archive and
 	# streams their dumps to the backup server instead. The empty database and
 	# its grants have just been recreated above, so only the data is missing —
@@ -132,6 +145,12 @@ if [ -d "${R}/databases" ]; then
 			echo "  ${bigdb}   import with:  zcat ${bigdb}.sql.gz | mysql ${bigdb}"
 		done < "${R}/databases/_streamed_separately.txt"
 		echo "  (databases/${USER}/<db>.sql.gz in the same dated remote backup dir)"
+	fi
+	# excluded on the Exclusions tab when the backup was taken: no dump exists
+	# anywhere, the empty database and its grants are all there is
+	if [ -s "${R}/excludes.txt" ] && grep -q '^db	' "${R}/excludes.txt"; then
+		echo -e "${RED}── databases restored EMPTY (excluded from this backup) ──${NC}"
+		grep '^db	' "${R}/excludes.txt" | cut -f2 | sed 's/^/  /'
 	fi
 fi
 
@@ -233,6 +252,15 @@ fi
 # ===========================================================================
 echo -e "${WHITE}── panel account row ──${NC}"
 ${SQLITE} "${DB_FILE}" "INSERT INTO accounts (id, user, domain, disk_usage, disk_quota, has_email, status, created_at, dkim_selector) VALUES (${AID}, '${AUSER}', '${ADOMAIN}', 0, ${AQUOTA}, ${AHASEMAIL}, '${ASTATUS}', '${ACREATED}', '${ADKIM}')"
+# The account's backup exclusion rules. Only lines of exactly the shape
+# backup.sh writes, for this user, are run: the file comes from an archive, and
+# anything else in it must not reach reqad.db. (A pattern can never hold a
+# quote — backup_excludes.sh check refuses it — and a note's are doubled.)
+if [ -s "${R}/meta/backup_excludes.sql" ]; then
+	grep -E "^INSERT OR IGNORE INTO backup_excludes \(user,kind,pattern,scope,note,created\) VALUES \('${USER}','(path|db)','[^']+','(both|nightly|manual)','([^']|'')*',[0-9]+\);$" \
+		"${R}/meta/backup_excludes.sql" | ${SQLITE} "${DB_FILE}" 2>/dev/null \
+		&& echo "backup exclusion rules restored"
+fi
 
 # ===========================================================================
 # 8. cron
@@ -290,8 +318,33 @@ fi
 # recompute disk usage in the background (best effort)
 [ -x "${REQAD}/scripts/update_disk_usage" ] && sudo "${REQAD}/scripts/update_disk_usage" >/dev/null 2>&1 &
 
+# ---- what the backup never had ---------------------------------------------
+# excludes.txt (written by backup.sh) lists what was left out on purpose. Say
+# it here, or a restore with no node_modules/ looks like a broken one.
+EXCL_NOTE=''
+if [ -s "${R}/excludes.txt" ]; then
+	EXCL_N=$(grep -vc '^#' "${R}/excludes.txt")
+	echo -e "\n${RED}── not in this backup (excluded when it was taken) ──${NC}"
+	grep -v '^#' "${R}/excludes.txt" | while IFS=$'\t' read -r k w d; do
+		case "${k}" in
+			rule)     echo "  ${w}   (exclusion rule, ${d})" ;;
+			mount)    # the mount point itself was excluded too; recreate it empty
+			          # so remounting needs no mkdir
+			          if [[ "${w}" != *..* ]]; then
+			              sudo mkdir -p "${PHOME}/${w}" && sudo chown "${PUID}:${PGID}" "${PHOME}/${w}"
+			          fi
+			          echo "  ${w}/   (mounted filesystem: ${d} — mount point recreated empty, remount it)" ;;
+			marker)   echo "  ${w}/   (folder held a .nobackup file — only the folder was restored)" ;;
+			cachedir) echo "  ${w}/   (cache folder, CACHEDIR.TAG)" ;;
+			db)       echo "  database ${w}   (restored empty)" ;;
+			*)        echo "  ${w}   (${k})" ;;
+		esac
+	done
+	EXCL_NOTE=" ${EXCL_N} excluded item(s) were not in the backup: $(grep -v '^#' "${R}/excludes.txt" | cut -f2 | head -5 | paste -sd ',' | sed 's/,/, /g')$([ "${EXCL_N}" -gt 5 ] && echo ', ...')."
+fi
+
 sudo rm -rf "${STAGE}"
 echo -e "\n${GREEN}Done. Account '${USER}' (${DOMAIN}) restored from $(basename ${ARCHIVE}).${NC}"
 [ "${LE_RESTORED}" -eq 1 ] && echo "Let's Encrypt auto-renewal re-issue was launched in the background (check log/debug_log)."
-post_msg success "Account '${USER}' (${DOMAIN}) restored from $(basename ${ARCHIVE})."
+post_msg success "Account '${USER}' (${DOMAIN}) restored from $(basename ${ARCHIVE}).${EXCL_NOTE}"
 exit 0

@@ -42,6 +42,42 @@
 		exit;
 	}
 
+	/* Exclusions tab of /backup/: what each rule matches right now, and what
+	   else in the home directory is worth leaving out. Both walk the whole home
+	   directory (metadata only), so they run on demand, never on page load. */
+	/* The server-wide switches of the Exclusions tab, saved as they are
+	   flipped. Stored explicitly either way: a missing row means the default
+	   (.nobackup honoured, mounts skipped, CACHEDIR.TAG ignored), which
+	   backup_excludes.sh applies too. */
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-backup-exclude-setting') {
+		header('Content-Type: application/json');
+		$bx_name = (string)($_POST['name'] ?? '');
+		if (!in_array($bx_name, array('markers', 'mounts', 'caches'), true)) {
+			echo json_encode(array('ok' => false, 'error' => 'Unknown setting.'));
+			exit;
+		}
+		$bx_val = ((string)($_POST['value'] ?? '') === '1') ? '1' : '0';
+		$bx_ok  = setting_put('backup-exclude-'.$bx_name, $bx_val);
+		if ($bx_ok) route_log("backup exclude setting $bx_name=$bx_val");
+		echo json_encode($bx_ok ? array('ok' => true) : array('ok' => false, 'error' => 'Could not save the setting.'));
+		exit;
+	}
+
+	if(isset($_POST["action"]) && in_array($_POST["action"], array('ajax-backup-exclude-preview', 'ajax-backup-exclude-suggest'), true)) {
+		header('Content-Type: application/json');
+		$bx_user = (string)($_POST['user'] ?? '');
+		if (!valid_username($bx_user) || !account_get($db, $bx_user)) {
+			echo json_encode(array('ok' => false, 'error' => 'Unknown account.'));
+			exit;
+		}
+		set_time_limit(1000);
+		if ($_POST["action"] === 'ajax-backup-exclude-preview')
+			echo json_encode(array('ok' => true) + backup_exclude_preview($bx_user));
+		else
+			echo json_encode(array('ok' => true, 'suggestions' => backup_exclude_suggest($bx_user)));
+		exit;
+	}
+
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-check-email-fixing' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
 		$output = trim(shell_exec("dig +short NS $domain | head -n 1 | sed 's/\.$//'"));
@@ -548,12 +584,39 @@
         $isfile = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -f '.escapeshellarg($abs).' && echo 1'));
         if($isfile !== '1') { header('HTTP/1.1 404 Not Found'); echo 'Not a file.'; exit; }
         // reqad's php.ini disables passthru, and the file may be reqad-unreadable,
-        // so copy it (as root) to a reqad temp, stream it, then remove the temp.
+        // so stage a copy in reqad's tmp, stream that, then remove it.
+        //
+        // The copy is read by `cat` running as the ACCOUNT USER, not as root.
+        // It used to be `sudo cp` (root): fm_resolve had already jailed $abs to
+        // /home/<user>, but between that check and the copy the account user can
+        // swap the final component for a symlink to, say, /etc/shadow -- and root's
+        // cp would follow it out of the jail (a time-of-check/time-of-use race).
+        // Reading as the account user makes that pointless: the symlink resolves
+        // with the tenant's own privileges, so it can only reach what they could
+        // already read. Every other ajax-fm-* handler runs `sudo -u <user>` for
+        // exactly this reason; the download was the one that did not.
+        //
+        // stdout goes straight to the stage file, whose handle is opened here as
+        // reqad -- the child inherits the already-open fd, so it never needs write
+        // access to _PATH/tmp itself, and the file lands owned by reqad (no chown).
         $name  = basename($abs);
         $stage = _PATH . '/tmp/fm_dl_' . bin2hex(random_bytes(6));
-        shell_exec('sudo cp '.escapeshellarg($abs).' '.escapeshellarg($stage).' 2>/dev/null');
-        shell_exec('sudo chown reqad:reqad '.escapeshellarg($stage).' 2>/dev/null; sudo chmod 640 '.escapeshellarg($stage).' 2>/dev/null');
-        if(!is_file($stage)) { header('HTTP/1.1 500 Internal Server Error'); echo 'Could not read file.'; exit; }
+        $dl_desc = array(0 => array('file', '/dev/null', 'r'),
+                         1 => array('file', $stage, 'w'),
+                         2 => array('pipe', 'w'));
+        $dl_proc = proc_open('sudo -u '.escapeshellarg($u).' cat '.escapeshellarg($abs),
+                             $dl_desc, $dl_pipes);
+        $dl_rc = -1;
+        if(is_resource($dl_proc)) {
+            fclose($dl_pipes[2]);
+            $dl_rc = proc_close($dl_proc);
+        }
+        clearstatcache(true, $stage);
+        if($dl_rc !== 0 || !is_file($stage)) {
+            @unlink($stage);
+            header('HTTP/1.1 500 Internal Server Error'); echo 'Could not read file.'; exit;
+        }
+        @chmod($stage, 0600);
         header('Content-Description: File Transfer');
         header('Content-Type: application/octet-stream');
         header('Content-Disposition: attachment; filename="'.str_replace('"', '', $name).'"');
@@ -638,6 +701,78 @@
 				exit;
 			}
 		}
+		exit;
+	}
+
+	/* Databases page: Optimize modal -> {ok, output, tables, errors} or {error}. */
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-db-optimize' && isset($_POST["dbname"])) {
+		header('Content-Type: application/json');
+		$dbname = trim($_POST["dbname"]);
+		if(!db_is_managed($dbname)) { echo json_encode(array('error' => 'Database not found.')); exit; }
+		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." optimize database $dbname\n", 3, '../log/route_log');
+		@set_time_limit(0);
+		echo json_encode(array('ok' => true) + db_optimize($dbname));
+		exit;
+	}
+
+	/* Databases page: Remote access modal. Every call names a database and a user
+	   that already holds a localhost grant on it; add/edit/remove then resync the
+	   csf rules (scripts/sync_mysql_remote_fw.sh). */
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-db-remote-status') {
+		header('Content-Type: application/json');
+		echo json_encode(array('ok' => true) + mysql_remote_status());
+		exit;
+	}
+
+	if(isset($_POST["action"]) && in_array($_POST["action"], array('ajax-db-remote-list', 'ajax-db-remote-add', 'ajax-db-remote-edit', 'ajax-db-remote-remove'))
+	   && isset($_POST["dbname"]) && isset($_POST["dbuser"])) {
+		header('Content-Type: application/json');
+		$dbname = trim($_POST["dbname"]);
+		$dbuser = trim($_POST["dbuser"]);
+		if(!db_is_managed($dbname)) { echo json_encode(array('error' => 'Database not found.')); exit; }
+		if(!valid_mysql_identifier($dbuser) || !in_array($dbuser, db_local_users($dbname), true)) {
+			echo json_encode(array('error' => 'User '.$dbuser.' has no access to '.$dbname.'.'));
+			exit;
+		}
+
+		$act = $_POST["action"];
+		$err = '';
+		$ip  = '';
+		if($act != 'ajax-db-remote-list') {
+			$ip = db_remote_normalize_ip($_POST["ip"] ?? '');
+			if($ip === false) { echo json_encode(array('error' => 'Please enter a valid IPv4 or IPv6 address.')); exit; }
+			$hosts = db_remote_hosts($dbname, $dbuser);
+			$old = '';
+			if($act == 'ajax-db-remote-edit' || $act == 'ajax-db-remote-remove') {
+				$old = $act == 'ajax-db-remote-edit' ? trim($_POST["old"] ?? '') : $ip;
+				if(!in_array($old, $hosts, true)) { echo json_encode(array('error' => 'IP '.$old.' is not in the list.')); exit; }
+			}
+			if($act != 'ajax-db-remote-remove' && $ip !== $old && in_array($ip, $hosts, true)) {
+				echo json_encode(array('error' => 'IP '.$ip.' already has access.'));
+				exit;
+			}
+
+			error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." $act $dbname $dbuser ".($old !== '' && $old !== $ip ? "$old -> " : '')."$ip\n", 3, '../log/route_log');
+			if($act == 'ajax-db-remote-add')
+				$err = db_remote_add($dbname, $dbuser, $ip);
+			elseif($act == 'ajax-db-remote-remove')
+				$err = db_remote_remove($dbname, $dbuser, $ip);
+			elseif($ip !== $old) {
+				// Add first: if the new host fails, the old one keeps working.
+				$err = db_remote_add($dbname, $dbuser, $ip);
+				if($err === '')
+					$err = db_remote_remove($dbname, $dbuser, $old);
+			}
+		}
+
+		$res = array('hosts' => db_remote_hosts($dbname, $dbuser));
+		if($act != 'ajax-db-remote-list')
+			$res['firewall'] = mysql_remote_fw_sync();
+		if($err !== '')
+			$res['error'] = $err;
+		else
+			$res['ok'] = true;
+		echo json_encode($res);
 		exit;
 	}
 
@@ -956,7 +1091,43 @@
 		exit;
 	}
 
-	// WP Toolkit "Manage" modal — current state of the toggleable options.
+	/* WP Toolkit "Rescan Wordpress" — run scripts/scan_for_wordpress (root-only,
+	   upserts the wordpress table) detached, so a slow wp-cli sweep over many
+	   accounts never holds the request open. The log doubles as the job state:
+	   no ###DONE### marker + a live process = still running. */
+	if(isset($_POST["action"]) && ($_POST["action"] == 'ajax-wp-rescan' || $_POST["action"] == 'ajax-wp-rescan-status')) {
+		header('Content-Type: application/json');
+		$rescan_log = _PATH.'/wptoolkit/rescan.log';
+		$rescan_running = function() use ($rescan_log) {
+			$log = @file_get_contents($rescan_log);
+			if($log === false || strpos($log, '###DONE:') !== false) return false;
+			return trim((string)shell_exec('pgrep -f '.escapeshellarg('[s]cripts/scan_for_wordpress'))) !== '';
+		};
+
+		if($_POST["action"] == 'ajax-wp-rescan') {
+			if(!$rescan_running()) {
+				error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-rescan started\n", 3, '../log/route_log');
+				// Seed the log before launching so the first status poll can't
+				// mistake "not started yet" for "finished". unlink first: a previous
+				// run left it root-owned, but the dir is ours.
+				@unlink($rescan_log);
+				file_put_contents($rescan_log, '');
+				$q_log = escapeshellarg($rescan_log);
+				$job = _PATH.'/scripts/scan_for_wordpress > '.$q_log.' 2>&1; echo "###DONE:$?###" >> '.$q_log;
+				shell_exec('sudo -n nohup sh -c '.escapeshellarg($job).' </dev/null >/dev/null 2>&1 &');
+			}
+			echo json_encode(array('ok' => true, 'running' => true));
+			exit;
+		}
+
+		$log = (string)@file_get_contents($rescan_log);
+		$running = $rescan_running();
+		$exit = preg_match('/###DONE:(\d+)###/', $log, $m) ? (int)$m[1] : null;
+		echo json_encode(array('ok' => true, 'running' => $running, 'exit' => $exit));
+		exit;
+	}
+
+	// WP Toolkit site page — Performance tab state (kept for the toggle round trip).
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-manage-status' && isset($_POST["user"])) {
 		header('Content-Type: application/json');
 		$user = preg_replace('/[^a-z0-9]/', '', trim($_POST["user"]));
@@ -966,7 +1137,7 @@
 		exit;
 	}
 
-	// WP Toolkit "Manage" modal — enable/disable one option for one site.
+	// WP Toolkit site page — enable/disable one Performance option for one site.
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-manage-toggle' && isset($_POST["user"]) && isset($_POST["option"])) {
 		header('Content-Type: application/json');
 		$user   = preg_replace('/[^a-z0-9]/', '', trim($_POST["user"]));
@@ -987,6 +1158,10 @@
 		elseif($option === 'wp_cron')
 			$r = $enable ? wp_wpcron_enable($row['user'], $docroot)
 			             : wp_wpcron_disable($row['user'], $docroot);
+		elseif($option === 'indexing')
+			$r = wp_indexing_set($row['user'], $docroot, $enable);
+		elseif($option === 'maintenance')
+			$r = wp_maintenance_set($row['user'], $docroot, $enable);
 		else { echo json_encode(array('error' => 'Unknown option.')); exit; }
 
 		$st = wp_manage_status($db, $ini, $user);
@@ -996,6 +1171,93 @@
 			'success' => $r['success'],
 			'log'     => $r['log'] ?? '',
 			'status'  => $st,
+		));
+		exit;
+	}
+
+	/* WP Toolkit site page — everything the page shows, from one wp-cli probe:
+	   header cards, Performance switches and Security checkboxes. */
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-site-status' && isset($_POST["user"])) {
+		header('Content-Type: application/json');
+		$user = trim($_POST["user"]);
+		$row  = valid_username($user) ? wp_site_row($db, $user) : false;
+		if(!$row) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
+		$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
+		$probe = wp_site_probe($row['user'], $docroot);
+		list($wp_versions, ) = wp_stable_versions();
+		$shot = wp_screenshot_file($row['user']);
+		echo json_encode(array(
+			'ok'          => true,
+			'probe_error' => $probe['error'],
+			'info'        => $probe + array(
+				'wp_status'   => $wp_versions[$probe['wp_version'] ?? ''] ?? '',
+				'php_version' => wp_site_php_version($ini, $row['domain']),
+				'screenshot'  => is_file($shot) ? filemtime($shot) : 0,
+				'pagespeed'   => wp_pagespeed_cached($row['user']),
+				'psi_key'     => wp_pagespeed_key() !== '',
+				'chromium'    => wp_chromium_bin() !== '',
+			),
+			'performance' => wp_manage_status($db, $ini, $row['user'], $probe),
+			'security'    => wp_security_status($ini, $row, $probe),
+			'allow_ips'   => wp_sec_allowed_ips($row['domain']),
+		));
+		exit;
+	}
+
+	// WP Toolkit site page — apply the Security tab (the full set of ticked boxes).
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-security-apply' && isset($_POST["user"])) {
+		header('Content-Type: application/json');
+		$user = trim($_POST["user"]);
+		$row  = valid_username($user) ? wp_site_row($db, $user) : false;
+		if(!$row) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
+		$want = array_values(array_intersect(array_keys(wp_security_options()), (array)($_POST["on"] ?? array())));
+		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-security-apply user=$user on=".implode(',', $want)."\n", 3, '../log/route_log');
+		$r = wp_security_apply($ini, $row, $want, $_POST["login_slug"] ?? '', ($_POST["regen_keys"] ?? '') === '1',
+			preg_split('/[\s,]+/', (string)($_POST["allow_ips"] ?? ''), -1, PREG_SPLIT_NO_EMPTY));
+		$probe = wp_site_probe($row['user'], wp_site_docroot($row['user'], $row['path'] ?? ''));
+		echo json_encode(array(
+			'ok'       => empty($r['error']),
+			'error'    => implode("\n", $r['error']),
+			'log'      => $r['log'],
+			'security' => wp_security_status($ini, $row, $probe),
+			'login_slug' => $probe['login_slug'] ?? '',
+			'allow_ips'  => wp_sec_allowed_ips($row['domain']),
+		));
+		exit;
+	}
+
+	/* WP Toolkit site page — long jobs (screenshot via Chromium, PageSpeed test
+	   via Google) run in the background; see wp_bg_job_run(). The page starts
+	   one with ajax-wp-job and polls ajax-wp-job-status. */
+	if(isset($_POST["action"]) && ($_POST["action"] == 'ajax-wp-job' || $_POST["action"] == 'ajax-wp-job-status')
+	   && isset($_POST["user"]) && in_array($_POST["kind"] ?? '', array('screenshot', 'pagespeed'), true)) {
+		$user = trim($_POST["user"]);
+		$kind = $_POST["kind"];
+		$row  = valid_username($user) ? wp_site_row($db, $user) : false;
+		if(!$row) { header('Content-Type: application/json'); echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
+		$path = trim((string)($row['path'] ?? ''), '/');
+		$url  = 'https://'.$row['domain'].'/'.($path !== '' ? $path.'/' : '');
+
+		if($_POST["action"] == 'ajax-wp-job') {
+			error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-job $kind user=$user\n", 3, '../log/route_log');
+			wp_bg_job_run($kind, $row['user'], function () use ($kind, $row, $url) {
+				if($kind === 'screenshot')
+					return wp_screenshot_make($row['user'], $url);
+				list($err, ) = wp_pagespeed_run($row['user'], $url);   // also saves the screenshot
+				return $err;
+			});
+			exit;
+		}
+
+		header('Content-Type: application/json');
+		$shot = wp_screenshot_file($row['user']);
+		$j = wp_bg_job_get($kind, $row['user']);
+		echo json_encode(array(
+			'ok'         => true,
+			'running'    => !empty($j['running']),
+			'error'      => (string)($j['error'] ?? ''),
+			'screenshot' => is_file($shot) ? filemtime($shot) : 0,
+			'pagespeed'  => $kind === 'pagespeed' ? wp_pagespeed_cached($row['user']) : null,
 		));
 		exit;
 	}
@@ -1420,7 +1682,7 @@
 			'template_details' => trim($TEMPLATE_DETAILS),
 			'php_versions'     => $_php_parts,
 			'reqad_ver'        => $reqad_version[0],
-			'reqad_date'       => date('M j, Y', strtotime($reqad_version[1])),
+			'reqad_date'       => reqad_version_label($reqad_version)[1],
 			'uptime'           => trim(shell_exec('uptime -p')),
 		]);
 		file_put_contents($cache_file, $json);

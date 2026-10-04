@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 require_once __DIR__ . '/../public_html/defines.php';
 require_once __DIR__ . '/../public_html/modules/version.php';

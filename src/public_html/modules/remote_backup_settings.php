@@ -37,6 +37,9 @@ if ($errmsg === '') {
 	@unlink(_PATH.'/log/remote_backup.cache');      /* the listing may now differ */
 	$successmsg = 'Backup server settings saved.';
 
+	/* a custom ssh port is usually missing from csf's TCP_OUT */
+	$fw_note = csf_open_tcp_out($port) === 'updated' ? ' Outbound port '.$port.' opened in the csf firewall.' : '';
+
 	if (isset($_POST['test'])) {
 		$cfg = remote_backup_config();
 		$rc  = 0;
@@ -51,5 +54,6 @@ if ($errmsg === '') {
 	}
 }
 
+if ($errmsg === '') $successmsg .= $fw_note;
 if ($errmsg !== '') msg_redirect($msg_base, $errmsg, 'error');
 msg_redirect($msg_base, $successmsg, 'success');

@@ -81,7 +81,8 @@ if($errmsg=='') {
 	}
 
 } else {
-	if(php_sapi_name() != "cli" || posix_getuid() != 0) {
+	/* account_create() defines REQAD_TEMPLATE_RETURN and reads $errmsg itself. */
+	if(!defined('REQAD_TEMPLATE_RETURN') && (php_sapi_name() != "cli" || posix_getuid() != 0)) {
 		echo $errmsg;
 		exit;
 	}

@@ -78,6 +78,19 @@ START_NEW='  # SpamAssassin — inbound mail only.'
 END_OLD='                       X-Spam-Report: $spam_report'
 END_NEW_RE='^ +log_message = SpamAssassin as .* detected message as NOT spam'
 
+# The distro's stock exim.conf (the local-only exim of an email=0 server) has
+# START_OLD too, but as the header of a COMMENTED-OUT example whose end line is
+# commented as well — END_OLD never matches, and the splice below used to eat
+# everything from there to EOF: the rest of acl_check_data, every router and
+# every transport. `exim -bV` passes a config with no routers, so it went live
+# and all mail became "Unrouteable address". Only touch a config that actually
+# scans: an uncommented `spam =` condition, or our own canonical block.
+if ! grep -qE '^[[:space:]]+(warn|deny|accept)[[:space:]]+spam[[:space:]]*=' "$TARGET" \
+   && ! grep -qF "$START_NEW" "$TARGET"; then
+    echo "SpamAssassin scanning is not enabled in $TARGET — nothing to do."
+    exit 0
+fi
+
 if ! grep -qF "$START_OLD" "$TARGET" && ! grep -qF "$START_NEW" "$TARGET"; then
     echo "ERROR: SpamAssassin block not found in $TARGET (hand-customised?)" >&2
     exit 1
@@ -171,15 +184,27 @@ cat > "$RCPT_BLOCK" <<'RCPT_END'
 RCPT_END
 
 # 1. Normalise the SpamAssassin block in acl_check_data.
+#    Other "### --- Reqad managed (...) ---" blocks found inside it are kept and
+#    put back after the relay_from_hosts accept, preceded by one blank line.
+#    That is where reqad-clamav's clamav-exim-wire.sh inserts its scan (it
+#    anchors on the first such accept in acl_check_data, which is this block's)
+#    — without this, every run of this script silently switched ClamAV off.
 awk -v s1="$START_OLD" -v s2="$START_NEW" -v e1="$END_OLD" -v e2re="$END_NEW_RE" -v bf="$BLOCK" '
-  !skip && !done && ($0 == s1 || $0 == s2) {
-      while ((getline line < bf) > 0) print line
-      close(bf); skip = 1; next
+  !skip && !done && ($0 == s1 || $0 == s2) { skip = 1; next }
+  skip && ($0 == e1 || $0 ~ e2re) {
+      while ((getline line < bf) > 0) {
+          print line
+          if (kept != "" && line ~ /^  accept  hosts      = \+relay_from_hosts$/) printf "\n%s", kept
+      }
+      close(bf); skip = 0; done = 1; next
   }
-  skip && ($0 == e1 || $0 ~ e2re) { skip = 0; done = 1; next }
+  skip && /^[[:space:]]*### --- Reqad managed \(/     { inkeep = 1 }
+  skip && inkeep                                       { kept = kept $0 "\n" }
+  skip && /^[[:space:]]*### --- end Reqad managed \(/ { inkeep = 0 }
   skip { next }
   { print }
-' "$TARGET" > "$CAND" || { echo "ERROR: splice failed" >&2; exit 1; }
+  END { if (skip) exit 3 }
+' "$TARGET" > "$CAND" || { echo "ERROR: splice failed (end of the SpamAssassin block not found), nothing changed" >&2; exit 1; }
 
 # 2. Capture the account per recipient, at the end of acl_check_rcpt.
 RCPT_ANCHOR='  # At this point, the address has passed all the checks that have been'
@@ -241,6 +266,14 @@ for want in 'X-Spam-Bar: \$spam_bar' 'spam       = \${acl_m_sauser}/defer_ok' 's
 done
 
 grep -q '^spamcheck:$' "$CAND" && { echo "ERROR: spamcheck router still present" >&2; exit 1; }
+
+# A splice that ran away would still pass `exim -bV`, so check that the config
+# kept its sections.
+for sect in routers transports; do
+    if grep -q "^begin $sect" "$TARGET" && ! grep -q "^begin $sect" "$CAND"; then
+        echo "ERROR: 'begin $sect' missing from candidate config, nothing changed" >&2; exit 1
+    fi
+done
 
 if cmp -s "$CAND" "$TARGET"; then
     echo "$TARGET is already up to date — nothing to do."

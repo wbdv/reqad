@@ -1,0 +1,792 @@
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
+<?php
+/**
+ * reqad — command line interface for the Reqad hosting control panel.
+ *
+ * The account / database / email commands call the same functions as the web
+ * panel (app/functions/*.php), so both do exactly the same thing. Every such
+ * command accepts --json for scripting; exit status is 0 on success, 1 when
+ * the operation failed and 2 on a usage error.
+ */
+
+// App root, resolved relative to this script (bin/ sits directly under it),
+// so -V / info work without loading the panel config.
+define('REQAD_ROOT', realpath(__DIR__.'/..'));
+
+$prog = basename($argv[0]);
+
+function usage($prog) {
+    cli_help(<<<HELP
+!Reqad — the alternate hosting control panel.
+
+Usage: {$prog} [options]
+       {$prog} <command> [arguments] [--json]
+
+Options:
+  -h, --help       Show this help and exit
+  -V, --version    Show the installed Reqad version and exit
+
+Commands:
+  info             Show the web server and installed PHP versions
+  account          List, show, create, edit and delete hosting accounts
+  db               List, create and delete MySQL databases, change passwords
+  email            List, create, edit and delete mailboxes
+
+Run '{$prog} <command> --help' for the command's own options.
+
+HELP);
+}
+
+function usage_account($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} account list
+       {$prog} account show   <user>
+       {$prog} account create <user> <domain> [--dns] [--letsencrypt] [--email] [--www]
+                                          [--quota=MB] [password option]
+       {$prog} account edit   <user> [--password] [--php=VERSION[:fpm|mod_php]|off] [--email=on|off]
+       {$prog} account delete <user> [--yes]
+
+create:
+  --dns             Create the DNS zone at the configured DNS provider
+  --letsencrypt     Request a Let's Encrypt certificate (in the background)
+  --email           Enable mail for the domain (exim, DKIM, MX/SPF/DMARC)
+  --www             Add the www.<domain> alias
+  --quota=MB        Disk quota (ignored when quotas are off)
+
+edit:
+  --password        Set a new password (prompt, or --password-stdin)
+  --php=8.3         Switch PHP version; on Apache also 8.2:mod_php or 8.2:fpm
+  --php=off         Disable PHP (pool removed, .php answers 403); a version re-enables it
+  --email=on|off    Enable or disable mail for the domain
+
+delete removes the vhost, mail, certificates, DNS zone, the home directory and
+every database and database user prefixed "<user>_". Databases assigned to
+the account (db assign) are kept and become unassigned.
+
+HELP);
+    usage_common();
+}
+
+function usage_db($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} db list   [--account=USER]
+       {$prog} db create <account> <name> [--user=NAME] [password option]
+       {$prog} db delete <database> [--yes]
+       {$prog} db passwd <dbuser> [password option]
+       {$prog} db assign <database> <account>
+       {$prog} db unassign <database>
+
+Names are prefixed with the account: 'db create bob wp' creates database bob_wp
+and user bob_wp (or bob_<NAME> with --user=NAME). delete and passwd take the
+full name (bob_wp). Users left without any database are dropped with it.
+
+assign gives a database without an account prefix (imported, made in
+phpMyAdmin) to an account, so it is listed and backed up with it; unassign
+removes that again. Neither renames nor changes the database.
+
+HELP);
+    usage_common();
+}
+
+function usage_email($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} email list   [--domain=DOMAIN]
+       {$prog} email create <address> [password option]
+       {$prog} email edit   <address> [--password] [--enable|--disable]
+       {$prog} email delete <address> [--yes]
+
+edit:
+  --password        Set a new password (prompt, or --password-stdin)
+  --disable         Block IMAP/POP3/SMTP login (mail is still delivered)
+  --enable          Allow login again
+
+delete also removes the mailbox's messages, filters and autoresponder.
+
+HELP);
+    usage_common();
+}
+
+function usage_common() {
+    echo "\n";
+    cli_help(<<<HELP
+Password option (passwords are never taken as an argument):
+  (none)                 Prompt for it (twice) when run from a terminal
+  --password-stdin       Read it from the first line of standard input
+  --generate-password    Generate a random one and print it
+
+Common:
+  --json            Print the result as JSON
+  -y, --yes         Do not ask for confirmation (required for delete without a terminal)
+
+HELP);
+}
+
+/**
+ * Locate an executable, preferring an absolute fallback path when the PATH
+ * lookup fails (the CLI may run with a minimal environment).
+ */
+function find_bin($name, $fallback = '') {
+    $path = trim(shell_exec('command -v '.escapeshellarg($name).' 2>/dev/null'));
+    if ($path !== '') return $path;
+    if ($fallback !== '' && is_executable($fallback)) return $fallback;
+    return '';
+}
+
+function show_info() {
+    $ini = parse_ini_file(REQAD_ROOT.'/etc/server-software.ini');
+    if ($ini === false) {
+        fwrite(STDERR, "reqad: unable to read etc/server-software.ini\n");
+        exit(1);
+    }
+
+    // OS pretty name from /etc/os-release (it is ini-formatted, so parse_ini_file
+    // strips the surrounding quotes for us).
+    $osr = @parse_ini_file('/etc/os-release');
+    $os  = ($osr && !empty($osr['PRETTY_NAME'])) ? $osr['PRETTY_NAME'] : 'unknown';
+    echo "OS:          {$os}\n";
+
+    $template  = trim($ini['template'] ?? '');
+    $is_apache = (substr($template, 0, 7) == 'apache_');
+
+    // Web server type follows the configured template; the version comes from
+    // the running binary (-v writes to stderr, hence the 2>&1).
+    if ($is_apache) {
+        $server = 'Apache';
+        $bin    = find_bin('httpd', '/usr/sbin/httpd');
+        $raw    = $bin ? shell_exec(escapeshellarg($bin).' -v 2>&1') : '';
+        $ver    = preg_match('#Apache/(\S+)#', (string)$raw, $m) ? $m[1] : '?';
+    } else {
+        $server = 'nginx';
+        $bin    = find_bin('nginx', '/usr/sbin/nginx');
+        $raw    = $bin ? shell_exec(escapeshellarg($bin).' -v 2>&1') : '';
+        $ver    = preg_match('#nginx/(\S+)#', (string)$raw, $m) ? $m[1] : '?';
+    }
+
+    echo "Web server:  {$server} {$ver}  (template: ".($template !== '' ? $template : 'unset').")\n\n";
+
+    $default      = trim($ini['php'] ?? '');
+    $php_versions = array_map('trim', explode(',', $ini['php_versions'] ?? ''));
+    $php_versions = array_filter($php_versions, 'strlen');
+
+    if (!$php_versions) {
+        echo "Installed PHP: none\n";
+        return;
+    }
+
+    echo "Installed PHP:\n";
+    foreach ($php_versions as $pv) {
+        // Under nginx everything runs via php-fpm; under apache the default
+        // version is served by mod_php, the rest via php-fpm.
+        $handler = (!$is_apache || $pv != $default) ? 'php-fpm' : 'mod_php';
+
+        $tag = ($pv == $default) ? '  (default)' : '';
+        printf("  %-5s %-8s %s\n", $pv, $handler, $tag);
+    }
+}
+
+function show_version() {
+    include REQAD_ROOT.'/public_html/modules/version.php';
+    if (!isset($reqad_version) || !is_array($reqad_version)) {
+        fwrite(STDERR, "reqad: unable to determine version\n");
+        exit(1);
+    }
+    echo 'Reqad '.$reqad_version[0].' ('.$reqad_version[1].")\n";
+}
+
+/* ---- helpers for the management commands -------------------------------- */
+
+function cli_die($msg, $code = 2) {
+    fwrite(STDERR, "reqad: $msg\n");
+    exit($code);
+}
+
+/* Split arguments into positionals and --options. "--name=value" gives a
+   string, a bare "--name" gives true; -y and -h are the only short options. */
+function cli_parse(array $args) {
+    $pos  = array();
+    $opts = array();
+    foreach ($args as $a) {
+        if ($a === '-y')       $opts['yes'] = true;
+        elseif ($a === '-h')   $opts['help'] = true;
+        elseif (substr($a, 0, 2) === '--') {
+            $kv = explode('=', substr($a, 2), 2);
+            $opts[$kv[0]] = isset($kv[1]) ? $kv[1] : true;
+        } elseif ($a !== '' && $a[0] === '-')
+            cli_die("unknown option '$a'");
+        else
+            $pos[] = $a;
+    }
+    return array($pos, $opts);
+}
+
+/* Reject options the subcommand does not know, so a typo is not silently ignored. */
+function cli_allow(array $opts, array $allowed) {
+    $allowed = array_merge($allowed, array('json', 'help'));
+    foreach (array_keys($opts) as $k)
+        if (!in_array($k, $allowed, true))
+            cli_die("unknown option '--$k'");
+}
+
+function cli_need(array $pos, $n, $what) {
+    if (count($pos) < $n)
+        cli_die("missing argument: $what");
+    if (count($pos) > $n)
+        cli_die("unexpected argument '".$pos[$n]."'");
+}
+
+function cli_is_tty() {
+    return function_exists('posix_isatty') && posix_isatty(STDIN);
+}
+
+function cli_read_hidden($prompt) {
+    fwrite(STDERR, $prompt);
+    shell_exec('stty -echo < /dev/tty');
+    $line = fgets(STDIN);
+    shell_exec('stty echo < /dev/tty');
+    fwrite(STDERR, "\n");
+    return rtrim((string)$line, "\r\n");
+}
+
+/* Get a password without ever putting it in argv (visible in `ps` and shell
+   history). Returns array(password, generated?). */
+function cli_password(array $opts, $what) {
+    if (isset($opts['password']) && $opts['password'] !== true)
+        cli_die("passwords are not accepted as arguments; use --password-stdin, --generate-password or the prompt");
+    if (!empty($opts['generate-password']))
+        return array(mailbox_random_password(20), true);
+    if (!empty($opts['password-stdin'])) {
+        $pw = rtrim((string)fgets(STDIN), "\r\n");
+        if ($pw === '')
+            cli_die("empty password on standard input");
+        return array($pw, false);
+    }
+    if (!cli_is_tty())
+        cli_die("no terminal to prompt for the $what password; use --password-stdin or --generate-password");
+    $pw = cli_read_hidden("New $what password: ");
+    if ($pw !== cli_read_hidden("Retype the password: "))
+        cli_die("passwords do not match", 1);
+    return array($pw, false);
+}
+
+/* Destructive commands: --yes, or type the name back at a terminal. */
+function cli_confirm(array $opts, $name, $what) {
+    if (!empty($opts['yes']))
+        return;
+    if (!cli_is_tty())
+        cli_die("refusing to delete $what $name without --yes (no terminal to confirm on)");
+    fwrite(STDERR, "This permanently deletes $what $name. Type '$name' to confirm: ");
+    if (trim((string)fgets(STDIN)) !== $name)
+        cli_die("not confirmed, nothing was deleted", 1);
+}
+
+/* Print a result_ok()/result_error() array and exit with its status. */
+function cli_result(array $r, array $opts, $generated_password = null) {
+    if ($generated_password !== null && $r['ok'])
+        $r['data']['password'] = $generated_password;
+    if (!empty($opts['json'])) {
+        echo json_encode($r, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n";
+        exit($r['ok'] ? 0 : 1);
+    }
+    if (!$r['ok'])
+        cli_die($r['error'], 1);
+    echo $r['message']."\n";
+    if ($generated_password !== null)
+        echo "Password: $generated_password\n";
+    foreach ($r['warnings'] as $w)
+        fwrite(STDERR, "warning: $w\n");
+    exit(0);
+}
+
+/* Colors only on a terminal (never in --json or a pipe), and NO_COLOR
+   (https://no-color.org) turns them off. */
+function cli_colors() {
+    static $on = null;
+    if ($on === null)
+        $on = getenv('NO_COLOR') === false && function_exists('posix_isatty') && posix_isatty(STDOUT);
+    return $on;
+}
+
+function cli_white($s) { return cli_colors() ? "\033[97m".$s."\033[0m" : $s; }
+function cli_grey($s)  { return cli_colors() ? "\033[90m".$s."\033[0m" : $s; }
+
+/* Print help text: headings (a line ending in ':', the "Usage:" label, or a
+   line marked with a leading '!') in white, descriptions and prose in grey.
+   The usage block itself stays plain so the syntax stands out. */
+function cli_help($text) {
+    $in_usage = false;
+    foreach (explode("\n", $text) as $i => $line) {
+        if ($i > 0) echo "\n";
+        if (trim($line) === '') { $in_usage = false; echo $line; continue; }
+        if ($line[0] === '!')
+            echo cli_white(substr($line, 1));
+        elseif (strpos($line, 'Usage:') === 0) {
+            $in_usage = true;
+            echo cli_white('Usage:').substr($line, 6);
+        } elseif ($in_usage)
+            echo $line;
+        elseif ($line[0] !== ' ' && substr($line, -1) === ':')
+            echo cli_white($line);
+        elseif (preg_match('/^(\s+\S.*?)(\s{2,})(\S.*)$/', $line, $m))
+            echo $m[1].$m[2].cli_grey($m[3]);   // "  --opt      description"
+        else
+            echo cli_grey($line);               // prose paragraph
+    }
+}
+
+/* Display width, so box borders line up with multibyte text. */
+function cli_width($s) {
+    return function_exists('mb_strwidth') ? mb_strwidth((string)$s, 'UTF-8') : strlen((string)$s);
+}
+
+/* A box-drawn table (same style as scripts/scan_for_wordpress); $cols maps
+   header => row key. */
+function cli_table(array $rows, array $cols) {
+    if (!$rows) {
+        echo "(none)\n";
+        return;
+    }
+    $w   = array();
+    $num = array();   // all-numeric columns (UID, SIZE_MB) are right-aligned
+    foreach ($cols as $h => $k) {
+        $w[$k]   = cli_width($h);
+        $num[$k] = true;
+        foreach ($rows as $r) {
+            $w[$k] = max($w[$k], cli_width($r[$k]));
+            if (!is_numeric($r[$k])) $num[$k] = false;
+        }
+    }
+    $rule = function($l, $m, $r) use ($w) {
+        $parts = array();
+        foreach ($w as $n) $parts[] = str_repeat('─', $n + 2);
+        return $l.implode($m, $parts).$r."\n";
+    };
+    $line = function($vals, $head = false) use ($cols, $w, $num) {
+        $cells = array();
+        foreach (array_values($cols) as $k) {
+            $v   = (string)$vals[$k];
+            $pad = str_repeat(' ', $w[$k] - cli_width($v));
+            $v   = $num[$k] ? $pad.$v : $v.$pad;
+            $cells[] = ' '.($head ? cli_white($v) : $v).' ';
+        }
+        return '│'.implode('│', $cells)."│\n";
+    };
+    echo $rule('┌', '┬', '┐');
+    echo $line(array_combine(array_values($cols), array_keys($cols)), true);
+    echo $rule('├', '┼', '┤');
+    foreach ($rows as $r)
+        echo $line($r);
+    echo $rule('└', '┴', '┘');
+}
+
+function cli_list(array $rows, array $opts, array $cols) {
+    if (!empty($opts['json'])) {
+        echo json_encode(result_ok('', $rows), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n";
+        exit(0);
+    }
+    cli_table($rows, $cols);
+    exit(0);
+}
+
+/* ---- command table ------------------------------------------------------ */
+
+/*
+ * The options every subcommand accepts, and what its first argument is. One
+ * table so the validation in cli_allow() and the bash completion can never
+ * disagree about what exists.
+ *
+ * arg: what to complete for the first positional -- account | domain (mail) |
+ *      database | dbuser | mailbox | '' (nothing to suggest, e.g. a new name).
+ */
+function cli_spec() {
+    $pw = array('password', 'password-stdin', 'generate-password');
+    return array(
+        'account' => array(
+            'list'   => array('opts' => array(),                                                                          'arg' => ''),
+            'show'   => array('opts' => array(),                                                                          'arg' => 'account'),
+            'create' => array('opts' => array_merge($pw, array('dns', 'letsencrypt', 'email', 'www', 'quota')),            'arg' => ''),
+            'edit'   => array('opts' => array_merge($pw, array('php', 'email')),                                          'arg' => 'account'),
+            'delete' => array('opts' => array('yes'),                                                                     'arg' => 'account'),
+        ),
+        'db' => array(
+            'list'   => array('opts' => array('account'),                                                                 'arg' => ''),
+            'create' => array('opts' => array_merge($pw, array('user')),                                                  'arg' => 'account'),
+            'delete' => array('opts' => array('yes'),                                                                     'arg' => 'database'),
+            'passwd' => array('opts' => $pw,                                                                              'arg' => 'dbuser'),
+            'assign'   => array('opts' => array(),                                                                        'arg' => 'database'),
+            'unassign' => array('opts' => array(),                                                                        'arg' => 'database'),
+        ),
+        'email' => array(
+            'list'   => array('opts' => array('domain'),                                                                  'arg' => ''),
+            'create' => array('opts' => $pw,                                                                              'arg' => ''),
+            'edit'   => array('opts' => array_merge($pw, array('enable', 'disable')),                                     'arg' => 'mailbox'),
+            'delete' => array('opts' => array('yes'),                                                                     'arg' => 'mailbox'),
+        ),
+    );
+}
+
+/* Options of one subcommand, or array() when the subcommand is unknown. */
+function cli_opts($cmd, $sub) {
+    $spec = cli_spec();
+    return isset($spec[$cmd][$sub]) ? $spec[$cmd][$sub]['opts'] : array();
+}
+
+/* ---- bash completion ----------------------------------------------------- */
+
+/*
+ * Hidden `reqad __complete <cword> <cur> <prev> <words...>`: print the
+ * candidates for the word being typed, one per line.
+ *
+ * cur and prev are passed in rather than read out of <words>: bash-completion's
+ * -s mode splits "--php=8.3" into the option and its value, so the value being
+ * typed is NOT words[cword] -- it is only in $cur. Called by the script in
+ * etc/reqad-completion.bash; it prints nothing rather than failing, and must
+ * never block -- so a lookup that needs `sudo` runs only when already root
+ * (otherwise sudo could sit waiting for a password while the user presses Tab).
+ */
+function cmd_complete(array $argv) {
+    $cword = (int)($argv[2] ?? 0);
+    $cur   = (string)($argv[3] ?? '');
+    $prev  = (string)($argv[4] ?? '');
+    $words = array_slice($argv, 5);
+    $cmd   = (string)($words[1] ?? '');
+    $sub   = (string)($words[2] ?? '');
+    $spec  = cli_spec();
+    $out   = array();
+
+    /* A value for the option before the cursor (bash-completion's -s mode
+       splits --opt=value, so $prev is the option name). */
+    switch ($prev) {
+    case '--account': $out = complete_values('account'); break;
+    case '--domain':  $out = complete_values('domain');  break;
+    case '--email':   $out = ($cmd === 'account') ? array('on', 'off') : array(); break;
+    case '--php':     $out = complete_php();            break;
+    }
+
+    if (!$out && $cword <= 1)
+        $out = array_merge(array_keys($spec), array('info', '--help', '--version'));
+    elseif (!$out && isset($spec[$cmd])) {
+        if ($cword == 2)
+            $out = array_keys($spec[$cmd]);
+        elseif (isset($spec[$cmd][$sub])) {
+            if (substr($cur, 0, 1) === '-')
+                foreach (array_merge($spec[$cmd][$sub]['opts'], array('json')) as $o)
+                    $out[] = '--'.$o;
+            elseif ($cword == 3)
+                $out = complete_values($spec[$cmd][$sub]['arg']);
+        }
+    }
+
+    foreach ($out as $c)
+        if ($cur === '' || strpos((string)$c, $cur) === 0)
+            echo $c."\n";
+    exit(0);
+}
+
+/* PHP versions from the ini, plus "off" -- no privileges needed. */
+function complete_php() {
+    $ini = @parse_ini_file(REQAD_ROOT.'/etc/server-software.ini');
+    if (!$ini || empty($ini['php_versions']))
+        return array();
+    $versions = array_filter(array_map('trim', explode(',', $ini['php_versions'])), 'strlen');
+    $versions[] = 'off';
+    return $versions;
+}
+
+/* Values of one kind for completion. Accounts and mail domains come straight
+   out of the panel db (world-readable, so this also works for a non-root
+   shell); databases, database users and mailboxes need root. */
+function complete_values($kind) {
+    if ($kind === 'account' || $kind === 'domain') {
+        $file = REQAD_ROOT.'/db/reqad.db';
+        if (!is_readable($file))
+            return array();
+        try {
+            $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
+            $sql = ($kind === 'account')
+                 ? 'SELECT user FROM accounts ORDER BY user'
+                 : 'SELECT domain FROM accounts WHERE has_email=1 ORDER BY domain';
+            $out = array();
+            $res = $db->query($sql);
+            while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
+                $out[] = $row[0];
+            $db->close();
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+
+    if (posix_geteuid() !== 0)
+        return array();
+    require_once REQAD_ROOT.'/public_html/modules/functions.php';
+    foreach (glob(REQAD_ROOT.'/app/functions/*.php') as $f)
+        require_once $f;
+
+    if ($kind === 'database')
+        return array_column(database_list(), 'name');
+    if ($kind === 'mailbox')
+        return mailbox_list();
+    if ($kind === 'dbuser') {
+        /* Only the per-account users the panel creates ("<account>_<name>"),
+           never root or MySQL's own mysql.session / mysql.sys. */
+        $users = array();
+        foreach (database_list() as $row)
+            foreach ($row['users'] as $u)
+                $users[substr($u, 0, strrpos($u, '@'))] = true;
+        return array_keys($users);
+    }
+    return array();
+}
+
+/* ---- account ------------------------------------------------------------- */
+
+function cmd_account($prog, $sub, array $pos, array $opts) {
+    global $db;
+    switch ($sub) {
+    case 'list':
+        cli_allow($opts, cli_opts('account', 'list'));
+        cli_need($pos, 0, '');
+        $rows = account_list($db);
+        foreach ($rows as &$r)
+            $r['email_flag'] = $r['has_email'] ? 'yes' : 'no';
+        unset($r);
+        if (!empty($opts['json'])) {
+            foreach ($rows as &$r) unset($r['email_flag']);
+            unset($r);
+        }
+        cli_list($rows, $opts, array('UID' => 'id', 'USER' => 'user', 'DOMAIN' => 'domain', 'EMAIL' => 'email_flag', 'STATUS' => 'status', 'CREATED' => 'created_at'));
+
+    case 'show':
+        cli_allow($opts, cli_opts('account', 'show'));
+        cli_need($pos, 1, '<user>');
+        $row = account_get($db, $pos[0]);
+        if (!$row)
+            cli_result(result_error("Account {$pos[0]} not found."), $opts);
+        list($php, $handler) = account_php($row['domain']);
+        $data = array(
+            'uid' => $row['id'], 'user' => $row['user'], 'domain' => $row['domain'],
+            'status' => $row['status'], 'created_at' => $row['created_at'],
+            'email' => ($row['has_email'] == 1), 'disk_usage' => $row['disk_usage'], 'disk_quota' => $row['disk_quota'],
+            'php' => $php, 'php_handler' => $handler,
+            'mailboxes' => array_column(email_list($row['domain']), 'email'),
+            'databases' => array_column(database_list($row['user']), 'name'),
+        );
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $data), $opts);
+        foreach ($data as $k => $v) {
+            if (is_bool($v)) $v = $v ? 'yes' : 'no';
+            if (is_array($v)) $v = $v ? implode(', ', $v) : '-';
+            printf("%-12s %s\n", $k.':', $v);
+        }
+        exit(0);
+
+    case 'create':
+        cli_allow($opts, cli_opts('account', 'create'));
+        cli_need($pos, 2, '<user> <domain>');
+        list($pw, $gen) = cli_password($opts, 'account');
+        $r = account_create($db, array(
+            'user' => $pos[0], 'domain' => $pos[1], 'password' => $pw,
+            'disk_quota' => isset($opts['quota']) ? (int)$opts['quota'] : 0,
+            'dns' => !empty($opts['dns']), 'letsencrypt' => !empty($opts['letsencrypt']),
+            'email' => !empty($opts['email']), 'www' => !empty($opts['www']),
+        ));
+        cli_result($r, $opts, $gen ? $pw : null);
+
+    case 'edit':
+        cli_allow($opts, cli_opts('account', 'edit'));
+        cli_need($pos, 1, '<user>');
+        $o = array('user' => $pos[0]);
+        $gen = false;
+        if (isset($opts['password']) || isset($opts['password-stdin']) || isset($opts['generate-password']))
+            list($o['password'], $gen) = cli_password($opts, 'account');
+        if (isset($opts['php'])) {
+            if ($opts['php'] === true) cli_die("--php needs a version, e.g. --php=8.3");
+            $o['php'] = $opts['php'];
+        }
+        if (isset($opts['email'])) {
+            if (!in_array($opts['email'], array('on', 'off'), true)) cli_die("--email must be on or off");
+            $o['email'] = ($opts['email'] === 'on');
+        }
+        if (count($o) == 1)
+            cli_die("nothing to change; see '$prog account --help'");
+        cli_result(account_edit($db, $o), $opts, $gen ? $o['password'] : null);
+
+    case 'delete':
+        cli_allow($opts, cli_opts('account', 'delete'));
+        cli_need($pos, 1, '<user>');
+        if (!account_get($db, $pos[0]))
+            cli_result(result_error("Account {$pos[0]} not found."), $opts);
+        cli_confirm($opts, $pos[0], 'account');
+        cli_result(account_delete($db, $pos[0]), $opts);
+
+    default:
+        cli_die("unknown account command '$sub'; see '$prog account --help'");
+    }
+}
+
+/* ---- db ------------------------------------------------------------------ */
+
+function cmd_db($prog, $sub, array $pos, array $opts) {
+    switch ($sub) {
+    case 'list':
+        cli_allow($opts, cli_opts('db', 'list'));
+        cli_need($pos, 0, '');
+        $rows = database_list(isset($opts['account']) && $opts['account'] !== true ? $opts['account'] : '');
+        if (empty($opts['json'])) {
+            foreach ($rows as &$r) {
+                $r['users']   = $r['users'] ? implode(', ', $r['users']) : '-';
+                $r['account'] = $r['account'] !== '' ? $r['account'].($r['assigned'] ? ' (assigned)' : '') : '-';
+            }
+            unset($r);
+        }
+        cli_list($rows, $opts, array('DATABASE' => 'name', 'SYSTEM USER' => 'account', 'SIZE_MB' => 'size_mb', 'USERS' => 'users'));
+
+    case 'create':
+        cli_allow($opts, cli_opts('db', 'create'));
+        cli_need($pos, 2, '<account> <name>');
+        $dbuser = isset($opts['user']) && $opts['user'] !== true ? $opts['user'] : $pos[1];
+        list($pw, $gen) = cli_password($opts, 'database user');
+        cli_result(database_create(array('account' => $pos[0], 'name' => $pos[1], 'dbuser' => $dbuser, 'password' => $pw)), $opts, $gen ? $pw : null);
+
+    case 'delete':
+        cli_allow($opts, cli_opts('db', 'delete'));
+        cli_need($pos, 1, '<database>');
+        if (!in_array($pos[0], array_column(database_list(), 'name'), true))
+            cli_result(result_error("Database {$pos[0]} does not exist."), $opts);
+        cli_confirm($opts, $pos[0], 'database');
+        cli_result(database_delete($pos[0]), $opts);
+
+    case 'passwd':
+        cli_allow($opts, cli_opts('db', 'passwd'));
+        cli_need($pos, 1, '<dbuser>');
+        list($pw, $gen) = cli_password($opts, 'database user');
+        cli_result(database_password($pos[0], $pw), $opts, $gen ? $pw : null);
+
+    case 'assign':
+        cli_allow($opts, cli_opts('db', 'assign'));
+        cli_need($pos, 2, '<database> <account>');
+        cli_result(database_assign($pos[0], $pos[1]), $opts);
+
+    case 'unassign':
+        cli_allow($opts, cli_opts('db', 'unassign'));
+        cli_need($pos, 1, '<database>');
+        cli_result(database_unassign($pos[0]), $opts);
+
+    default:
+        cli_die("unknown db command '$sub'; see '$prog db --help'");
+    }
+}
+
+/* ---- email --------------------------------------------------------------- */
+
+function cmd_email($prog, $sub, array $pos, array $opts) {
+    global $db, $ini;
+    if (!feature_enabled($ini, 'email'))
+        cli_result(result_error("Email is disabled on this server (email=0 in etc/server-software.ini)."), $opts);
+    switch ($sub) {
+    case 'list':
+        cli_allow($opts, cli_opts('email', 'list'));
+        cli_need($pos, 0, '');
+        $rows = email_list(isset($opts['domain']) && $opts['domain'] !== true ? $opts['domain'] : '');
+        if (empty($opts['json'])) {
+            foreach ($rows as &$r) $r['enabled'] = $r['enabled'] ? 'active' : 'disabled';
+            unset($r);
+        }
+        cli_list($rows, $opts, array('EMAIL' => 'email', 'SYSTEM USER' => 'account', 'STATUS' => 'enabled'));
+
+    case 'create':
+        cli_allow($opts, cli_opts('email', 'create'));
+        cli_need($pos, 1, '<address>');
+        list($pw, $gen) = cli_password($opts, 'mailbox');
+        cli_result(email_create(array('email' => $pos[0], 'password' => $pw)), $opts, $gen ? $pw : null);
+
+    case 'edit':
+        cli_allow($opts, cli_opts('email', 'edit'));
+        cli_need($pos, 1, '<address>');
+        $o = array('email' => $pos[0]);
+        $gen = false;
+        if (!empty($opts['enable']) && !empty($opts['disable']))
+            cli_die("--enable and --disable are mutually exclusive");
+        if (!empty($opts['enable']))  $o['enabled'] = true;
+        if (!empty($opts['disable'])) $o['enabled'] = false;
+        if (isset($opts['password']) || isset($opts['password-stdin']) || isset($opts['generate-password']))
+            list($o['password'], $gen) = cli_password($opts, 'mailbox');
+        if (count($o) == 1)
+            cli_die("nothing to change; see '$prog email --help'");
+        cli_result(email_edit($o), $opts, $gen ? $o['password'] : null);
+
+    case 'delete':
+        cli_allow($opts, cli_opts('email', 'delete'));
+        cli_need($pos, 1, '<address>');
+        if (!in_array(strtolower($pos[0]), mailbox_list(true), true))
+            cli_result(result_error("Email {$pos[0]} does not exist."), $opts);
+        cli_confirm($opts, strtolower($pos[0]), 'mailbox');
+        cli_result(email_delete($db, $pos[0]), $opts);
+
+    default:
+        cli_die("unknown email command '$sub'; see '$prog email --help'");
+    }
+}
+
+/* ---- dispatch ------------------------------------------------------------ */
+
+$arg = isset($argv[1]) ? $argv[1] : '';
+
+/* Bash completion asks first: no root check, no panel load, no output on error. */
+if ($arg === '__complete')
+    cmd_complete($argv);
+
+switch ($arg) {
+    case '':
+    case '-h':
+    case '--help':
+    case 'help':
+        usage($prog);
+        exit(0);
+
+    case '-V':
+    case '--version':
+        show_version();
+        exit(0);
+
+    case 'info':
+        show_info();
+        exit(0);
+
+    case 'account':
+    case 'db':
+    case 'email':
+        break;
+
+    default:
+        fwrite(STDERR, "reqad: unknown option '{$arg}'\n\n");
+        usage($prog);
+        exit(2);
+}
+
+$sub = (isset($argv[2]) && $argv[2] !== '' && $argv[2][0] !== '-') ? $argv[2] : '';
+list($pos, $opts) = cli_parse(array_slice($argv, $sub === '' ? 2 : 3));
+
+// Help needs neither root nor the panel config.
+if ($sub === '' || !empty($opts['help'])) {
+    $fn = 'usage_'.$arg;
+    $fn($prog);
+    exit($sub === '' && empty($opts['help']) ? 2 : 0);
+}
+
+/* The management commands change system users, vhosts, mail and MySQL, and
+   read files only root (or the panel via sudo) may read. */
+if (posix_geteuid() !== 0)
+    cli_die("'$arg' must be run as root", 1);
+
+/* Load the panel exactly as index.php does. At file scope on purpose:
+   defines.php creates $db, $ini, $_debug as globals, which a function-scope
+   require would turn into locals. */
+require_once REQAD_ROOT.'/public_html/defines.php';
+require_once REQAD_ROOT.'/public_html/modules/functions.php';
+foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
+    require_once $app_functions_file;
+date_default_timezone_set(system_timezone());
+
+$fn = 'cmd_'.$arg;
+$fn($prog, $sub, $pos, $opts);

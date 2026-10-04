@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 if(php_sapi_name() != "cli" || posix_getuid() != 0) {
     echo "You can only run this script as root from cli.\n";

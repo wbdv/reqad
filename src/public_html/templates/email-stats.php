@@ -9,6 +9,10 @@
 
 	$nb_accounts = count($domains);
 
+	/* One read for the "Errors" card and the list below it, so the two cannot
+	   disagree. Collected by scripts/exim_error_parser.php. */
+	$smtp_errors = smtp_errors_read();
+
 	$output = shell_exec("/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | awk {'print \$2'} | awk -F/ {'print \$1'}");
 	$local_ips = array_map('trim', explode("\n", trim($output)));
 
@@ -81,7 +85,7 @@
                   <div class="d-flex align-items-center">
                     <div class="subheader">Errors</div>
                   </div>
-                  <div class="h1 mb-3"><?=shell_exec("sudo grep '\*' /var/log/exim/main.log | awk {'print $5'} | sort | uniq | wc -l");?></div>
+                  <div class="h1 mb-3"><?=count($smtp_errors);?></div>
                 </div>
               </div>
             </div>
@@ -122,10 +126,12 @@
                       </tr>
                     </thead>
                     <tbody>
-                   <?
-						$i=0;
-    					$results = $db->query('SELECT * FROM errors GROUP BY email ORDER BY date desc');
-				    	while ($row = $results->fetchArray()) {
+                   <?php
+						/* Collected by scripts/exim_error_parser.php into
+						   log/smtp_errors.log -- these used to come from an
+						   `errors` table in the panel database. */
+						$i = 0;
+						foreach ($smtp_errors as $row) {
 							$i++;
                     ?>
                       <tr>

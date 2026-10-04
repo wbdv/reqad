@@ -89,7 +89,7 @@ sed -i 's/opcache.interned_strings_buffer=8/opcache.interned_strings_buffer=32/'
 sed -i 's/opcache.memory_consumption=128/opcache.memory_consumption=1024/' /etc/php.d/10-opcache.ini
 sed -i 's/opcache.max_accelerated_files=4000/opcache.max_accelerated_files=1000000/' /etc/php.d/10-opcache.ini
 
-chmod -R a+rwx /var/lib/php/session/
+chmod 1733 /var/lib/php/session
 
 echo -n 'PHP '
 echo -n `rpm -qi php | grep 'Version' | awk {'print $3'}`

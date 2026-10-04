@@ -20,7 +20,7 @@ NC='\033[0m' # No Color
 
 echo -ne "${YELLOW}"
 echo -e "┌──────────────────────────────────────────────────────────────────────────────┐"
-echo "│ Reqad install script version ${VERSION}                            │"
+echo "│ Reqad install script version ${VERSION}                             │"
 echo -e "└──────────────────────────────────────────────────────────────────────────────┘\n"
 echo -ne "${NC}"
 

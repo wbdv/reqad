@@ -345,6 +345,7 @@ nginx_server_body() {
     root        ${DOCROOT};
     autoindex   off;
     index       index.php index.html index.htm;
+    include /etc/nginx/reqad-error-pages.conf;
 
     # Allow OPTIONS for Wordpress
     allow_methods "^(GET|POST|HEAD|OPTIONS)\$";
@@ -358,10 +359,23 @@ nginx_server_body() {
 
         try_files \$uri \$uri/ /index.php\$is_args\$args;
 
+        # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
+        location ~ /\\. {
+            deny all;
+        }
+
+        # Deny access to any files with a .php extension in the uploads directory
+        # Works in sub-directory installs and also in multisite network
+        # Must stay ABOVE the PHP handler: nested regex locations match in file
+        # order, so placed after the .php location this deny never fired.
+        location ~* /(?:uploads|files)/.*\\.php\$ {
+            deny all;
+        }
+
         location ~ \\.php\$ {
             try_files                   \$uri =404;
             fastcgi_split_path_info     ^(.+\\.php)(/.+)\$;
-            fastcgi_intercept_errors    on;
+            fastcgi_intercept_errors    off;
 
             include         /etc/nginx/fastcgi_params;
             fastcgi_index   index.php;
@@ -382,17 +396,6 @@ nginx_server_body() {
             allow all;
             log_not_found off;
             access_log off;
-        }
-
-        # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
-        location ~ /\\. {
-            deny all;
-        }
-
-        # Deny access to any files with a .php extension in the uploads directory
-        # Works in sub-directory installs and also in multisite network
-        location ~* /(?:uploads|files)/.*\\.php\$ {
-            deny all;
         }
     }
 EOF

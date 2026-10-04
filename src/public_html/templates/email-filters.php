@@ -527,7 +527,7 @@ $(function() {
      folder field stays the plain text input it has always been. */
   var FOLDERS = <?=json_encode($folders);?>;
 
-  /* What the message is tested against, using cPanel's labels so the list reads
+  /* What the message is tested against, using cP***'s labels so the list reads
      the same to anyone coming from there. Every entry is something the renderer
      AND the parser can round-trip; "body" and "size" are special-cased, "to,cc"
      becomes a single Sieve header list, the rest are plain header names. */

@@ -165,6 +165,18 @@ if($errmsg == '') {
 		'opcache.interned_strings_buffer' => 'numeric',
 		'opcache.max_accelerated_files' => 'numeric',
 	);
+	/* Fallbacks used when a key is missing from 10-opcache.ini. A key must never
+	   be appended blank: PHP reads an empty value as 0, and
+	   opcache.memory_consumption=0 is clamped to 8MB, which no longer fits the
+	   interned strings buffer -- PHP then aborts at startup and every CLI run and
+	   php-fpm worker for that version dies. */
+	$opcache_default = array(
+		'opcache.enable' => '1',
+		'opcache.enable_cli' => '1',
+		'opcache.memory_consumption' => '128',
+		'opcache.interned_strings_buffer' => '8',
+		'opcache.max_accelerated_files' => '10000',
+	);
 	foreach($opcache_path as $opcache_path_cur) {
 		if(!is_file($opcache_path_cur))
 			continue;
@@ -178,14 +190,38 @@ if($errmsg == '') {
 			if(array_key_exists($var, $opcache_allowed))
 				$oc[$var] = $val;
 		}
+		/* The interned strings buffer is carved out of the same shared segment as
+		   opcache.memory_consumption, so it has to fit inside it with room to
+		   spare. Writing interned_strings_buffer >= memory_consumption makes PHP
+		   abort at startup ("Insufficient shared memory for interned strings
+		   buffer"), taking php-fpm and every CLI tool (wp-cli, composer) with it,
+		   and the panel can no longer be used to undo it. Validate the pair --
+		   posted value where given, current file value otherwise -- and skip the
+		   file rather than write a config that kills PHP. */
+		$oc_mc  = isset($_POST['opcache_memory_consumption']) && trim($_POST['opcache_memory_consumption']) !== ''
+		        ? (int)$_POST['opcache_memory_consumption']
+		        : (int)(isset($oc['opcache.memory_consumption']) ? $oc['opcache.memory_consumption'] : $opcache_default['opcache.memory_consumption']);
+		$oc_isb = isset($_POST['opcache_interned_strings_buffer']) && trim($_POST['opcache_interned_strings_buffer']) !== ''
+		        ? (int)$_POST['opcache_interned_strings_buffer']
+		        : (int)(isset($oc['opcache.interned_strings_buffer']) ? $oc['opcache.interned_strings_buffer'] : $opcache_default['opcache.interned_strings_buffer']);
+		if($oc_mc < 8)
+			$oc_mc = 8;
+		if($oc_isb >= $oc_mc) {
+			$errmsg = 'OPcache: interned_strings_buffer ('.$oc_isb.'MB) must be smaller than memory_consumption ('.$oc_mc.'MB) '
+			        . '-- PHP would refuse to start. Nothing was written to '.$opcache_path_cur.'.';
+			continue;
+		}
+
 		foreach($opcache_allowed as $var => $type) {
 			$var2 = str_replace('.', '_', $var);
 			if(!isset($oc[$var])) {
 				// search for a commented setting to uncomment, else append
 				$commented = trim(shell_exec("grep -e '^;$var=' $opcache_path_cur | tail -n 1"));
 				if($commented == '') {
-					shell_exec("echo '$var=' | sudo tee --append $opcache_path_cur");
-					$oc[$var] = '';
+					// append with a working default, never blank (see $opcache_default)
+					$def = $opcache_default[$var];
+					shell_exec("echo '$var=$def' | sudo tee --append $opcache_path_cur");
+					$oc[$var] = $def;
 				} else {
 					shell_exec("sudo sed -i 's/^;$var=/$var=/' $opcache_path_cur");
 					$parsed_line = array_map('trim', explode("=", trim($commented), 2));

@@ -14,16 +14,25 @@ $msg_base = $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/backup/?tab
 $enabled = isset($_POST['enabled']);
 $hour = trim((string)($_POST['hour'] ?? '2'));
 $min  = trim((string)($_POST['min']  ?? '15'));
-$keep = trim((string)($_POST['keep'] ?? '0'));
+$keep = trim((string)($_POST['keep'] ?? '4'));
+/* "Notify on errors" is on by default. Without a contact email the switch is
+   disabled, so never posted — that is not the admin switching it off, and
+   saving '0' then would keep it off once an address is set */
+$contact = setting_get('email');
+$notify  = isset($_POST['notify']) && $contact !== '';
 
 /* same schedule charset create_cron.php accepts */
 if (!preg_match('/^[\d\*\/\-\,]{1,32}$/', $hour) || !preg_match('/^[\d\*\/\-\,]{1,32}$/', $min))
 	$errmsg = 'That schedule is not valid.';
-elseif (!ctype_digit($keep))
-	$errmsg = 'Keep must be a number of days (0 = keep everything).';
+elseif (!ctype_digit($keep) || (int)$keep < 1 || (int)$keep > 9)
+	$errmsg = 'Keep must be a number from 1 to 9.';
 
 if ($errmsg === '') {
 	setting_put('backup-remote-keep', $keep);
+	/* not in the cron line: backup_remote.sh reads this setting and the contact
+	   email at run time, so schedules saved before the switch existed notify too */
+	if ($contact !== '')
+		setting_put('backup-remote-notify', $notify ? '1' : '0');
 
 	$script = '/usr/local/reqad/scripts/backup_remote.sh';
 	$line   = $min.' '.$hour.' * * * root '.$script
@@ -47,7 +56,8 @@ if ($errmsg === '') {
 	} elseif ($enabled) {
 		exec('echo '.escapeshellarg($line).' | sudo -n tee --append /etc/crontab > /dev/null', $o2, $rc2);
 		if ($rc2 !== 0) $errmsg = 'Could not write the cron entry.';
-		else $successmsg = 'Nightly remote backup enabled at '.sprintf('%02d:%02d', (int)$hour, (int)$min).'.';
+		else $successmsg = 'Nightly remote backup enabled at '.sprintf('%02d:%02d', (int)$hour, (int)$min).'.'
+		                 . ($notify ? ' Errors will be emailed to '.$contact.'.' : '');
 	} else {
 		$successmsg = 'Nightly remote backup disabled.';
 	}

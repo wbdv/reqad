@@ -1,50 +1,41 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
+/*
+ * exim_error_parser.php -- collect SMTP delivery failures into a log file
+ *
+ * Run from cron every minute. Reads the permanent-failure ("**") lines out of
+ * exim's main.log and appends the ones not recorded yet to log/smtp_errors.log.
+ *
+ * These used to be INSERTed into an `errors` table in the panel database; see
+ * the comment above smtp_error_parse() in modules/functions.php for why that
+ * moved here. The parsing, dedup and trimming all live in functions.php so the
+ * page that renders the log reads it back through the same code.
+ *
+ * Reqad -- https://www.reqad.com/
+ */
 
-if(!is_file(__DIR__.'/../db/reqad.db')) {
-    echo "Missing SQLite Database '".__DIR__."'/../db/reqad.db'\n";
-    exit;
+require_once __DIR__.'/../public_html/modules/functions.php';
+
+/* Runs every minute over a log that can be tens of megabytes after a spam
+   burst. Skip rather than queue up overlapping scans that would each redo the
+   same work and then race on the append. */
+$lock = @fopen(__DIR__.'/../log/.smtp_errors.lock', 'c');
+if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB))
+	exit(0);
+
+$raw = shell_exec(escapeshellarg(__DIR__.'/exim_error_parser.sh').' 2>/dev/null');
+
+$entries = array();
+foreach (explode("\n", (string)$raw) as $line) {
+	$e = smtp_error_parse(rtrim($line, "\r"));
+	if ($e !== null) $entries[] = $e;
 }
 
-$db = new SQLite3(__DIR__.'/../db/reqad.db');
-$s = array();
+$added = smtp_errors_append($entries);
+smtp_errors_trim();
 
-$results = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name='errors';");
-$row = $results->fetchArray();
-print_r($row);
+/* cron redirects to /dev/null; this is for running it by hand. */
+echo "exim_error_parser: ".count($entries)." failures in main.log, ".$added." new\n";
 
-
-
-$output = shell_exec(__DIR__.'/exim_error_parser.sh');
-$output = explode("\n", trim($output));
-function sqlitequote($s) {
-	return trim(str_replace(array("'", '<', '>'), array("''", '', ''), $s));
-}
-
-foreach($output as $k => $o) {
-	$s[$k] = array_map('trim', explode('|', $o));
-	if($s[$k][3]!='')
-		$s[$k][2] = $s[$k][3];
-	unset($s[$k][3]);
-	$results = $db->query("SELECT count(*) AS nb FROM errors WHERE date='".sqlitequote($s[$k][0])."' AND email='".sqlitequote($s[$k][1])."'");
-	if($results !== false) {
-		$row = $results->fetchArray();
-		$nb  = (int)($row["nb"]);
-		if($nb==0 && $s[$k][0]!='' && $s[$k][1]!='' && $s[$k][2]!='') {
-			echo("INSERT INTO errors VALUES (null, '".sqlitequote($s[$k][0])."', '".sqlitequote($s[$k][1])."', '".str_replace(array('550 5.1.1', '550-5.1.1', '552 1', '554 30', '550-','550 '), array('', '', '', '', '', ''), sqlitequote($s[$k][2]))."')\n");
-			$db->query("INSERT INTO errors VALUES (null, '".sqlitequote($s[$k][0])."', '".sqlitequote($s[$k][1])."', '".str_replace(array('550 5.1.1', '550-5.1.1', '552 1', '554 30', '550-','550 '), array('', '', '', '', '', ''), sqlitequote($s[$k][2]))."')");
-		}
-	} else {
-		echo("CREATE TABLE `errors` (`id` integer not null primary key autoincrement, `date` datetime not null, `email` varchar(100) not null, `errmsg` varchar(255) not null, unique (`id`))");
-		$db->exec("CREATE TABLE `errors` (`id` integer not null primary key autoincrement, `date` datetime not null, `email` varchar(100) not null, `errmsg` varchar(255) not null, unique (`id`))");
-	}
-}
-
-#print_r($s);
-
-#$results = $db->query('SELECT count(*) as nb FROM errors');
-#$row = $results->fetchArray();
-#$nb_accounts = (int)($row["nb"]);
-
-
-
+flock($lock, LOCK_UN);
+fclose($lock);

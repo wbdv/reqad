@@ -1,4 +1,4 @@
-#!/usr/bin/php82
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 /* Re-apply a DNS zone dumped by dump_dns_zone.php, using the configured provider.
  * Called by scripts/restore.sh. Provider-agnostic: uses import_zone_records().

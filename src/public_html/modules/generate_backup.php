@@ -3,6 +3,8 @@
 	$website 	= (isset($_POST['website'])  && $_POST['website']=='on') ?'-w':'';
 	$email 		= (isset($_POST['email'])    && $_POST['email']=='on')   ?'-m':'';
 	$database 	= (isset($_POST['database']) && $_POST['database']=='on')?'-d':'';
+	/* the Exclusions tab's manual-scope rules apply unless "full copy" is ticked */
+	$excludes 	= (isset($_POST['noexcl'])   && $_POST['noexcl']=='on')  ?'--scope manual --no-excludes':'--scope manual';
 
 	$errmsg 	= '';
 	$successmsg = '';
@@ -15,7 +17,7 @@
 		$errmsg = 'Select at least one thing to back up (website, email or databases).';
 	} else {
 		$q_user = escapeshellarg($user);
-		shell_exec("/usr/local/reqad/scripts/backup.sh $q_user $website $email $database >> /usr/local/reqad/log/backup.log 2>&1 &");
+		shell_exec("/usr/local/reqad/scripts/backup.sh $q_user $website $email $database $excludes >> /usr/local/reqad/log/backup.log 2>&1 &");
 		sleep(5);
 		$successmsg = "Backup on progress for user $user.";
 	}

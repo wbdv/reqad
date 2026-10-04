@@ -4,6 +4,15 @@
     $HOSTNAME = trim(shell_exec('hostname'));
     if($route == 'cancel-reboot') shell_exec("sudo shutdown -c");
     $reboot_date = trim(shell_exec("head -1 /run/systemd/shutdown/scheduled 2>/dev/null | cut -c6-15"));
+
+    /* Server (root) SSH public key — shown in the key modal so it can be copied
+       to other servers. PHP runs as the reqad user and cannot read /root at all,
+       so this needs sudo (see backupdb.php / remote_backup_ssh). */
+    $server_pubkey = '';
+    foreach(array('/root/.ssh/id_rsa.pub', '/root/.ssh/id_ed25519.pub') as $_pk) {
+        $_out = trim(shell_exec('sudo -n cat '.escapeshellarg($_pk).' 2>/dev/null'));
+        if($_out != '') { $server_pubkey = $_out; break; }
+    }
 ?>
           <!-- Page title -->
           <div class="page-header d-print-none">
@@ -11,7 +20,10 @@
               <div class="col" style="padding-left:22px;padding-right:0;overflow:hidden;">
                 <div class="page-pretitle">Dashboard</div>
                 <h2 class="page-title">Server Information</h2>
-		        <h3><?=$HOSTNAME;?></h3><br>
+		        <h3 class="d-inline-block"><?=$HOSTNAME;?></h3>
+                <span type="button" id="server-pubkey-btn" class="btn btn-icon btn-sm ms-2 align-middle" data-bs-toggle="modal" data-bs-target="#modal-server-pubkey" title="Server SSH public key" style="margin-top:-6px;margin-left:-5px !important;border:none;background:transparent;color:#206bc4CC !important">
+				  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-key-round h-3.5 w-3.5" aria-hidden="true"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"></path><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"></circle></svg>
+				</span><br>
                 <style>
                   	.sysinfo-table th { background-color:#DEF; white-space:nowrap; }
 					@media (min-width: 991px) {
@@ -49,7 +61,7 @@
                       <tr><td>Timezone:</td><td><b><span id="d-timezone" class="dash-loading"></span></b></td></tr>
                       <tr><td>Template:</td><td><b><span id="d-template" class="dash-loading"></span></b></td></tr>
                       <tr><td>PHP Versions:</td><td><span id="d-php" class="dash-loading"></span></td></tr>
-                      <tr><td>Reqad Version:</td><td><b><?=$reqad_version[0];?></b> <span class="text-muted">(<?=date("M j, Y", strtotime($reqad_version[1]));?>)</span></td></tr>
+                      <?php $_rv = reqad_version_label($reqad_version); ?><tr><td>Reqad Version:</td><td><b><?=$_rv[0];?></b> <span class="text-muted">(<?=$_rv[1];?>)</span></td></tr>
                       <tr><td>Uptime:</td><td><b><span id="d-uptime" class="dash-loading"></span></b></td></tr>
                     </table>
                   </div>
@@ -78,28 +90,22 @@
               <div>
                   <svg xmlns="http://www.w3.org/2000/svg" class="icon alert-icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><path d="M12 9v2m0 4v.01"></path><path d="M5 19h14a2 2 0 0 0 1.84 -2.75l-7.1 -12.25a2 2 0 0 0 -3.5 0l-7.1 12.25a2 2 0 0 0 1.75 2.75"></path></svg>
               </div>
-              <div>
+              <div class="flex-fill">
                 <h4 class="alert-title">Kernel Updated</h4>
                 <form method="post">
                 <input type="hidden" name="action" value="reboot-server">
-                <div class="container-xl" style="margin-left:0; padding:0;">
-                  <div class="row">
-                    <div class="col-8">
-                      <div class="text-muted">Reboot is required to ensure that your system benefits from kernel updates.</div>
-                    </div>
-                    <div class="col-2">
-                      <select name="time" class="form-select" style="min-width:88px;">
-                        <option>now</option>
-                        <option>22:00</option>
-                        <option>23:00</option>
-                        <option>00:00</option>
-                        <option>01:00</option>
-                        <option>02:00</option>
-                      </select>
-                    </div>
-                    <div class="col-2">
-                      <input type="submit" value="Reboot" class="btn btn-warning">
-                    </div>
+                <div class="d-flex flex-wrap align-items-center gap-2">
+                  <div class="text-muted" style="min-width:200px;">Reboot is required to ensure that your system benefits from kernel updates.</div>
+                  <div class="d-flex align-items-center gap-2">
+                    <select name="time" class="form-select" style="width:auto;">
+                      <option>now</option>
+                      <option>22:00</option>
+                      <option>23:00</option>
+                      <option>00:00</option>
+                      <option>01:00</option>
+                      <option>02:00</option>
+                    </select>
+                    <input type="submit" value="Reboot" class="btn btn-warning">
                   </div>
                 </div>
                 </form>
@@ -326,7 +332,111 @@ window.addEventListener('load', function () {
   </div>
 </div>
 
+<!-- Server SSH public key modal -->
+<div class="modal modal-blur fade" id="modal-server-pubkey" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Server SSH Public Key</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+<?php if($server_pubkey != ''): ?>
+        <p class="text-muted">Add this key to <code>~/.ssh/authorized_keys</code> on another server to let this server connect to it over SSH without a password.</p>
+        <div style="position:relative">
+          <button id="server-pubkey-copy" type="button" title="Copy to clipboard" style="position:absolute;top:6px;right:6px;background:none;border:none;cursor:pointer;color:#6c757d;padding:4px;line-height:1;">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2" /><path d="M13 3m0 2a2 2 0 0 1 2 -2h0a2 2 0 0 1 2 2v0a2 2 0 0 1 -2 2h0a2 2 0 0 1 -2 -2z" /></svg>
+          </button>
+          <pre id="server-pubkey-text" style="font-family:monospace monospace;word-break:break-all;white-space:pre-wrap;color:#000;display:block;line-height:1.2rem;padding-right:36px;margin-bottom:0"><?=htmlspecialchars($server_pubkey);?></pre>
+        </div>
+        <div id="server-pubkey-note" class="mt-2 small" style="display:none"></div>
+<?php else: ?>
+        <div class="alert alert-warning mb-0" role="alert">
+          No SSH key pair was found at <code>/root/.ssh/id_rsa.pub</code>. Generate one with
+          <code>ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N ""</code> and reload this page.
+        </div>
+<?php endif; ?>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 <?php include('templates/footer.php'); ?>
+<script>
+$(function () {
+  var copyIcon  = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2" /><path d="M13 3m0 2a2 2 0 0 1 2 -2h0a2 2 0 0 1 2 2v0a2 2 0 0 1 -2 2h0a2 2 0 0 1 -2 -2z" /></svg>';
+  var checkIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2fb344" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M5 12l5 5l10 -10" /></svg>';
+
+  var $btn  = $('#server-pubkey-copy');
+  var $pre  = $('#server-pubkey-text');
+  var $note = $('#server-pubkey-note');
+
+  function feedback(ok) {
+    $btn.html(ok ? checkIcon : copyIcon);
+    $note.text(ok ? 'Copied to clipboard' : 'Press Ctrl+C to copy the selected key')
+         .css('color', ok ? '#2fb344' : '#d63939').show();
+    if (ok) setTimeout(function () { $btn.html(copyIcon); $note.fadeOut(); }, 2000);
+  }
+
+  /* Select the key in the page so Ctrl+C still works if nothing else does. */
+  function selectKey() {
+    var r = document.createRange();
+    r.selectNodeContents($pre[0]);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+
+  /*
+   * execCommand first, navigator.clipboard second — deliberately the reverse of
+   * the usual advice. The async clipboard API needs a focused document and a
+   * secure context: over plain http, or whenever the window is not focused, it
+   * silently rejects or never settles at all, and the button just does nothing.
+   * execCommand is synchronous inside the click gesture and always reports back.
+   * The textarea goes inside the modal, not the body: Bootstrap traps focus in
+   * the open modal and would yank it straight back off a textarea placed outside.
+   */
+  function legacyCopy(text) {
+    var host = $btn.closest('.modal-content')[0] || document.body;
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:absolute;left:-9999px;top:0;opacity:0;';
+    host.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { ta.setSelectionRange(0, text.length); } catch (e) {}
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    host.removeChild(ta);
+    return ok;
+  }
+
+  $btn.click(function () {
+    var text = $pre.text();
+
+    if (legacyCopy(text)) { feedback(true); return; }
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      var settled = false;
+      navigator.clipboard.writeText(text).then(
+        function () { if (!settled) { settled = true; feedback(true); } },
+        function () { if (!settled) { settled = true; selectKey(); feedback(false); } }
+      );
+      /* writeText can hang indefinitely on an unfocused document — never leave
+         the button looking dead. */
+      setTimeout(function () {
+        if (!settled) { settled = true; selectKey(); feedback(false); }
+      }, 1200);
+    } else {
+      selectKey();
+      feedback(false);
+    }
+  });
+});
+</script>
 <script>
 (function () {
   var loadChart = null, trafficChart = null;

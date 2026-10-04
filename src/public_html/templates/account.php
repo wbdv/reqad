@@ -37,21 +37,8 @@
 
 	$domain = $acct["domain"];
 
-	/* Detect the account's active PHP version + handler (same logic as accounts.php:
-	   version is inferred from which php-fpm.d dir holds its pool file). */
-	$phpversion = $ini['php'];
-	foreach ($php_versions as $pv) {
-		$pv2 = str_replace('.', '', $pv);
-		if(is_file('/etc/opt/remi/php'.$pv2.'/php-fpm.d/'.$domain.'.conf'))
-			$phpversion = $pv;
-	}
-	$phphandler = 'mod_php';
-	if($is_apache) {
-		if($phpversion != $ini['php'])
-			$phphandler = 'fpm';
-		elseif(is_file('/etc/php-fpm.d/'.$domain.'.conf'))
-			$phphandler = 'fpm';
-	}
+	/* The account's active PHP version + handler ('off'/'off' when PHP is disabled). */
+	list($phpversion, $phphandler) = account_php($domain);
 
 	/* Disk usage figures for the summary. */
 	$DISKSPACE = `lsblk -b --output TYPE,SIZE | grep 'disk' | awk {'print \$2'}`;
@@ -81,8 +68,8 @@
 	if($tab === 'config') {
 		$cfg_nginx = account_config_target($ini, $domain, 'nginx');
 		$cfg_nginx_content = (string)shell_exec('sudo cat '.escapeshellarg($cfg_nginx['path']).' 2>/dev/null');
-		/* php-fpm pool exists for nginx (always fpm) and for apache accounts on fpm */
-		$has_fpm = (!$is_apache || $phphandler === 'fpm');
+		/* php-fpm pool exists when account_php() says fpm: nginx (unless PHP is off) and apache accounts on fpm */
+		$has_fpm = ($phphandler === 'fpm');
 		if($has_fpm) {
 			$cfg_fpm = account_config_target($ini, $domain, 'fpm');
 			$cfg_fpm_content = (string)shell_exec('sudo cat '.escapeshellarg($cfg_fpm['path']).' 2>/dev/null');

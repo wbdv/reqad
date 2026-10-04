@@ -22,8 +22,8 @@ elseif (!in_array($mode, array('account','public_html','database'), true))
                                                      $errmsg = 'Choose what to restore.';
 elseif ($mode === 'database' && !valid_mysql_identifier($dbn))
                                                      $errmsg = 'Invalid database name.';
-elseif ($mode === 'database' && $dbn !== $user && strpos($dbn, $user.'_') !== 0)
-                                                     $errmsg = 'That database does not belong to '.$user.'.';
+elseif ($mode === 'database' && !in_array(database_owner($dbn), array('', $user), true))
+                                                     $errmsg = 'That database belongs to '.database_owner($dbn).', not '.$user.'.';
 
 if ($errmsg === '') {
 	/* the same guard the script applies, checked here so the answer is immediate */

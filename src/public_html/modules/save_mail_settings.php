@@ -28,6 +28,11 @@ $r = mail_settings_apply($which, $posted);
 error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.$_SERVER['USER']
         .' save mail settings ['.$which.'] '.($r['error'] === '' ? 'ok' : 'FAILED')."\n", 3, '../log/route_log');
 
-msg_redirect('/email-config/'.$which.'/',
+/* Back to the tab the form was on. Whitelisted, because it is pasted into a
+   Location header. */
+$tab = isset($_POST['tab']) ? clean($_POST['tab']) : '';
+if (!in_array($tab, array('limits'), true)) $tab = '';
+
+msg_redirect('/email-config/'.$which.'/'.($tab !== '' ? '?tab='.$tab : ''),
              $r['error'] !== '' ? $r['error'] : $r['success'],
              $r['error'] !== '' ? 'error' : 'success');

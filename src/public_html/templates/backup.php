@@ -73,7 +73,7 @@
 	   lands where it was started.
 	   Set BEFORE the header is included, because the page-header buttons are
 	   gated on it. */
-	$tab = (isset($_GET['tab']) && $_GET['tab'] === 'local') ? 'local' : 'remote';
+	$tab = (isset($_GET['tab']) && in_array($_GET['tab'], array('local', 'exclude'), true)) ? $_GET['tab'] : 'remote';
 
 	include('templates/header.php'); 
 ?>
@@ -134,6 +134,7 @@
       <ul class="nav nav-tabs card-header-tabs" id="backup-tabs">
         <li class="nav-item"><a class="nav-link <?=$tab==='remote'?'active':'';?>" href="/backup/">Remote backup</a></li>
         <li class="nav-item"><a class="nav-link <?=$tab==='local'?'active':'';?>"  href="/backup/?tab=local">Local backup</a></li>
+        <li class="nav-item"><a class="nav-link <?=$tab==='exclude'?'active':'';?>" href="/backup/?tab=exclude">Exclusions</a></li>
       </ul>
     </div>
     <div class="tab-content">
@@ -143,7 +144,7 @@
            display:none -- the markup was all there and none of it was visible. -->
       <div class="tab-pane backup-tab-pane active show" id="tab-backup">
         <div class="card-body">
-<?php if ($tab === 'remote') { include('templates/backup-remote.php'); } else { ?>
+<?php if ($tab === 'remote') { include('templates/backup-remote.php'); } elseif ($tab === 'exclude') { include('templates/backup-exclude.php'); } else { ?>
 <?
      $results = $db->query('SELECT user,domain FROM accounts');
 	 $domains = array();
@@ -305,6 +306,13 @@
 					<input class="form-check-input backup-part" type="checkbox" name="database" checked="true">
 					  <span class="form-check-label">Databases</span>
 					  <span class="form-check-description">MariaDB dumps, CREATE DATABASE and user grants</span>
+                 </label>
+          	</div>
+			<div class="mb-3">
+				<label class="form-check">
+					<input class="form-check-input" type="checkbox" name="noexcl">
+					  <span class="form-check-label">Ignore exclusions (full copy)</span>
+					  <span class="form-check-description">back up everything, including what the <a href="/backup/?tab=exclude">Exclusions</a> rules and <code>.nobackup</code> markers leave out &mdash; filesystems mounted inside the home directory are still skipped while that is switched on</span>
                  </label>
           	</div>
           </div>

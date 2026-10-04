@@ -8,27 +8,8 @@
 		$settings[$settings_name] = $row["value"];
 	}
 	#echo "<pre>"; print_r($settings);exit;
-	$wp_versions = array();
-	$wp_latest = '';
-	$stable_file = _PATH.'/wptoolkit/stable-check.json';
-	$cache_life = '3600'; //caching time, in seconds
-	if(!is_file($stable_file) || time() - filemtime($stable_file) >= $cache_life) {
-		shell_exec('curl -s https://api.wordpress.org/core/stable-check/1.0/ > '.$stable_file.'.tmp');
-		$wp_versions = @json_decode(file_get_contents($stable_file.'.tmp'), true);
-		if(!empty($wp_versions)) {
-			shell_exec('/bin/mv '.$stable_file.'.tmp '.$stable_file);
-		} else {
-			$errmsg = 'Error: Cannot download stable-check.json from wordpress.org website.';
-		}
-	}
-
-	if(is_file($stable_file)) {
-		$wp_versions = json_decode(file_get_contents(_PATH.'/wptoolkit/stable-check.json'), true);
-		#echo "#wp_versions<pre>"; print_r($wp_versions); 
-		$wp_latest = array_search('latest', $wp_versions);
-		#echo "#wp_latest<pre>"; print_r($wp_latest); 
-		#echo 'Last error: ', json_last_error_msg(), PHP_EOL, PHP_EOL;
-	}
+	list($wp_versions, $errmsg) = wp_stable_versions();
+	$wp_latest = array_search('latest', $wp_versions);
 
 	include('templates/header.php');	
 ?>
@@ -45,10 +26,14 @@
                 </h2>
               </div>
               <div class="col-auto ms-auto d-print-none">
-                <div class="btn-list">
+                <div class="btn-list flex-column flex-sm-row">
                   <a href="#" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modal-wp-install">
                     <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
                     Install Wordpress
+                  </a>
+                  <a href="#" class="btn btn-white" id="btn-wp-rescan">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icons-tabler-outline icon-tabler-refresh" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none" /><path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4" /><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4" /></svg>
+                    Rescan Wordpress
                   </a>
                 </div>
               </div>
@@ -188,7 +173,7 @@
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
-                            <a href="#" class="btn btn-white btn-md wp-manage-btn" data-bs-toggle="modal" data-bs-target="#modal-wp-manage" data-bs-user="<?=htmlspecialchars($row["user"], ENT_QUOTES);?>" data-bs-domain="<?=htmlspecialchars($row["domain"], ENT_QUOTES);?>">Manage</a>
+                            <a href="/wp-toolkit/<?=htmlspecialchars($row["user"], ENT_QUOTES);?>/" class="btn btn-white btn-md">Manage</a>
                             <form method="post" action="./wp-toolkit/" target="_blank" style="display:inline;margin:0;">
                             <input type="hidden" name="action" value="wp-auto-login">
                             <input type="hidden" name="user" value="<?=htmlspecialchars($row["user"], ENT_QUOTES);?>">
@@ -317,66 +302,6 @@
 <? /*		</form> */ ?>
 		</div><!-- /#modal-wp-scan : close the outer .modal wrapper (its </form> closer above is commented out, leaving it open) -->
 
-		<!-- Manage WordPress site options -->
-		<div class="modal modal-blur fade" id="modal-wp-manage" tabindex="-1" role="dialog" aria-hidden="true">
-		<div class="modal-dialog modal-lg" role="document">
-		<div class="modal-content">
-			<div class="modal-header">
-				<h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Manage <span id="wp-manage-domain"></span></h5>
-				<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-			</div>
-			<div class="modal-body">
-				<p class="text-muted">Enable or disable performance options for this WordPress site. Changes are applied to the live server immediately.</p>
-
-				<div id="wp-manage-alert" class="alert" role="alert" style="display:none;"></div>
-
-				<!-- Option: Nginx cache -->
-				<div class="card mb-3">
-					<div class="card-body">
-						<label class="form-check form-switch form-switch-lg mb-1">
-							<input class="form-check-input wp-manage-toggle" type="checkbox" data-option="nginx_cache">
-							<span class="form-check-label form-check-label-on"></span>
-							<span class="h3 mb-0 ms-2">Nginx cache</span>
-							<span class="wp-manage-spinner spinner-border spinner-border-sm ms-2" role="status" style="display:none;"></span>
-						</label>
-						<div class="text-muted">
-							Serves cached pages straight from nginx (FastCGI microcache) instead of hitting PHP/WordPress on
-							every request &mdash; a large speed-up for anonymous traffic. Logged-in users, the cart/checkout and
-							admin are never cached. Enabling injects the cache config into the vhost, reloads nginx, and installs
-							the <a href="https://github.com/wbdv/reqad-cache-purger" target="_blank">reqad-cache-purger</a> plugin so
-							WordPress clears the cache when content changes.
-							<div class="wp-manage-na text-red mt-1" data-option="nginx_cache" style="display:none;">
-								Unavailable: this server does not use nginx as its web server.
-							</div>
-						</div>
-					</div>
-				</div>
-
-				<!-- Option: Disable WP cron -->
-				<div class="card mb-3">
-					<div class="card-body">
-						<label class="form-check form-switch form-switch-lg mb-1">
-							<input class="form-check-input wp-manage-toggle" type="checkbox" data-option="wp_cron">
-							<span class="form-check-label form-check-label-on"></span>
-							<span class="h3 mb-0 ms-2">Disable WP cron</span>
-							<span class="wp-manage-spinner spinner-border spinner-border-sm ms-2" role="status" style="display:none;"></span>
-						</label>
-						<div class="text-muted">
-							WordPress&rsquo; built-in cron runs on page visits, which is unreliable and adds latency. Enabling this
-							sets the <code>DISABLE_WP_CRON</code> constant in <code>wp-config.php</code> and installs a real system
-							cron that runs due tasks every 2 minutes &mdash; more reliable and faster page loads.
-						</div>
-					</div>
-				</div>
-
-				<pre id="wp-manage-log" style="display:none;background:#222;color:#ccc;padding:10px 14px;max-height:220px;overflow:auto;font-size:11px;border-radius:4px;"></pre>
-			</div>
-			<div class="modal-footer">
-				<a href="#" class="btn btn-link link-secondary" data-bs-dismiss="modal">Close</a>
-			</div>
-		</div>
-		</div>
-		</div>
 
 	<?php
     include('templates/footer.php');
@@ -415,6 +340,42 @@ jQuery(document).ready(function () {
 				}
 			}
 		});
+	});
+
+	// "Rescan Wordpress": scan_for_wordpress runs detached server-side; poll
+	// until it finishes, then reload so the list shows what it found.
+	var rescanBtnHtml = $('#btn-wp-rescan').html();
+	function rescanBusy(busy) {
+		var $b = $('#btn-wp-rescan');
+		if(busy) {
+			$b.addClass('disabled').attr('aria-disabled', 'true')
+			  .html('<span class="spinner-border spinner-border-sm me-2" role="status"></span>Rescanning ...');
+		} else {
+			$b.removeClass('disabled').removeAttr('aria-disabled').html(rescanBtnHtml);
+		}
+	}
+	function rescanPoll() {
+		$.post('./ajax-wp-rescan-status/', { action: 'ajax-wp-rescan-status' }, null, 'json').done(function(r) {
+			if(r.running) { setTimeout(rescanPoll, 2000); return; }
+			if(r.exit === 0) { location.reload(); return; }
+			rescanBusy(false);
+			alert('Wordpress rescan failed. Check wptoolkit/rescan.log on the server.');
+		}).fail(function() { setTimeout(rescanPoll, 5000); });
+	}
+	$('#btn-wp-rescan').on('click', function(e) {
+		e.preventDefault();
+		if($(this).hasClass('disabled')) return;
+		rescanBusy(true);
+		$.post('./ajax-wp-rescan/', { action: 'ajax-wp-rescan' }, null, 'json').done(function() {
+			setTimeout(rescanPoll, 2000);
+		}).fail(function() {
+			rescanBusy(false);
+			alert('Could not start the Wordpress rescan.');
+		});
+	});
+	// Scan already in progress (started from another tab / before a reload)?
+	$.post('./ajax-wp-rescan-status/', { action: 'ajax-wp-rescan-status' }, null, 'json').done(function(r) {
+		if(r.running) { rescanBusy(true); setTimeout(rescanPoll, 2000); }
 	});
 
 	var ws;
@@ -677,90 +638,6 @@ jQuery(document).ready(function () {
 	});
 */ ?>
 
-	/* ---- Manage modal: per-site options -------------------------------- */
-	var wpManageUser = '';
-
-	function wpManageAlert(type, html) {
-		var $a = $('#wp-manage-alert');
-		if(!html) { $a.hide(); return; }
-		$a.removeClass('alert-success alert-danger alert-info')
-		  .addClass(type === 'error' ? 'alert-danger' : (type === 'info' ? 'alert-info' : 'alert-success'))
-		  .html(html).show();
-	}
-
-	// Reflect a status object onto the switches.
-	function wpManageRender(st) {
-		$('.wp-manage-toggle').each(function () {
-			var opt = $(this).data('option');
-			var state = st[opt];               // 'on' | 'off' | 'na'
-			var na = (state === 'na');
-			$(this).prop('checked', state === 'on').prop('disabled', na);
-			$('.wp-manage-na[data-option="'+opt+'"]').toggle(na);
-		});
-	}
-
-	// Populate the modal when it opens.
-	$('#modal-wp-manage').on('show.bs.modal', function (event) {
-		var button = event.relatedTarget;
-		wpManageUser = button ? button.getAttribute('data-bs-user') : '';
-		var domain  = button ? button.getAttribute('data-bs-domain') : '';
-		$('#wp-manage-domain').text(domain || '');
-		wpManageAlert('', '');
-		$('#wp-manage-log').hide().text('');
-		$('.wp-manage-toggle').prop('disabled', true);
-
-		jQuery.ajax({
-			method: "POST",
-			url: "./ajax-wp-manage-status/",
-			data: { action: 'ajax-wp-manage-status', user: wpManageUser }
-		}).done(function (resp) {
-			if(resp && resp.ok) {
-				wpManageRender(resp.status);
-			} else {
-				wpManageAlert('error', (resp && resp.error) ? resp.error : 'Could not load site status.');
-			}
-		}).fail(function () {
-			wpManageAlert('error', 'Could not load site status.');
-		});
-	});
-
-	// Toggle an option on/off.
-	$('.wp-manage-toggle').on('change', function () {
-		var $cb    = $(this);
-		var option = $cb.data('option');
-		var enable = $cb.is(':checked');
-		var $spin  = $cb.closest('label').find('.wp-manage-spinner');
-
-		$('.wp-manage-toggle').prop('disabled', true);
-		$spin.show();
-		wpManageAlert('info', (enable ? 'Enabling' : 'Disabling') + ' &hellip; this can take a few seconds.');
-		$('#wp-manage-log').hide().text('');
-
-		jQuery.ajax({
-			method: "POST",
-			url: "./ajax-wp-manage-toggle/",
-			data: { action: 'ajax-wp-manage-toggle', user: wpManageUser, option: option, enable: enable ? '1' : '0' }
-		}).done(function (resp) {
-			$spin.hide();
-			if(resp && resp.status) wpManageRender(resp.status);
-			else $('.wp-manage-toggle').prop('disabled', false);
-
-			if(resp && resp.ok) {
-				wpManageAlert('success', resp.success || 'Done.');
-			} else {
-				wpManageAlert('error', (resp && resp.error) ? resp.error : 'Operation failed.');
-			}
-			if(resp && resp.log && resp.log.trim() !== '') {
-				$('#wp-manage-log').text(resp.log.trim()).show();
-			}
-		}).fail(function () {
-			$spin.hide();
-			$('.wp-manage-toggle').prop('disabled', false);
-			// Revert the visual state on transport failure.
-			$cb.prop('checked', !enable);
-			wpManageAlert('error', 'Request failed. No change was applied.');
-		});
-	});
 });
 </script>
 </>

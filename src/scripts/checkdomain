@@ -1,4 +1,4 @@
-#!/usr/bin/php82 -c ""
+#!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini -c ""
 <?php
 #$debug = true;
 $debug = false;

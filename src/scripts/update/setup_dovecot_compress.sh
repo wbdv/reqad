@@ -34,8 +34,14 @@
 #
 # vsz_limit
 # ---------
-# Decompressing costs address space, and the default here is default_vsz_limit
-# = 256M. 1G for imap matches the 2.3 config this replaces.
+# Decompressing costs address space, and the default is default_vsz_limit =
+# 256M. This script no longer WRITES that limit: it belongs to
+# /etc/dovecot/limits.conf and setup_dovecot_vsz.sh, because a server with
+# compression off needs it just as much (large mailboxes, FTS searches) and
+# keeping it here made the panel's memory-limit field a no-op on exactly those
+# servers. What this script still does is make sure that turning compression ON
+# cannot leave the limit at a value compression makes inadequate — it calls
+# setup_dovecot_vsz.sh for that, one way, and that script never calls back.
 #
 # What this does NOT do
 # ---------------------
@@ -64,7 +70,8 @@
 #   --disable  remove the config; refused while any mailbox holds gzipped mail
 #   --status   print enabled/disabled, the vsz in force, and how many mailboxes
 #              hold compressed mail (this is what the panel reads)
-#   --vsz N    address-space limit for imap/pop3, e.g. 512M, 1024M, 2G
+#   --vsz N    address-space limit for imap/pop3, e.g. 512M, 1024M, 2G —
+#              forwarded to setup_dovecot_vsz.sh, which owns limits.conf
 #
 # Safe to re-run: idempotent, and it rolls itself back if doveconf or Dovecot
 # reject the result. No-op when email is disabled in server-software.ini, when
@@ -84,13 +91,18 @@ ARCHIVE_CONF="/usr/local/reqad/etc/mail-archive.conf"
 # the ceiling is killed mid-session. Overridable with --vsz so the panel's
 # Dovecot settings page can raise it without owning the file format.
 VSZ_LIMIT="1024M"
+# Whether a limit was actually ASKED for. Without an explicit --vsz this script
+# only raises the limit when nothing has set one at all: re-running it must
+# never stomp on a value the admin chose on the panel's Dovecot page.
+VSZ_EXPLICIT=0
+VSZ_HELPER="/usr/local/reqad/scripts/update/setup_dovecot_vsz.sh"
 
 # enable (default) | disable | status | repair
 MODE="enable"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --vsz)     VSZ_LIMIT="${2:-}"; shift 2 ;;
+        --vsz)     VSZ_LIMIT="${2:-}"; VSZ_EXPLICIT=1; shift 2 ;;
         --disable) MODE="disable"; shift ;;
         --status)  MODE="status"; shift ;;
         --repair)  MODE="repair"; shift ;;
@@ -139,20 +151,26 @@ if [ "$MODE" = "repair" ]; then
     fi
     # Keep whatever limit is already configured; only fall back to the default
     # when re-creating the file from nothing (signal 2 or 3 above).
+    # A pre-1.0.48 compress.conf still carries the vsz_limit blocks this script
+    # used to write. Carry that value forward EXPLICITLY, or the rewrite below
+    # (whose template no longer has them) would silently drop a server that has
+    # been running at 1024M back to dovecot's 256M default. Nothing to read on a
+    # file written by the current template — limits.conf owns the value there,
+    # and that is not a problem worth printing a warning about.
+    #
+    # Anchored at the start of the line so this reads the setting and not the
+    # COMMENT above it, which mentions "default_vsz_limit = 256M." — that
+    # sentence's full stop came back as part of the value, produced a config
+    # doveconf rejected, and the rollback then took compression down on a
+    # server that was using it. The pattern also refuses anything that is not
+    # a plain size, so a hand-edited file cannot inject a command line here.
+    # head BEFORE tr: the file sets vsz_limit twice (imap and pop3), and
+    # squeezing whitespace first joined both lines into "2048M2048M".
     if [ -f "$COMPRESS_CONF" ]; then
-        # Anchored at the start of the line so this reads the setting and not the
-        # COMMENT above it, which mentions "default_vsz_limit = 256M." — that
-        # sentence's full stop came back as part of the value, produced a config
-        # doveconf rejected, and the rollback then took compression down on a
-        # server that was using it. The pattern also refuses anything that is not
-        # a plain size, so a hand-edited file cannot inject a command line here.
-        # head BEFORE tr: the file sets vsz_limit twice (imap and pop3), and
-        # squeezing whitespace first joined both lines into "2048M2048M".
         CUR_VSZ=$(grep -oP '^[[:space:]]*vsz_limit[[:space:]]*=[[:space:]]*\K[0-9]{1,6}[KMG]?[[:space:]]*$' "$COMPRESS_CONF" 2>/dev/null | head -1 | tr -d '[:space:]')
         if [ -n "${CUR_VSZ:-}" ]; then
             VSZ_LIMIT="$CUR_VSZ"
-        else
-            echo "  (could not read the current vsz_limit — using $VSZ_LIMIT)"
+            VSZ_EXPLICIT=1
         fi
     fi
     MODE="enable"
@@ -285,24 +303,17 @@ protocol lmtp {
 # CPU climbs sharply on mail.
 compress_gz_level = 6
 
-# Decompressing a large message costs address space, and the default ceiling is
-# default_vsz_limit = 256M. An imap process that hits it is killed mid-session.
-# The panel sets this from the Dovecot settings page; 1024M matches the limit
-# this stack ran with under 2.3.
-service imap {
-  vsz_limit = __VSZ__
-}
-
-# pop3 fetches whole messages too, and RETR on a compressed mailbox has the same
-# cost profile as an IMAP FETCH.
-service pop3 {
-  vsz_limit = __VSZ__
-}
+# The imap/pop3 vsz_limit is deliberately NOT set here any more. Decompressing
+# costs address space and needs headroom above dovecot's 256M default — but so
+# do large mailboxes and FTS searches on a server that never compresses a byte,
+# and while the value lived in THIS file the panel could not set it at all
+# unless compression happened to be on (the save was validated and then dropped,
+# and imap kept dying at 256M). It lives in /etc/dovecot/limits.conf now, owned
+# by scripts/update/setup_dovecot_vsz.sh, which this script calls below to make
+# sure enabling compression cannot leave the limit too low.
 EOF
 # The heredoc above is quoted, so nothing in it expands and the file cannot be
-# broken by a stray $ in a comment. The one value that has to vary is patched in
-# afterwards.
-sed -i "s/__VSZ__/${VSZ_LIMIT}/g" "$COMPRESS_CONF"
+# broken by a stray $ in a comment.
 chown root:root "$COMPRESS_CONF"
 chmod 0644 "$COMPRESS_CONF"
 
@@ -316,6 +327,24 @@ else
     echo "  WARNING: $LOCAL_CONF missing — creating it with the compression include"
     printf '# Mail compression (mail_compress)\n%s\n' "$INCLUDE_LINE" > "$LOCAL_CONF"
     chmod 0644 "$LOCAL_CONF"
+fi
+
+# --- Make sure the memory limit is high enough for compression ---------------
+# Owned by setup_dovecot_vsz.sh / limits.conf, not by this file. Two cases call
+# for a write: an explicit --vsz (including the value migrated out of a legacy
+# compress.conf just above), or no limit configured anywhere at all, where
+# leaving dovecot's 256M under a decompressing imap is the thing this whole
+# script exists to avoid. An admin's own choice is otherwise left alone.
+# --no-restart because the validate-and-restart below covers both files, and
+# restarting twice for one change drops every IMAP connection twice.
+if [ -x "$VSZ_HELPER" ] || [ -f "$VSZ_HELPER" ]; then
+    LIVE_VSZ=$(doveconf -n 2>/dev/null | sed -n '/^service imap {/,/^}/p' | grep -oP 'vsz_limit\s*=\s*\K\S+')
+    if [ "$VSZ_EXPLICIT" -eq 1 ] || [ -z "${LIVE_VSZ:-}" ]; then
+        bash "$VSZ_HELPER" --vsz "$VSZ_LIMIT" --no-restart || \
+            echo "  WARNING: could not set the imap/pop3 memory limit — check $VSZ_HELPER"
+    fi
+else
+    echo "  WARNING: $VSZ_HELPER missing — imap/pop3 memory limit left as it is"
 fi
 
 rollback() {
@@ -354,7 +383,8 @@ fi
 # doveconf accepting the file only proves it parses. Confirm the setting really
 # is in the running config.
 if doveconf -n 2>/dev/null | grep -q 'mail_compress'; then
-    echo "  Dovecot mail compression enabled (mail_compress, imap/pop3 vsz_limit ${VSZ_LIMIT})."
+    LIVE_VSZ=$(doveconf -n 2>/dev/null | sed -n '/^service imap {/,/^}/p' | grep -oP 'vsz_limit\s*=\s*\K\S+')
+    echo "  Dovecot mail compression enabled (mail_compress; imap/pop3 vsz_limit ${LIVE_VSZ:-dovecot default}, from /etc/dovecot/limits.conf)."
 else
     echo "  WARNING: mail_compress is not visible in 'doveconf -n' — check $COMPRESS_CONF"
     exit 1

@@ -30,6 +30,12 @@ $rb_cron_on   = ($rb_cron_line !== '');
 $rb_cron_min  = '15'; $rb_cron_hour = '2';
 if ($rb_cron_on && preg_match('/^\s*(\S+)\s+(\S+)\s/', $rb_cron_line, $m)) { $rb_cron_min = $m[1]; $rb_cron_hour = $m[2]; }
 
+/* "Notify on errors" mails the Settings contact email, so it cannot be on
+   without one. On by default: only an explicit '0' turns it off — the same
+   rule backup_remote.sh applies */
+$rb_contact = setting_get('email');
+$rb_notify  = $rb_contact !== '' && setting_get('backup-remote-notify') !== '0';
+
 /* accounts that still exist — decides which restore modes are offered */
 $rb_live = array();
 $rs = $db->query('SELECT user FROM accounts');
@@ -73,6 +79,9 @@ $rb_list = $rb_configured ? remote_backup_dates($rb_cfg, isset($_GET['refresh'])
 <?php if (!$rb_configured): ?>
 				<span class="badge bg-orange">not configured</span>
 				<div class="text-muted mt-2">No backup server is set. Backups cannot run until one is configured.</div>
+				<!-- the empty state needs the Configure button more than the filled one
+				     does: without it there is no way into the settings modal at all -->
+				<div class="mt-3"><button type="button" class="btn" data-bs-toggle="modal" data-bs-target="#modal-rb-settings">Configure</button></div>
 <?php else: ?>
 				<!-- table + button sit side by side; the table is width:auto so the
 				     button lands right next to it instead of drifting to the far
@@ -124,13 +133,16 @@ $rb_list = $rb_configured ? remote_backup_dates($rb_cfg, isset($_GET['refresh'])
 					<tr><td class="text-muted pe-3 ps-0" style="width:35%">Schedule</td><td><span class="badge bg-success">enabled</span></td></tr>
 					<tr><td class="text-muted pe-3 ps-0">Runs at</td><td><?=h(sprintf('%02d:%02d', (int)$rb_cron_hour, (int)$rb_cron_min));?> every night</td></tr>
 					<tr><td class="text-muted pe-3 ps-0">Keep</td>
-						<td><?=((int)$rb_cfg['keep'] > 0 ? (int)$rb_cfg['keep'].' backups' : 'everything');?></td></tr>
+						<td><?=((int)$rb_cfg['keep'] > 0 ? 'up to '.(int)$rb_cfg['keep'].' backups' : 'everything');?></td></tr>
+					<tr><td class="text-muted pe-3 ps-0">On errors</td>
+						<td><?=($rb_notify ? 'email '.h($rb_contact) : '<span class="text-muted">no email</span>');?></td></tr>
 				</table>
 				<button type="button" class="btn" style="margin-top:-4px;" data-bs-toggle="modal" data-bs-target="#modal-rb-cron">Configure</button>
 				</div>
 <?php else: ?>
 				<span class="badge bg-orange">not enabled</span>
 				<div class="text-muted mt-2">Backups run only when started by hand. Enable a nightly run to keep this server backed up automatically.</div>
+				<div class="mt-3"><button type="button" class="btn" data-bs-toggle="modal" data-bs-target="#modal-rb-cron">Configure</button></div>
 <?php endif; ?>
 			</div>
 		</div>
@@ -237,7 +249,13 @@ $rb_list = $rb_configured ? remote_backup_dates($rb_cfg, isset($_GET['refresh'])
 					<td><?=h($u);?> <?php if (!$exists): ?><span class="badge bg-orange">deleted</span><?php endif; ?></td>
 					<td class="text-muted"><?=h($a['domain']);?></td>
 					<td><?=h(human_kb($a['bytes'] / 1024));?></td>
-					<td class="text-muted" style="white-space:normal;font-size:90%;"><?=h(implode(', ', $items) ?: 'archive only');?></td>
+					<td class="text-muted" style="white-space:normal;font-size:90%;"><?=h(implode(', ', $items) ?: 'archive only');?>
+<?php			if (!empty($a['excl'])):
+					$xl = array();
+					foreach ($a['excl'] as $x) $xl[] = ($x['kind'] === 'db' ? 'database ' : '').$x['path'].' ('.$x['kind'].')'; ?>
+						<span class="badge bg-secondary-lt ms-1" title="Left out of this backup:&#10;<?=h(implode("\n", $xl));?>"><?=count($xl);?> excluded</span>
+<?php			endif; ?>
+					</td>
 					<td class="text-end" style="white-space:nowrap;">
 <?php			if ($rb_root): ?>
 						<a href="/backup/?tab=remote&amp;date=<?=rawurlencode($rb_date);?>&amp;download=<?=rawurlencode('accounts/'.$u.'.tar.gz');?>" class="btn btn-sm">Download</a>
@@ -437,7 +455,7 @@ $rb_list = $rb_configured ? remote_backup_dates($rb_cfg, isset($_GET['refresh'])
 					</div>
 					<div class="col-md-4">
 						<label class="form-label">SSH user</label>
-						<input type="text" name="user" value="<?=h($rb_cfg['user']);?>" class="form-control" placeholder="bkpv208" required>
+						<input type="text" name="user" value="<?=h($rb_cfg['user']);?>" class="form-control" placeholder="bkpuser" required>
 					</div>
 					<div class="col-md-3">
 						<label class="form-label">Port</label>
@@ -487,10 +505,6 @@ $rb_list = $rb_configured ? remote_backup_dates($rb_cfg, isset($_GET['refresh'])
 				<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
 			</div>
 			<div class="modal-body">
-				<label class="form-check form-switch mb-3">
-					<input class="form-check-input" type="checkbox" name="enabled" value="1" <?=$rb_cron_on?'checked':'';?>>
-					<span class="form-check-label">Run a full backup every night</span>
-				</label>
 				<div class="row g-2">
 					<div class="col-4">
 						<label class="form-label">Hour</label>
@@ -502,16 +516,65 @@ $rb_list = $rb_configured ? remote_backup_dates($rb_cfg, isset($_GET['refresh'])
 					</div>
 					<div class="col-4">
 						<label class="form-label">Keep</label>
-						<div class="input-group">
-							<input type="text" name="keep" value="<?=h($rb_cfg['keep']);?>" class="form-control">
-							<span class="input-group-text">backups</span>
-						</div>
+						<select name="keep" id="rb-keep" class="form-select">
+<?php $rb_keep_sel = ((int)$rb_cfg['keep'] >= 1) ? (int)$rb_cfg['keep'] : 4; /* old "all" (0) saves */ ?>
+<?php for ($k = 1; $k <= 9; $k++): ?>
+							<option value="<?=$k;?>" <?=($rb_keep_sel === $k)?'selected':'';?>><?=$k;?></option>
+<?php endfor; ?>
+						</select>
 					</div>
 				</div>
 				<small class="form-hint mt-2 d-block">
-					Older backups are deleted from the backup server once there are more than this many,
-					and only after a run that finished with no failures. 0 keeps everything for ever.
+					Keeps: <b id="rb-keep-list"></b>.<br>
+					"1st" and "15th" mean the first clean backup from that day on, so a failed night does not leave the month empty.
+					Backups are pruned only after a run that finished with no failures.
 				</small>
+				<script>
+				(function () {
+					var rungs = <?=json_encode(remote_backup_keep_rungs());?>;
+					var sel = document.getElementById('rb-keep'), out = document.getElementById('rb-keep-list');
+					function show() {
+						var n = parseInt(sel.value, 10) || 4, recent = 0, days = [];
+						rungs.slice(0, n).forEach(function (r) {
+							if (/newest/.test(r)) recent++; else days.push(r);
+						});
+						days.unshift(recent === 1 ? 'the newest backup' : 'the newest ' + recent);
+						out.textContent = days.join(', ');
+					}
+					sel.addEventListener('change', show);
+					show();
+				})();
+				</script>
+				<!-- same Active/Disabled state switch as Settings → Automatic updates -->
+				<div class="mt-3">
+					<label class="form-check form-switch d-inline-flex align-items-center mb-0" style="cursor:pointer">
+						<input class="form-check-input me-2" type="checkbox" name="enabled" id="rb-enabled" value="1" <?=$rb_cron_on?'checked':'';?>>
+						<span class="form-check-label<?=$rb_cron_on?'':' text-red';?>">Nightly backups are</span>
+						<span class="badge border ms-2 <?=$rb_cron_on?'bg-green-lt':'bg-red-lt';?>"><?=$rb_cron_on?'Active':'Disabled';?></span>
+					</label>
+				</div>
+				<script>
+				document.getElementById('rb-enabled').addEventListener('change', function () {
+					var on = this.checked, lbl = this.nextElementSibling, badge = lbl.nextElementSibling;
+					lbl.classList.toggle('text-red', !on);
+					badge.textContent = on ? 'Active' : 'Disabled';
+					badge.classList.toggle('bg-green-lt', on);
+					badge.classList.toggle('bg-red-lt', !on);
+				});
+				</script>
+				<label class="form-check form-switch mt-3 mb-0">
+					<input class="form-check-input" type="checkbox" name="notify" value="1" <?=$rb_notify?'checked':'';?> <?=$rb_contact===''?'disabled':'';?>>
+					<span class="form-check-label">Notify on errors</span>
+				</label>
+<?php if ($rb_contact !== ''): ?>
+				<small class="form-hint d-block mt-2">
+					Emails <b><?=h($rb_contact);?></b> when a nightly run fails or cannot start<?=smtp_configured() ? ', through the sending method set in Settings' : '';?>.
+				</small>
+<?php else: ?>
+				<small class="form-hint d-block">
+					Needs a contact email — it turns on by itself once one is set in <a href="/settings/">Settings</a>.
+				</small>
+<?php endif; ?>
 <?php if ($rb_cron_on): ?>
 				<div class="text-muted mt-3" style="font-size:85%;">
 					Current entry in <code>/etc/crontab</code>:<br><code><?=h($rb_cron_line);?></code>

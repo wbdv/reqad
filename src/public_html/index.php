@@ -7,6 +7,9 @@
 
     include('defines.php');
     include('modules/functions.php');
+    // Account / database / email operations, shared with bin/reqad (and the API).
+    foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
+        require_once($app_functions_file);
 
     // Render every date() in the panel in the server's own timezone. php.ini
     // often has no date.timezone (PHP then assumes UTC), which made scheduled
@@ -49,23 +52,23 @@
 		'accounts'			=> array('create-account', 'edit-account', 'delete-account'),
 		'addon-domains'		=> array('edit-addon-domain', 'delete-addon-domain'),
 		'account'			=> array('alias-add', 'alias-delete', 'reissue-ssl', 'config-save', 'config-restore'),
-		'databases' 		=> array('create-database', 'delete-database', 'change-db-password'),
+		'databases' 		=> array('create-database', 'delete-database', 'change-db-password', 'assign-database'),
 		'email-accounts' 	=> array('create-email', 'edit-email', 'delete-email'),
 		'email'				=> array('clamav-exim'),
-		'email-config'		=> array('save-mail-settings', 'save-mail-rbl'),
+		'email-config'		=> array('save-mail-settings', 'save-mail-rbl', 'save-mail-skiprbl', 'reset-mail-limit'),
 		'forwarders'		=> array('create-forwarder', 'edit-forwarder', 'delete-forwarder'),
 		'autoresponders'	=> array('create-autoresponder', 'edit-autoresponder', 'delete-autoresponder'),
 		'email-filters'		=> array('create-email-filter', 'edit-email-filter', 'delete-email-filter', 'save-email-filter-raw'),
 		'spam-filters'		=> array('create-spam-rule', 'delete-spam-rule', 'save-spam-rules'),
 		'ssl'				=> array('update-ssl'),
-		'settings'			=> array('settings'),
+		'settings'			=> array('settings', 'settings-smtp', 'auto-update-cron'),
 		'dns-settings'		=> array('dns-settings'),
 		'php-settings'		=> array('php-settings'),
 		'wp-toolkit'		=> array('wp-install', 'wp-clone', 'wp-scan', 'wp-auto-login'),
 		'reboot'			=> array('reboot-server'),
 		'backup'			=> array('generate-backup', 'delete-backup', 'download-backup', 'restore-backup',
 							       'remote-backup-settings', 'remote-backup-cron', 'remote-backup-restore',
-							       'remote-backup-restore-server'),
+							       'remote-backup-restore-server', 'backup-exclude'),
 		'transfer-tool'		=> array('ajax-transfer-run'),
 		'ssh-keys'			=> array('add-ssh-key', 'delete-ssh-key'),
 		'cron'				=> array('create-cron', 'edit-cron', 'delete-cron'),
@@ -216,7 +219,12 @@
             include('templates/php-settings.php');
             break;
         case 'wp-toolkit':
-            include('templates/wp-toolkit.php');
+            // Per-site page: /wp-toolkit/<user>/ (and /wp-toolkit/<user>/screenshot)
+            $wp_user = isset($reqs[2]) ? preg_replace('/[^a-z0-9]/', '', $reqs[2]) : '';
+            if($wp_user != '')
+                include('templates/wp-site.php');
+            else
+                include('templates/wp-toolkit.php');
             break;
         case 'terminal':
             include('templates/terminal.php');

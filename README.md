@@ -20,7 +20,8 @@ on a single VPS, with predictable costs.
 - **Hosting accounts** - per-domain accounts with disk-usage monitoring
 - **Email** - Exim + Dovecot + Roundcube webmail + SpamAssassin, with SPF, DKIM, SRS,
   forwarders and autoresponders
-- **WordPress toolkit** - one-click install, subfolder detection, Wordfence integration
+- **WordPress toolkit** - install, one-click login, page cache, security hardening and
+  PageSpeed scores per site ([details below](#wordpress-toolkit))
 - **Multiple PHP versions** - per-account PHP 7.x/8.x with OPcache, APCu and a full
   `php.ini` editor
 - **SSL/TLS** - Let's Encrypt & ACME certificates for the panel and every hosted domain
@@ -30,6 +31,41 @@ on a single VPS, with predictable costs.
 - **File manager** - account-level, with CodeMirror editor, bulk operations, chmod and
   archive support
 - **More tools** - browser terminal, SSH keys, cron jobs, backups and service control
+
+### WordPress toolkit
+
+![Reqad WordPress toolkit](https://reqad.com/screenshots/screenshot_reqad_wptoolkit.png)
+
+Each WordPress site gets its own management page:
+
+- **Install and discover** - one-click install with the database created automatically.
+  A rescan finds existing installs, including ones in subfolders.
+- **One-click login** - opens wp-admin straight from the panel.
+- **Site overview** - WordPress, PHP and theme versions, pending plugin updates, disk
+  usage, SSL status and the login URL.
+- **Screenshot and PageSpeed** - a site screenshot plus Google PageSpeed scores for
+  performance, accessibility, best practices and SEO.
+- **Performance** - Nginx page cache, a real system cron in place of WP-Cron, a
+  search-engine indexing switch, and a maintenance mode that returns HTTP 503 so search
+  engines come back later.
+- **Security hardening** - per-site switches with recommended defaults:
+  - **Web server rules:** block `xmlrpc.php`, `wp-config.php`, sensitive files and author
+    scans; forbid PHP in `wp-includes`, uploads and cache directories; add security
+    headers; block aggressive crawlers; allow logins only from listed IPs.
+  - **WordPress settings:** hide the WordPress version, disable dashboard file editing,
+    turn off pingbacks, move the login to a custom URL.
+  - **Files:** regenerate the security keys and restrict file permissions.
+
+#### Page cache and the Reqad Cache Purger plugin
+
+On Nginx servers, turning on **Nginx cache** serves pages straight from a FastCGI
+cache, without running PHP for anonymous visitors. Logged-in users, the cart, checkout
+and wp-admin are never cached.
+
+Reqad also installs its companion WordPress plugin,
+[**Reqad Cache Purger**](https://github.com/wbdv/reqad-cache-purger). The plugin clears
+the cache automatically when content is published, updated, trashed or deleted. It also
+adds a purge button to the admin bar, an optional cache warmer and a cache self-test.
 
 ## Demo
 

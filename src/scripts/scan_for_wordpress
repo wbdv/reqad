@@ -1,116 +1,65 @@
 #!/usr/bin/env php82
 <?php
-if(php_sapi_name() != "cli" || posix_getuid() != 0) {
-    echo "You can only run this script as root from cli.\n";
-    exit;
+/*
+ * Look for WordPress installs in every account's site folders (main domain,
+ * addon domains, subdomains) and bring WP Toolkit's list up to date. The
+ * looking is done by core's wordpress_scan() AS each account: nothing of a
+ * site (wp-config.php, plugins) ever runs as root here.
+ *
+ * Called by the 2087 WP Toolkit's "Rescan Wordpress" (in the background, as
+ * root through sudo). One account: scan_for_wordpress <user>.
+ */
+if (php_sapi_name() != 'cli' || posix_getuid() != 0) {
+	echo "You can only run this script as root from cli.\n";
+	exit(1);
 }
-if(!is_file(__DIR__.'/../db/reqad.db')) {
-	echo "Missing SQLite Database '".__DIR__."'/../db/reqad.db'\n";
-	exit;
+if (isset($argv[1]) && $argv[1] === '--help') {
+	echo "Scan for WordPress installs in the folders of all sites of every account (or of one)\n";
+	echo "Usage: ".$argv[0]." [<user>] [--help]\n";
+	exit(0);
 }
+$only = isset($argv[1]) ? (string)$argv[1] : '';
 
-if(isset($argv) && count($argv)>1) {
-	$argp = explode('=', $argv[1]);
-	if($argp[0]=='--help') {
-		echo "Scan for wordpress instalations in public_html and subfolders\n";
-		echo "Usage: ".$argv[0]." [--help]\n";
-		exit;
-	}
-}
+/* the panel as bin/reqad loads it (at file scope: defines.php makes globals) */
+require_once __DIR__.'/../public_html/defines.php';
+require_once _PATH.'/public_html/modules/functions.php';
+$db->busyTimeout(5000);
+foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
+	require_once $app_functions_file;
+plugins_load();
 
-$db = new SQLite3('/usr/local/reqad/db/reqad.db');
-
-$results = $db->query('SELECT count(*) as nb FROM accounts');
-$row = $results->fetchArray();
-$nb_accounts = (int)($row["nb"]);
-if($nb_accounts == 0) {
-	echo "There are no accounts created on this server.\n";
- 	exit;
-}
-
-// Collect all wp-config.php paths.
-// Uses find instead of locate: the mlocate db is only as fresh as the last
-// updatedb run (new installs would be invisible for up to a day), and locate
-// is setgid slocate so it filters results by directory readability.
-// Format: /home/<user>/public_html[/<subpath>]/wp-config.php
-$locate_output = shell_exec('find /home/*/public_html -maxdepth 4 -type f -name wp-config.php 2>/dev/null');
-$locate_paths = [];
-if($locate_output) {
-    foreach(explode("\n", trim($locate_output)) as $p) {
-        $p = trim($p);
-        if($p !== '') $locate_paths[] = $p;
-    }
+$users = array();
+$res = $db->query('SELECT user FROM accounts ORDER BY user');
+while ($res && ($r = $res->fetchArray(SQLITE3_ASSOC)))
+	if ($only === '' || $r['user'] === $only)
+		$users[] = $r['user'];
+if (!$users) {
+	echo $only !== '' ? "There is no account '$only'.\n" : "There are no accounts created on this server.\n";
+	exit($only !== '' ? 1 : 0);
 }
 
-$results = $db->query('SELECT * FROM accounts');
-$i = 0;
+$pad = function ($s, $n) { return mb_substr(str_pad((string)$s, $n + strlen((string)$s) - mb_strlen((string)$s)), 0, $n); };
 echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
 echo "│ \033[97m   #   Domain                           WP Version    Title                            Path             Status\033[0m   │\n";
 echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤\n";
-
-while ($row = $results->fetchArray()) {
-    $user   = $row['user'];
-    $domain = $row['domain'];
-    $public_html = '/home/'.$user.'/public_html';
-
-    // Build list of wp-config.php files for this user
-    $wp_paths = [];
-
-    // Root install
-    if(is_file($public_html.'/wp-config.php')) {
-        $wp_paths[] = $public_html.'/wp-config.php';
-    }
-
-    // Subfolder installs from locate
-    foreach($locate_paths as $lp) {
-        if(strpos($lp, '/home/'.$user.'/public_html/') === 0 && $lp !== $public_html.'/wp-config.php') {
-            $wp_paths[] = $lp;
-        }
-    }
-
-    foreach($wp_paths as $wp_config) {
-        $wp_dir = dirname($wp_config);
-
-        // Relative path from public_html ('' for root install)
-        $rel_path = ($wp_dir === $public_html) ? '' : ltrim(substr($wp_dir, strlen($public_html)), '/');
-
-        $wp_version = trim(shell_exec('/usr/bin/wp core version --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
-        if($wp_version == '' || strpos($wp_version, 'Error:') === 0) continue;
-
-        $title = trim(shell_exec('/usr/bin/wp option get blogname --allow-root --path='.escapeshellarg($wp_dir).' 2>/dev/null | head -n 1'));
-
-        $i++;
-        echo '│ '.substr(str_pad($i.' ', 5, ' ', STR_PAD_LEFT), 0, 5);
-        echo '│ '.substr(str_pad($domain, 31), 0, 31);
-        echo '│ '.substr(str_pad($wp_version, 12), 0, 12);
-        echo '│ '.substr(str_pad($title, 32), 0, 32);
-        echo '│ '.substr(str_pad($rel_path === '' ? '/' : $rel_path, 14), 0, 14);
-        echo '│ '.substr(str_pad($row["status"], 9), 0, 9).'│';
-        echo "\n";
-
-        // Upsert: match on domain + path
-        $stmt = $db->prepare('SELECT id FROM wordpress WHERE domain=:domain AND path=:path');
-        $stmt->bindValue(':domain', $domain, SQLITE3_TEXT);
-        $stmt->bindValue(':path', $rel_path, SQLITE3_TEXT);
-        $res2 = $stmt->execute();
-        if($row2 = $res2->fetchArray()) {
-            $upd = $db->prepare('UPDATE wordpress SET wp_version=:v, title=:t, status=:s WHERE id=:id');
-            $upd->bindValue(':v', $wp_version, SQLITE3_TEXT);
-            $upd->bindValue(':t', $title, SQLITE3_TEXT);
-            $upd->bindValue(':s', $row['status'], SQLITE3_TEXT);
-            $upd->bindValue(':id', $row2['id'], SQLITE3_INTEGER);
-            $upd->execute();
-        } else {
-            $ins = $db->prepare('INSERT INTO wordpress (user, domain, title, wp_version, path, comments, status, created_at) VALUES (:u, :d, :t, :v, :p, "", :s, datetime("now"))');
-            $ins->bindValue(':u', $user, SQLITE3_TEXT);
-            $ins->bindValue(':d', $domain, SQLITE3_TEXT);
-            $ins->bindValue(':t', $title, SQLITE3_TEXT);
-            $ins->bindValue(':v', $wp_version, SQLITE3_TEXT);
-            $ins->bindValue(':p', $rel_path, SQLITE3_TEXT);
-            $ins->bindValue(':s', $row['status'], SQLITE3_TEXT);
-            $ins->execute();
-        }
-    }
+$i = 0;
+$failed = 0;
+foreach ($users as $user) {
+	$r = wordpress_scan($user);
+	if (empty($r['ok'])) {
+		$failed++;
+		echo '│ '.$pad('', 5).'│ '.$pad($user.': '.$r['error'], 105)."│\n";
+		continue;
+	}
+	foreach ($r['data']['sites'] as $s) {
+		$i++;
+		echo '│ '.$pad(str_pad($i.' ', 5, ' ', STR_PAD_LEFT), 5);
+		echo '│ '.$pad($s['domain'], 31);
+		echo '│ '.$pad($s['version'], 12);
+		echo '│ '.$pad($s['title'], 32);
+		echo '│ '.$pad($s['path'] === '' ? '/' : $s['path'], 14);
+		echo '│ '.$pad($s['status'], 9).'│'."\n";
+	}
 }
 echo "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n";
-?>
+exit($failed ? 1 : 0);

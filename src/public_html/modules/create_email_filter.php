@@ -64,7 +64,7 @@ if ($errmsg === '' && $scope === 'account') {
 	}
 }
 
-error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER']
+error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user()
         . " create email filter [$scope/$target] " . ($errmsg === '' ? 'ok' : 'FAILED') . "\n", 3, '../log/route_log');
 
 msg_redirect(ef_redirect_base($scope, $target),

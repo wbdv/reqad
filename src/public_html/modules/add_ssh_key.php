@@ -6,6 +6,26 @@ $ssh_pubkey = trim($_POST["pubkey"] ?? '');
 $errmsg     = '';
 $successmsg = '';
 
+// An account's keys are written AS the account (app/functions/ssh.php):
+// never by root inside a home folder, where a symlink could lead the write
+// anywhere. Only root's own keys are handled below.
+if ($ssh_user !== 'root') {
+    $valid_users = array();
+    $q = $db->query('SELECT user FROM accounts');
+    while ($row = $q->fetchArray())
+        $valid_users[] = $row["user"];
+    if (!in_array($ssh_user, $valid_users, true)) {
+        $errmsg = "Error: Invalid user selected.";
+    } else {
+        $r = ssh_key_add($ssh_user, $ssh_pubkey);
+        if ($r['ok'])
+            $successmsg = "SSH key successfully added for user $ssh_user.";
+        else
+            $errmsg = 'Error: '.$r['error'];
+    }
+    return;
+}
+
 // Auto-convert SSH2/RFC 4716 format to OpenSSH format
 if (strpos($ssh_pubkey, '---- BEGIN SSH2 PUBLIC KEY ----') !== false) {
     $tmpfile = tempnam(sys_get_temp_dir(), 'reqad_sshkey_');
@@ -58,6 +78,11 @@ if ($errmsg == '') {
     }
 }
 
+// plan limits for an account's keys (limit_allows: core allows all)
+if ($errmsg == '' && $ssh_user !== 'root' && ($limit_err = limit_allows($ssh_user, 'ssh_key')) !== '') {
+    $errmsg = 'Error: '.$limit_err;
+}
+
 if ($errmsg == '') {
     // Get AuthorizedKeysFile path from sshd_config (e.g. ".ssh/authorized_keys")
     $authorized = trim(shell_exec('sudo grep -i AuthorizedKeysFile /etc/ssh/sshd_config | grep -v \'^\s*#\' | awk \'{print $2}\' | head -n 1'));
@@ -94,7 +119,7 @@ if ($errmsg == '') {
         $errmsg = "Error: Key may not have been added correctly. ssh-keygen output: " . htmlspecialchars($verify);
     } else {
         $successmsg = "SSH key successfully added for user $ssh_user.";
-        error_log(date("Y-m-d H:i:s") . substr((string) microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " add ssh key for $ssh_user\n", 3, '../log/route_log');
+        error_log(date("Y-m-d H:i:s") . substr((string) microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user() . " add ssh key for $ssh_user\n", 3, '../log/route_log');
     }
 }
 ?>

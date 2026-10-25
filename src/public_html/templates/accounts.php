@@ -4,7 +4,7 @@
 	$row = $results->fetchArray();
 	$nb_accounts = (int)($row["nb"]);
 	$php_versions = array_map('trim', explode(',', $ini['php_versions']));
-	$is_apache = (substr(trim($ini['template'] ?? ''), 0, 7) == 'apache_');
+	$modphp = (php_mode($ini) === 'modphp');   // handler choice: mod_php or php-fpm
 	$php_version_colors = [
 		'7.2' => '#4299e1',
 		'7.4' => '#2da6b4',
@@ -45,6 +45,16 @@
 	while($ares && $ar = $ares->fetchArray(SQLITE3_ASSOC))
 		$aliases_by_account[$ar['account_id']][] = $ar;
 	$email_enabled = (isset($ini["email"]) && $ini["email"]==1);
+
+	/* extra columns from plugins (accounts.columns), after User, or after
+	   Domain with 'after' => 'domain' */
+	$plugin_cols = array();
+	$plugin_cols_d = array();
+	foreach ((array)plugin_filter('accounts.columns', array()) as $pc)
+		if (is_array($pc) && isset($pc['title'], $pc['cell']) && is_callable($pc['cell'])) {
+			if (($pc['after'] ?? '') === 'domain') $plugin_cols_d[] = $pc;
+			else                                   $plugin_cols[] = $pc;
+		}
 
 	if(!isset($errmsg))
 		$errmsg = '';
@@ -96,17 +106,23 @@
                       <tr>
                         <th class="w-1" style="background-color:#DEF;">ID</th>
                         <th style="background-color:#DEF;">Domain <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' width='16' height='16'><path fill='none' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' stroke-width='1' d='M5 10l3 -3l3 3'/></svg></th>
+					<? foreach($plugin_cols_d as $pc): ?>
+                        <th style="background-color:#DEF;"><?=h($pc['title']);?></th>
+					<? endforeach; ?>
                         <th style="background-color:#DEF;">User</th>
+					<? foreach($plugin_cols as $pc): ?>
+                        <th style="background-color:#DEF;"><?=h($pc['title']);?></th>
+					<? endforeach; ?>
                         <th class="w-10" style="background-color:#DEF;">Usage</th>
                         <th style="background-color:#DEF;">Status</th>
 					<? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
                         <th style="background-color:#DEF;">Email</th>
 					<? } ?>
                         <th style="background-color:#DEF;">PHP Version</th>
-					<? if($is_apache): ?>
+					<? if($modphp): ?>
                         <th style="background-color:#DEF;">Handler</th>
 					<? endif; ?>
-                        <th style="background-color:#DEF;">Created At</th>
+                        <th style="background-color:#DEF;">Created</th>
                         <th class="w-5" style="background-color:#DEF;"></th>
                       </tr>
 					<? if($nb_accounts > 1 ) { ?>
@@ -118,10 +134,10 @@
                             <button id="account-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
                           </div>
 						</td>
-						<td style="padding:4px 8px;" colspan="<?=(isset($ini["email"]) && $ini["email"]==1)?5:4; ?>">&nbsp;</td>
+						<td style="padding:4px 8px;" colspan="<?=((isset($ini["email"]) && $ini["email"]==1)?5:4) + count($plugin_cols) + count($plugin_cols_d); ?>">&nbsp;</td>
                         <td style="padding:4px 8px;">
                         </td>
-                        <td colspan="<?=7 + ($is_apache ? 1 : 0);?>" style="padding:4px 8px;"></td>
+                        <td colspan="<?=7 + ($modphp ? 1 : 0);?>" style="padding:4px 8px;"></td>
                       </tr>
 					<? } ?>
                     </thead>
@@ -134,15 +150,17 @@
                         	$DISKSPACE = 9999999;
 
                       	$results = $db->query('SELECT * FROM accounts ORDER BY domain');
+                      	$shelllog_on = shelllog_enabled();
                       	while ($row = $results->fetchArray()) {
                         	$i++;
 							if($row["disk_quota"] == 0)
 								$row["disk_quota"] = (int)($DISKSPACE/20);
 							// version/handler, or 'off'/'off' when PHP is disabled
 							list($phpversion, $phphandler) = account_php($row['domain']);
+							$acct_shell = account_shell_get($row['user']);
 							$domain = $row["domain"];
                     ?>
-                      <tr class="account-row" data-domain="<?=h($domain);?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none':'';?>">
+                      <tr class="account-row" data-domain="<?=h($domain);?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none;':'';?><?=($row["status"] == 'suspended'||$row["status"] == 'suspended')?'background-color:#FEE;':'';?>">
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
@@ -181,20 +199,28 @@
                             </div>
                           </div>
                         </td>
+					<? foreach($plugin_cols_d as $pc): ?>
+                        <td data-label="<?=h($pc['title']);?>"><?=call_user_func($pc['cell'], $row);?></td>
+					<? endforeach; ?>
                         <td data-label="User">
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
                             <?=h($row["user"]);?>
+                            <? if($acct_shell === 'jailed' || $acct_shell === 'none'): $sh_lbl = $acct_shell === 'jailed' ? array('jailed shell', 'Shell access: jailed (own home only)') : array('SFTP only', 'Shell access: none, SFTP only'); ?><? if($shelllog_on): ?><a href="/shell-activity/<?=h($row['user']);?>/" class="badge ms-1 text-decoration-none" style="background:#f1f3f5;color:#495057;" title="<?=h($sh_lbl[1]);?> - see what it ran"><?=h($sh_lbl[0]);?></a><? else: ?><span class="badge ms-1" style="background:#f1f3f5;color:#495057;" title="<?=h($sh_lbl[1]);?>"><?=h($sh_lbl[0]);?></span><? endif; ?><? endif; ?>
+                            <?=plugin_filter('accounts.user.badge', '', $row['user']);?>
                             </div>
                           </div>
                         </td>
+					<? foreach($plugin_cols as $pc): ?>
+                        <td data-label="<?=h($pc['title']);?>"><?=call_user_func($pc['cell'], $row);?></td>
+					<? endforeach; ?>
                         <td data-label="Usage">
 						<? $disk_pct = $DISKSPACE > 0 ? round($row["disk_usage"]*100/$DISKSPACE, 1) : 0; ?>
                           <div class="d-flex">
                             <div><strong><?=$row["disk_usage"]>1024?round($row["disk_usage"]/1024,1).' GB':$row["disk_usage"].' MB';?></strong> <span class="text-muted">(<?=$disk_pct;?>%)</span></div>
                           </div>
                           <div class="progress progress-xs">
-                            <div class="progress-bar bg-success" role="progressbar" style="width: <?=min($disk_pct, 100);?>%"></div>
+                            <div class="progress-bar" role="progressbar" style="width: <?=min($disk_pct, 100);?>%"></div>
                           </div>
                         </td>
                         <td class="text-muted" data-label="Status">
@@ -217,23 +243,26 @@
 					<? } ?>
                         <td class="text-muted" data-label="PHP Version">
 						<? if($phpversion == 'off'): ?>
-							<span class="badge bg-grey-lt border" style="color:#888;">PHP disabled</span>
+							<span class="badge bg-grey-lt border badge-muted">PHP disabled</span>
 						<? else: ?>
 							<? $php_color = $php_version_colors[$phpversion] ?? $php_version_colors[substr($phpversion, 0, 1)] ?? '#aaa'; ?>
 							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($phpversion);?></span>
 						<? endif; ?>
                         </td>
-					<? if($is_apache): ?>
+					<? if($modphp): ?>
                         <td class="text-muted" data-label="Handler">
 							<span class="text-muted" style="font-size:0.85em;"><?=$phphandler == 'off' ? '-' : ($phphandler == 'fpm' ? 'php-fpm' : $phphandler);?></span>
                         </td>
 					<? endif; ?>
                         <td data-label="Created on" class="text-muted">
-                              <div class="font-weight-medium"><?=date("M jS, Y - H:i", strtotime($row["created_at"]));?></></div>
+                              <span title="<?=date("j M Y, H:i", strtotime($row["created_at"]));?>"><?=date("j M Y", strtotime($row["created_at"]));?></span>
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-account" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>" data-bs-phpversion="<?=h($phpversion);?>" data-bs-phphandler="<?=h($phphandler);?>" data-bs-hasemail="<?=$row["has_email"];?>" <? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Manage</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-account" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>" data-bs-phpversion="<?=h($phpversion);?>" data-bs-phphandler="<?=h($phphandler);?>" data-bs-hasemail="<?=$row["has_email"];?>" data-bs-shell="<?=h($acct_shell);?>" <? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Manage</a>
+                            <a href="/account/<?=h($row["user"]);?>/?tab=config" class="btn btn-white btn-md btn-icon" title="Advanced settings" aria-label="Advanced settings for <?=h($row["user"]);?>">
+                              <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065z"></path><path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0"></path></svg>
+                            </a>
                             <? if(feature_enabled($ini, 'filemanager')) { ?>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-file-manager" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>">Files</a>
                             <? } ?>
@@ -337,7 +366,41 @@
                 Please enter a password.
               </div>
             </div>
-			<br>
+
+			<?=plugin_filter('accounts.create.form', '');?>
+
+			<div class="row mt-3">
+              <div class="col-lg-6">
+                <div class="mb-3">
+          			<label class="form-label">PHP version:</label>
+		            <select name="phpversion" class="form-select">
+					<? if($modphp): ?>
+						<option value="<?=$ini['php'];?>:mod_php" selected>PHP <?=$ini['php'];?> (mod_php)</option>
+						<option value="<?=$ini['php'];?>:fpm">PHP <?=$ini['php'];?> (php-fpm)</option>
+						<? foreach ($php_versions as $pv): if($pv == $ini['php']) continue; ?>
+						<option value="<?=$pv;?>:fpm">PHP <?=$pv;?> (php-fpm)</option>
+						<? endforeach; ?>
+					<? else: ?>
+						<? foreach ($php_versions as $pv): ?>
+						<option value="<?=$pv;?>" <?=$pv == $ini['php'] ? 'selected' : '';?>>PHP <?=$pv;?><?=$pv == $ini['php'] ? ' (default)' : '';?></option>
+						<? endforeach; ?>
+					<? endif; ?>
+						<option value="off">No PHP - static site or app</option>
+        		    </select>
+           		</div>
+			  </div>
+              <div class="col-lg-6">
+                <div class="mb-3">
+          			<label class="form-label">Shell access:</label>
+		            <select name="shell" class="form-select">
+					<? foreach (account_shell_modes() as $sh_k => $sh_l): ?>
+						<option value="<?=$sh_k;?>" <?=account_shell_default() === $sh_k ? 'selected' : '';?>><?=$sh_k === 'full' ? 'Full - normal shell' : ($sh_k === 'jailed' ? 'Jailed - own home only' : 'None - SFTP only');?><?=account_shell_default() === $sh_k ? ' (default)' : '';?></option>
+					<? endforeach; ?>
+        		    </select>
+           		</div>
+			  </div>
+			</div>
+
 			<div class="mb-3 <? if($settings["dns-provider"]=='') echo 'disabled';?>">
 				<label class="form-check">
 					<input class="form-check-input" type="checkbox" name="adddns" checked="true" <? if($settings["dns-provider"]=='') echo 'disabled';?>>
@@ -437,7 +500,7 @@
           			<label class="form-label">PHP version:</label>
 		            <select name="phpversion" id="phpversion" class="form-select">
 						<option value="off">Disable PHP</option>
-					<? if($is_apache): ?>
+					<? if($modphp): ?>
 						<option value="<?=$ini['php'];?>:mod_php">PHP <?=$ini['php'];?> (mod_php)</option>
 						<option value="<?=$ini['php'];?>:fpm">PHP <?=$ini['php'];?> (php-fpm)</option>
 						<? foreach ($php_versions as $pv): if($pv == $ini['php']) continue; ?>
@@ -467,6 +530,25 @@
 				</div>
 			  	</div>
 			  <? } ?>
+		    </div>
+
+			<?=plugin_filter('accounts.edit.form', '');?>
+
+			<div class="row">
+              <div class="col-lg-6">
+                <div class="mb-3">
+          			<label class="form-label">Shell access:</label>
+		            <select name="shell" id="shell-edit" class="form-select">
+					<? foreach (account_shell_modes() as $sh_k => $sh_l): ?>
+						<option value="<?=$sh_k;?>"><?=$sh_k === 'full' ? 'Full - normal shell' : ($sh_k === 'jailed' ? 'Jailed - own home only' : 'None - SFTP only');?></option>
+					<? endforeach; ?>
+						<option value="" id="shell-other" hidden>Unchanged (set outside Reqad)</option>
+        		    </select>
+           		</div>
+			  </div>
+              <div class="col-lg-6">
+				<div class="text-muted mb-3" style="font-size:.8rem;padding-top:30px;" id="shell-hint"></div>
+			  </div>
 		    </div>
 
           </div>
@@ -738,12 +820,18 @@ jQuery(document).ready(function () {
 		$('#diskquota-edit').val(disk_quota);
 		$('#diskquota-edit').next().html(disk_quota + ' MB');
 	<? } ?>
-	<?php if($is_apache): ?>
+	<?php if($modphp): ?>
 		$('#phpversion').val(phpversion == 'off' ? 'off' : phpversion + ':' + phphandler);
 	<?php else: ?>
 		$('#phpversion').val(phpversion);
 	<?php endif; ?>
 		$('#hasemail').prop( "checked", hasemail);
+		var shell = button.getAttribute('data-bs-shell') || 'full';
+		// full shell access is off on this server (root_access=0), but this account still has it
+		var fullOff = shell === 'full' && !$('#shell-edit option[value="full"]').length;
+		$('#shell-other').prop('hidden', shell !== 'other' && !fullOff).text(fullOff ? 'Full - not allowed here, choose one' : 'Unchanged (set outside Reqad)');
+		$('#shell-edit').val(shell === 'other' || fullOff ? '' : shell).trigger('change');
+		if (fullOff) $('#shell-hint').text('Full shell access is off on this server (root_access=0). The next Reqad update switches this account to Jailed; choose Jailed or None to do it now.');
   	});
 
 	$("#edit-account").submit(function(event) {
@@ -767,6 +855,15 @@ jQuery(document).ready(function () {
 		$('#submit-btn3').prop('disabled', true);
 		$("#delete-account").unbind('submit').submit();
   	});
+
+	// Shell access: one line on what the choice means
+	var shellHints = {
+		full:   'SSH, cron and the web terminal see the whole server, as today (other accounts\' files stay closed by permissions).',
+		jailed: 'SSH, cron and the web terminal run in a sandbox: own home only, own processes only. sudo, su and mail() from the shell do not work there.',
+		none:   'No SSH login and no web terminal; SFTP still works (own home only). Cron jobs still run, in the sandbox.',
+		'':     'This account has a shell Reqad did not set; it is left as it is.'
+	};
+	$('#shell-edit').on('change', function () { $('#shell-hint').text(shellHints[$(this).val()] || ''); });
 });
 </script>
 </body>

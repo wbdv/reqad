@@ -129,6 +129,44 @@
             </div>
           </div>
 
+          <!-- Needs attention: app/functions/health.php. A tile in the grid below,
+               the full list in #modal-health; both filled by the script at the end. -->
+          <?php $health_payload = health_payload($db); ?>
+          <style>
+            #modal-health .card-header { flex-wrap:wrap; gap:6px 10px; }
+            #modal-health .h-row { display:flex; gap:12px; align-items:flex-start; padding:10px 16px 10px 0px; border-left:0px solid transparent; margin: 4px 0; border-bottom: 1px solid #FFF;}
+            #modal-health .h-list > .h-row + .h-row, #modal-health .h-list > .h-row + .h-group, #modal-health .h-list > .h-group + .h-row, #modal-health .h-list > .h-group + .h-group { }
+            #modal-health .h-group .h-items .h-row { border-top:1px solid #f2f4f7; padding-left:36px; }
+            #modal-health .h-sev-critical { border-left-color:#d63939; }
+            #modal-health .h-sev-warning  { border-left-color:#f59f00; }
+            #modal-health .h-sev-info     { border-left-color:#4299e1; }
+            #modal-health .h-icon { flex:none; width:20px; margin-top:1px; }
+            #modal-health .h-body { flex:1; min-width:0; }
+            #modal-health .h-title { font-weight:500; color:#1d273b; overflow-wrap:anywhere; }
+            #modal-health .h-meta { font-size:.85rem; color:#6c7a91; margin-top:2px; overflow-wrap:anywhere; }
+            #modal-health .h-acct { color:#354052; font-weight:500; }
+            #modal-health .modal-body { padding:4px 1.5rem 1rem; }
+            #modal-health .h-list { overflow:hidden; }
+            #modal-health .h-actions { flex:none; display:flex; gap:6px; align-items:center; }
+            #modal-health .h-actions .btn { flex:none; width:max-content; white-space:nowrap; }
+            #modal-health .h-toggle { cursor:pointer; user-select:none; }
+            #modal-health .h-toggle .h-chev { display:inline-block; transition:transform .15s; color:#8a97ab; }
+            #modal-health .h-group.open .h-chev { transform:rotate(90deg); }
+            #modal-health .h-group .h-items { display:none; }
+            #modal-health .h-group.open .h-items { display:block; }
+            #modal-health .h-hidden { opacity:.6; }
+            #modal-health .h-more, #modal-health .h-hidden-link { color:#206bc4; cursor:pointer; }
+            #modal-health .h-empty { padding:18px 16px; color:#6c7a91; display:flex; gap:10px; align-items:center; }
+            #modal-health .dropdown-menu { min-width:150px; }
+            .h-counts .badge { font-weight:600; margin-right:4px; border:1px solid; }
+            .h-counts .bg-red-lt { border-color:rgba(214,57,57,.45); }
+            .h-counts .bg-orange-lt { border-color:rgba(247,103,7,.45); }
+            .h-counts .bg-azure-lt { border-color:rgba(66,153,225,.45); }
+            .h-counts .bg-green-lt { border-color:rgba(47,179,68,.45); }
+            .h-counts .bg-muted-lt { border-color:rgba(98,105,118,.35); }
+            @media (max-width: 575px) { #modal-health .h-row { flex-wrap:wrap; } #modal-health .h-actions { width:100%; padding-left:32px; } }
+          </style>
+
           <div class="row row-deck row-cards">
             <div class="col-sm-6 col-lg-3">
               <div class="card">
@@ -228,6 +266,16 @@
               </a>
             </div>
 <? } ?>
+            <div class="col-sm-6 col-lg-3" id="d-health-col">
+              <div class="card" id="health-card">
+                <div class="card-body">
+                  <div class="subheader">Needs attention</div>
+                  <div class="h-counts mt-2 mb-2" id="health-counts">&nbsp;</div>
+                  <div class="text-muted mb-3" id="health-top">&nbsp;</div>
+                  <button type="button" class="btn btn-white" data-bs-toggle="modal" data-bs-target="#modal-health" id="health-open">Show all</button>
+                </div>
+              </div>
+            </div>
 <?php
               // Hosting actions (email/db/phpMyAdmin) require accounts to be
               // enabled; accounts=0 marks a non-hosting box (e.g. a WireGuard
@@ -236,36 +284,57 @@
               $_plugin_tiles  = plugin_dashboard_actions($ini);
               if ($_accounts_on || !empty($_plugin_tiles)):
 ?>
-            <div class="col-lg-12" id="d-common-actions-col">
+            <div class="col-lg-9" id="d-common-actions-col">
                   <div class="card">
                     <div class="card-body">
                       <h3 class="card-title">Common Actions</h3>
+                      <style>
+                        .ca-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(185px, 1fr)); gap:18px 12px; }
+                        .ca-item { display:flex; align-items:center; gap:10px; min-width:0; }
+                        .ca-icon { flex:none; width:48px; height:48px; display:flex; align-items:center; justify-content:center; }
+                        .ca-icon img, .ca-icon svg { max-width:48px; max-height:48px; }
+                      </style>
+                      <div class="ca-grid">
 <? if( $_accounts_on ) { ?>
 <? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
-                      <div style="width:190px;float:left;margin-bottom:20px;">
-                        <a href="email-accounts/"><img src="images/email-accounts.png" style="vertical-align:-10px;"></a> <a href="email-accounts/">Email Accounts</a><br />
-                      </div>
-                      <div style="width:150px;float:left;margin-bottom:20px;">
-                        <a href="webmail/"><img src="images/rouncube.png" width="48" height="48" style="vertical-align:-10px;"></a> &nbsp;<a href="webmail/">Webmail</a><br />
-                      </div>
+                        <div class="ca-item"><a class="ca-icon" href="email-accounts/"><img src="images/email-accounts.png" alt=""></a><a href="email-accounts/">Email Accounts</a></div>
+                        <div class="ca-item"><a class="ca-icon" href="webmail/"><img src="images/rouncube.png" width="48" height="48" alt=""></a><a href="webmail/">Webmail</a></div>
 <? } ?>
-                      <div style="width:210px;float:left;margin-bottom:20px;">
-                        <a href="databases/"><img src="images/databases.png" style="vertical-align:-10px;"></a> <a href="databases/">Manage Databases </a>
-                      </div>
-                      <div style="width:190px;float:left">
-                        <a href="phpmyadmin/" target="_blank"><img src="images/phpmyadmin.png" style="vertical-align:-10px;"></a> &nbsp;<a href="phpmyadmin/" target="_blank">PhpMyAdmin</a><br />
-                      </div>
+                        <div class="ca-item"><a class="ca-icon" href="databases/"><img src="images/databases.png" alt=""></a><a href="databases/">Manage Databases</a></div>
+                        <div class="ca-item"><a class="ca-icon" href="phpmyadmin/" target="_blank"><img src="images/phpmyadmin.png" alt=""></a><a href="phpmyadmin/" target="_blank">PhpMyAdmin</a></div>
 <? } ?>
 <?php foreach($_plugin_tiles as $_a): ?>
-                      <div style="width:190px;float:left;margin-bottom:20px;">
-                        <a href="<?=htmlspecialchars($_a['url'])?>"><?=isset($_a['icon'])?$_a['icon']:''?></a> <a href="<?=htmlspecialchars($_a['url'])?>"><?=htmlspecialchars($_a['label'])?></a><br />
-                      </div>
+                        <div class="ca-item"><a class="ca-icon" href="<?=htmlspecialchars($_a['url'])?>"><?=isset($_a['icon'])?$_a['icon']:''?></a><a href="<?=htmlspecialchars($_a['url'])?>"><?=htmlspecialchars($_a['label'])?></a></div>
 <?php endforeach; ?>
+                      </div>
                     </div>
                   </div>
               </div>
 <?php endif; ?>
           </div>
+
+<!-- Needs attention: the full list -->
+<div class="modal modal-blur fade" id="modal-health" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Needs attention</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="h-list" id="health-list"></div>
+      </div>
+      <div class="modal-footer">
+        <div class="me-auto small text-muted">
+          <span class="h-counts" id="health-counts2"></span>
+          <span id="health-last2"></span><span id="health-foot"></span>
+        </div>
+        <button type="button" class="btn health-run">Check now</button>
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <?php
 $_welcome_dismissed = $db->querySingle('SELECT value FROM settings WHERE name="welcome_dismissed"');
@@ -364,6 +433,154 @@ window.addEventListener('load', function () {
   </div>
 </div>
 <?php include('templates/footer.php'); ?>
+<script>
+/* Needs attention card: one renderer for the first paint and every refresh. */
+$(function () {
+  var H = <?=json_encode($health_payload, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP);?>;
+  var GROUP_AT = 3, SHOW_ROWS = 50, showHidden = false, showAll = false;
+  var SEV = { critical: 0, warning: 1, info: 2 };
+  var ICON = {
+    critical: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#d63939" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4m0 4h.01"/></svg>',
+    warning:  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f59f00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v2m0 4v.01"/><path d="M5 19h14a2 2 0 0 0 1.84 -2.75l-7.1 -12.25a2 2 0 0 0 -3.5 0l-7.1 12.25a2 2 0 0 0 1.75 2.75"/></svg>',
+    info:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4299e1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>'
+  };
+  var OK_ICON = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#2fb344" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2l4 -4"/></svg>';
+  function esc(s) { return $('<div>').text(s == null ? '' : String(s)).html(); }
+
+  function actions(it) {
+    var h = '';
+    if (it.fix_url) h += '<a class="btn btn-white btn-sm" href="' + esc(it.fix_url) + '">' + esc(it.fix_label || 'Open') + '</a>';
+    if (it.hidden) {
+      h += '<button type="button" class="btn btn-ghost-secondary btn-sm h-restore" data-id="' + esc(it.id) + '">Show again</button>';
+    } else {
+      h += '<div class="dropdown"><button type="button" class="btn btn-ghost-secondary btn-sm h-dd-toggle" title="Hide this">Hide</button>'
+         + '<div class="dropdown-menu dropdown-menu-end">'
+         + '<a class="dropdown-item h-dismiss" href="#" data-id="' + esc(it.id) + '" data-days="7">For 7 days</a>'
+         + '<a class="dropdown-item h-dismiss" href="#" data-id="' + esc(it.id) + '" data-days="30">For 30 days</a>'
+         + '<a class="dropdown-item h-dismiss" href="#" data-id="' + esc(it.id) + '" data-days="0">Until I show it again</a>'
+         + '</div></div>';
+    }
+    return h;
+  }
+
+  function row(it, inGroup) {
+    var meta = [];
+    if (!inGroup) meta.push(it.account ? '<span class="h-acct">' + esc(it.account) + '</span>' : '<span class="h-acct">Server</span>');
+    if (it.detail) meta.push(esc(it.detail));
+    if (it.hidden) meta.push(it.hidden_until > 0 ? 'hidden until ' + new Date(it.hidden_until * 1000).toLocaleDateString() : 'hidden');
+    return '<div class="h-row h-sev-' + it.severity + (it.hidden ? ' h-hidden' : '') + '">'
+         + '<div class="h-icon">' + ICON[it.severity] + '</div>'
+         + '<div class="h-body"><div class="h-title">' + esc(it.title) + '</div>'
+         + (meta.length ? '<div class="h-meta">' + meta.join(' · ') + '</div>' : '') + '</div>'
+         + '<div class="h-actions">' + actions(it) + '</div></div>';
+  }
+
+  function render() {
+    var shown = H.items.filter(function (it) { return it.dashboard && (showHidden || !it.hidden); });
+    var hidden = H.items.filter(function (it) { return it.dashboard && it.hidden; }).length;
+    var counts = { critical: 0, warning: 0, info: 0 };
+    H.items.forEach(function (it) { if (it.dashboard && !it.hidden) counts[it.severity]++; });
+
+    var c = '';
+    if (counts.critical) c += '<span class="badge bg-red-lt">' + counts.critical + ' critical</span> ';
+    if (counts.warning)  c += '<span class="badge bg-orange-lt">' + counts.warning + ' warning' + (counts.warning > 1 ? 's' : '') + '</span> ';
+    if (counts.info)     c += '<span class="badge bg-azure-lt">' + counts.info + ' info</span>';
+    $('#health-counts, #health-counts2').html(c);
+    $('#health-last2').text(H.last_run ? 'Checked ' + H.last_run_text + '.' : '');
+
+    /* the tile: the badges and one line */
+    var total = counts.critical + counts.warning + counts.info;
+    if (!H.last_run) {
+      $('#health-counts').html('<span class="badge bg-muted-lt">not checked yet</span>');
+      $('#health-top').text('the checks run every 30 minutes');
+    } else if (!total) {
+      $('#health-counts').html('<span class="badge bg-green-lt">all good</span>');
+      $('#health-top').text('Checked ' + H.last_run_text);
+    } else {
+      $('#health-top').text('Checked ' + H.last_run_text);
+    }
+
+    if (!H.last_run) {
+      $('#health-list').html('<div class="h-empty">The checks have not run yet. They run every 30 minutes; Check now runs them at once.</div>');
+    } else if (!shown.length) {
+      $('#health-list').html('<div class="h-empty">' + OK_ICON + '<span>All good: nothing needs attention.</span></div>');
+    } else {
+      /* a check with GROUP_AT or more problems of one severity becomes one row */
+      var groups = {}, order = [];
+      shown.forEach(function (it) {
+        var k = it.check + '|' + it.severity + '|' + (it.hidden ? 1 : 0);
+        if (!groups[k]) { groups[k] = []; order.push(k); }
+        groups[k].push(it);
+      });
+      var blocks = [];
+      order.forEach(function (k) {
+        var g = groups[k];
+        if (g.length < GROUP_AT) { g.forEach(function (it) { blocks.push({ sev: it.severity, html: row(it, false) }); }); return; }
+        var accts = g.map(function (it) { return it.account || 'Server'; });
+        var head = '<div class="h-row h-sev-' + g[0].severity + ' h-toggle">'
+                 + '<div class="h-icon">' + ICON[g[0].severity] + '</div>'
+                 + '<div class="h-body"><div class="h-title"><span class="h-chev">&#9656;</span> ' + esc(H.labels[g[0].check] || g[0].check) + ': ' + g.length + '</div>'
+                 + '<div class="h-meta">' + esc(accts.slice(0, 6).join(', ') + (accts.length > 6 ? ' and ' + (accts.length - 6) + ' more' : '')) + '</div></div></div>';
+        blocks.push({ sev: g[0].severity, html: '<div class="h-group">' + head + '<div class="h-items">'
+                     + g.map(function (it) { return row(it, false); }).join('') + '</div></div>' });
+      });
+      blocks.sort(function (a, b) { return SEV[a.sev] - SEV[b.sev]; });
+      var more = blocks.length - SHOW_ROWS;
+      var html = blocks.slice(0, showAll ? blocks.length : SHOW_ROWS).map(function (b) { return b.html; }).join('');
+      if (more > 0 && !showAll) html += '<div class="h-row"><span class="h-more" id="health-more">Show ' + more + ' more</span></div>';
+      $('#health-list').html(html);
+    }
+    var foot = '';
+    if (hidden) foot = ' <span class="h-hidden-link" id="health-toggle-hidden">' + (showHidden ? 'Leave out the hidden ones' : hidden + ' hidden - show them') + '</span>';
+    $('#health-foot').html(foot);
+  }
+
+  function post(data, $btn) {
+    if ($btn) $btn.prop('disabled', true);
+    return $.ajax({ method: 'POST', url: './ajax-health/', data: data, dataType: 'json' })
+      .done(function (r) {
+        if (r && r.items) { H = r; render(); }
+        if (r && r.error) alertBox(r.error);
+      })
+      .fail(function () { alertBox('The request failed. Reload the page and try again.'); })
+      .always(function () { if ($btn) $btn.prop('disabled', false); });
+  }
+  function alertBox(msg) {
+    $('#health-list').prepend('<div class="alert alert-danger m-2 py-2">' + esc(msg) + '</div>');
+  }
+
+  var running = false;
+  $(document).on('click', '.health-run', function (e) {
+    e.preventDefault();
+    if (running) return;
+    running = true;
+    var $all = $('.health-run');
+    $all.each(function () { $(this).data('label', $(this).text()); }).text('Checking...');
+    post({ action: 'ajax-health-run' }).always(function () {
+      running = false;
+      $all.each(function () { $(this).text($(this).data('label')); });
+    });
+  });
+  var $card = $('#modal-health');
+  $card.on('click', '.h-toggle', function () { $(this).closest('.h-group').toggleClass('open'); });
+  $card.on('click', '#health-more', function () { showAll = true; render(); });
+  $card.on('click', '#health-toggle-hidden', function () { showHidden = !showHidden; render(); });
+  /* hand-rolled: Bootstrap's dropdown plugin is not wired up in the panel */
+  $card.on('click', '.h-dd-toggle', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    var $m = $(this).siblings('.dropdown-menu'), open = $m.hasClass('show');
+    $card.find('.dropdown-menu').removeClass('show');
+    if (!open) $m.addClass('show');
+  });
+  $(document).on('click', function (e) { if (!$(e.target).closest('#modal-health .dropdown').length) $card.find('.dropdown-menu').removeClass('show'); });
+  $card.on('click', '.h-dismiss', function (e) {
+    e.preventDefault();
+    post({ action: 'ajax-health-dismiss', id: $(this).data('id'), days: $(this).data('days') });
+  });
+  $card.on('click', '.h-restore', function () { post({ action: 'ajax-health-restore', id: $(this).data('id') }, $(this)); });
+  render();
+});
+</script>
 <script>
 $(function () {
   var copyIcon  = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M9 5h-2a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-12a2 2 0 0 0 -2 -2h-2" /><path d="M13 3m0 2a2 2 0 0 1 2 -2h0a2 2 0 0 1 2 2v0a2 2 0 0 1 -2 2h0a2 2 0 0 1 -2 -2z" /></svg>';
@@ -593,7 +810,7 @@ $(function () {
       if (r.mail_queue > 10) {
         $('#d-mailqueue').text(r.mail_queue);
         $('#d-mailqueue-card').css('display', '');
-        $('#d-common-actions-col').removeClass('col-lg-12').addClass('col-lg-9');
+        $('#d-common-actions-col').removeClass('col-lg-9').addClass('col-lg-6');
       }
       var rebootDate = r.reboot_date;
       setTimeout(function () {

@@ -7,7 +7,7 @@ set alert root@localhost
 #set httpd port 2812 and
 #    use address 0.0.0.0
 #    allow 127.0.0.1
-#    allow 86.126.137.70
+#    allow 203.0.113.10
 #    #allow admin:monit      # require user 'admin' with password 'monit'
 #    with ssl {            # enable SSL/TLS and set path to server certificate
 #        pemfile: /etc/ssl/certs/monit.pem
@@ -21,7 +21,7 @@ check process crond with pidfile /var/run/crond.pid
 check process reqad with pidfile /run/reqad.pid
     start program = "/usr/bin/systemctl start reqad"
     stop program  = "/usr/bin/systemctl stop reqad"
-    if failed host localhost port 2087 protocol https for 2 cycles then restart
+    if failed host localhost port 2087 protocol https request "/reqad-health" for 2 cycles then restart
     if 3 restarts within 5 cycles then timeout
 
 check process reqad-php-fpm with pidfile /run/reqad-php-fpm.pid 

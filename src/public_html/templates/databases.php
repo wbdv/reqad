@@ -16,7 +16,7 @@
 	#echo '<pre>'; print_r($mysql_databases_size); exit;
 
 	$mysql_users = array();
-	$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SELECT DISTINCT Db,User FROM mysql.db'"))), true);
+	$mysql_array = @json_decode(@json_encode(simplexml_load_string(shell_exec("sudo mysql --xml=true -e 'SELECT DISTINCT Db,User FROM mysql.db WHERE User NOT LIKE \"rqpma-%\"'"))), true);
 	#echo '<pre>'; print_r($mysql_array); exit;
     if(!empty($mysql_array["row"])) {
 		if(count($mysql_array["row"])==1) {
@@ -55,8 +55,8 @@
 	$db_has_remote  = array();
 	foreach(mysql_rows('SELECT DISTINCT Db, User, Host FROM mysql.db') as $grant_row) {
 		list($grant_db, $grant_user, $grant_host) = array_pad(explode("\t", $grant_row), 3, '');
-		$grant_db = str_replace('\\_', '_', $grant_db);
-		if($grant_user === '') continue;
+		$grant_db = database_grant_name($grant_db);
+		if($grant_user === '' || strpos($grant_user, database_pma_prefix()) === 0) continue;   // account panel phpMyAdmin logins
 		if($grant_host === 'localhost')
 			$db_local_users[$grant_db][$grant_user] = true;
 		elseif(!in_array($grant_host, array('127.0.0.1', '::1'), true))

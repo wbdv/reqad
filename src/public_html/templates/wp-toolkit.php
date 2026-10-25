@@ -8,7 +8,10 @@
 		$settings[$settings_name] = $row["value"];
 	}
 	#echo "<pre>"; print_r($settings);exit;
-	list($wp_versions, $errmsg) = wp_stable_versions();
+	/* keep the message of an action (Install) that ran before the page */
+	list($wp_versions, $stable_err) = wp_stable_versions();
+	if (empty($errmsg))
+		$errmsg = $stable_err;
 	$wp_latest = array_search('latest', $wp_versions);
 
 	include('templates/header.php');	
@@ -177,6 +180,7 @@
                             <form method="post" action="./wp-toolkit/" target="_blank" style="display:inline;margin:0;">
                             <input type="hidden" name="action" value="wp-auto-login">
                             <input type="hidden" name="user" value="<?=htmlspecialchars($row["user"], ENT_QUOTES);?>">
+                            <input type="hidden" name="id" value="<?=(int)$row["id"];?>">
                             <button type="submit" class="btn btn-white btn-md">Login</button></form>
 <? /*                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-wp-scan" data-bs-user="<?=$row["user"];?>">Scan</a> */ ?>
 <? /*                            <a href="#" class="btn btn-white disabled" data-bs-toggle="modal" data-bs-target="#modal-wp-clone" data-bs-user="<?=$row["user"];?>">Clone</a> */ ?>

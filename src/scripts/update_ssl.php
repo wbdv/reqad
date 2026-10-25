@@ -11,9 +11,8 @@ error_log("update_ssl files: $newcert_file $privkey_file ".__FILE__."\n", 3, __D
 
 if(!is_file($newcert_file) || !is_file($privkey_file)) return;
 
-$TEMPLATE = trim(shell_exec("grep -e '^template=' /usr/local/reqad/etc/server-software.ini | awk -F= '{print \$2}'"));
-
-if(substr($TEMPLATE, 0, 7) == 'apache_') {
+/* the certificate lives in the front server's vhost */
+if(web_front($ini) === 'httpd') {
     $httpdcf_file = "/etc/httpd/conf.d/".$domain.".conf";
     if(is_file($httpdcf_file)) {
         shell_exec("sudo sed -i 's#SSLCertificateFile .*#SSLCertificateFile ".$newcert_file."#' ".$httpdcf_file);

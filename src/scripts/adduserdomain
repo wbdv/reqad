@@ -118,6 +118,7 @@ if($errmsg == '') {
     } else {
         $uid = `id -u $user`;
         $uid = (int)($uid);
+        shell_exec('sudo /usr/local/reqad/scripts/session_limits.sh set '.escapeshellarg($user).' default >/dev/null 2>&1');
         error_log(date("Y-m-d H:i.s").substr((string)microtime(), 1, 4)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER'].' INSERT INTO accounts VALUES ('.$uid.', "'.$user.'", "'.$domain.'", 0, '.$disk_quota.', "active", datetime("now"))'."\n", 3, '../log/debug_log');
         $db->query('INSERT INTO accounts VALUES ('.$uid.', "'.$user.'", "'.$domain.'", 0, '.$disk_quota.', "active", datetime("now"))');
 		shell_exec('sudo su - '.$user.' -c "mkdir public_html && ln -s public_html www" >> ../log/debug_log');

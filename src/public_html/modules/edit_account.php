@@ -8,6 +8,12 @@ $r = account_edit($db, array(
 	'password' => trim($_POST['password'] ?? ''),
 	'php'      => trim($_POST['phpversion'] ?? ''),
 	'email'    => isset($_POST['hasemail']) && $_POST['hasemail'] == 'on',
+	'shell'    => trim($_POST['shell'] ?? ''),   // '' = leave as it is
+	'package'  => trim($_POST['package'] ?? ''), // hosting package (plugin): name/id, none, '' = leave
+	/* fields add-ons put in the dialog (accounts.edit.form) as plugin[<name>],
+	   for their account.edit.apply */
+	'plugin'   => array_map(function ($v) { return trim((string)$v); },
+	                        array_filter((array)($_POST['plugin'] ?? array()), 'is_scalar')),
 ));
 
 $msg_base = $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/accounts/';

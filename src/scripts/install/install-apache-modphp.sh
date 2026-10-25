@@ -7,6 +7,17 @@ if [ "$PHP_VERSION" == "" ]
     then PHP_VERSION='8.3'
 fi
 
+# Which Apache template (install-apache-phpfpm.sh sets apache_phpfpm):
+#   apache_modphp  prefork + mod_php + mod_ruid2; php-fpm per account optional
+#   apache_phpfpm  event MPM, no mod_php: every site's PHP in its own php-fpm pool
+APACHE_TEMPLATE="${APACHE_TEMPLATE:-apache_modphp}"
+case "$APACHE_TEMPLATE" in
+    apache_modphp|apache_phpfpm) ;;
+    *) echo "Unknown APACHE_TEMPLATE '${APACHE_TEMPLATE}' (apache_modphp | apache_phpfpm)" 1>&2; exit 1 ;;
+esac
+# the package that carries the PHP version: mod_php is the php package
+PHP_PKG=php; [ "$APACHE_TEMPLATE" == "apache_phpfpm" ] && PHP_PKG=php-fpm
+
 WHITE='\033[1;37m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -63,7 +74,11 @@ if ! systemctl is-active --quiet httpd; then
     echo -n "Installing httpd                    "
 
     (
-		dnf -y install httpd mod_ssl mod_ruid2 python3-certbot-apache
+		if [ "$APACHE_TEMPLATE" == "apache_modphp" ]; then
+			dnf -y install httpd mod_ssl mod_ruid2 python3-certbot-apache
+		else
+			dnf -y install httpd mod_ssl python3-certbot-apache
+		fi
 
         if [ ! -f "/etc/letsencrypt/options-ssl-apache.conf" ]; then
             cat /usr/local/reqad/scripts/install/config/options-ssl-apache.txt > /etc/letsencrypt/options-ssl-apache.conf
@@ -104,9 +119,15 @@ echo
 echo -n "Configuring httpd modules           "
 MODSUM_BEFORE=$(cat ${MODDIR}/*.conf 2>/dev/null | md5sum)
 (
-	# mpm_prefork — required by mod_php
-	httpd_module on  00-mpm.conf mpm_prefork_module
-	httpd_module off 00-mpm.conf mpm_event_module
+	if [ "$APACHE_TEMPLATE" == "apache_modphp" ]; then
+		# mpm_prefork — required by mod_php (and mod_ruid2)
+		httpd_module on  00-mpm.conf mpm_prefork_module
+		httpd_module off 00-mpm.conf mpm_event_module
+	else
+		# mpm_event — PHP runs in php-fpm, so apache can use threads
+		httpd_module on  00-mpm.conf mpm_event_module
+		httpd_module off 00-mpm.conf mpm_prefork_module
+	fi
 	httpd_module off 00-mpm.conf mpm_worker_module
 
 	# disable what we don't serve with
@@ -133,6 +154,10 @@ if [ "$(cat ${MODDIR}/*.conf 2>/dev/null | md5sum)" != "${MODSUM_BEFORE}" ]; the
 	(systemctl is-active --quiet httpd && systemctl restart httpd) >> ./install_reqad.log 2>&1
 fi
 
+# index.php before index.html / index.htm (the stock order is the other way
+# round; the rpm's post-install ran before httpd was here)
+bash /usr/local/reqad/scripts/update/setup_directory_index.sh >> ./install_reqad.log 2>&1
+
 if grep -qE '^[[:space:]]*LoadModule[[:space:]]+proxy_module' ${MODDIR}/00-proxy.conf 2>/dev/null \
 	&& grep -qE '^[[:space:]]*LoadModule[[:space:]]+proxy_fcgi_module' ${MODDIR}/00-proxy.conf 2>/dev/null; then
 	echo -e "[ ${GREEN}OK${NC} ]"
@@ -148,7 +173,7 @@ fi
 #
 #  php (mod_php)
 
-EXISTING_PHP=$(rpm -qi php | grep 'Version' | awk {'print $3'} | awk -F. {'print $1"."$2'})
+EXISTING_PHP=$(rpm -qi ${PHP_PKG} | grep 'Version' | awk {'print $3'} | awk -F. {'print $1"."$2'})
 if [ "${EXISTING_PHP}" != "${PHP_VERSION}" ]; then
 echo -n "Installing php                      "
 (
@@ -164,7 +189,9 @@ echo -n "Installing php                      "
     dnf -y module enable php:remi-${PHP_VERSION}
     # php-fpm is not a dependency of mod_php, but accounts can be switched to the
     # fpm handler on the default php version (pool in /etc/php-fpm.d/) — install it
-    dnf install -y php php-fpm php-xml php-pdo php-mysqlnd php-mysql php-mbstring php-pear php-gd php-mcrypt php-intl php-process \
+    # mod_php is the php package; apache_phpfpm leaves it out
+    PHP_MOD=php; [ "$APACHE_TEMPLATE" == "apache_phpfpm" ] && PHP_MOD=
+    dnf install -y ${PHP_MOD} php-fpm php-xml php-pdo php-mysqlnd php-mysql php-mbstring php-pear php-gd php-mcrypt php-intl php-process \
     php-soap php-pecl-redis php-pecl-igbinary php-common php-json php-cli php-bcmath  php-pecl-zip php-opcache php-sodium php-pecl-apcu
 
     sed -i 's/;date.timezone =/date.timezone = Europe\/Bucharest/' /etc/php.ini
@@ -178,13 +205,18 @@ echo -n "Installing php                      "
     sed -i 's/expose_php = On/expose_php = Off/' /etc/php.ini
     sed -i 's/;mail.force_extra_parameters =.*/mail.force_extra_parameters = 1/' /etc/php.ini
 
+    # apache_phpfpm: the stock conf.d/php.conf hands .php outside the account
+    # vhosts (the server's default host) to /run/php-fpm/www.sock, so apache
+    # must reach it; it still runs as nobody, which cannot read the docroots
+    WWW_LISTEN=/run/php-fpm.sock; WWW_GROUP=nobody
+    [ "$APACHE_TEMPLATE" == "apache_phpfpm" ] && { WWW_LISTEN=/run/php-fpm/www.sock; WWW_GROUP=apache; }
     echo "[www]
 user = nobody
 group = nobody
-listen = /run/php-fpm.sock
+listen = ${WWW_LISTEN}
 listen.allowed_clients = 127.0.0.1
 listen.owner = nobody
-listen.group = nobody
+listen.group = ${WWW_GROUP}
 listen.mode = 0660
 
 pm = ondemand
@@ -208,7 +240,7 @@ pm.max_spare_servers = 1
 # wait for apache to reload, otherwise status = reloading
 sleep 3
 
-EXISTING_PHP=$(rpm -qi php | grep 'Version' | awk {'print $3'} | awk -F. {'print $1"."$2'})
+EXISTING_PHP=$(rpm -qi ${PHP_PKG} | grep 'Version' | awk {'print $3'} | awk -F. {'print $1"."$2'})
 
 if [ "${EXISTING_PHP}" == "${PHP_VERSION}" ] && [ "$(systemctl is-active httpd)" == "active" ]; then
     echo -ne "[ ${GREEN}OK${NC} ]"
@@ -220,7 +252,7 @@ fi
 else
     echo -ne "[${GREEN} RUNNING ${NC}] "
     echo -n 'php '
-    echo -n `rpm -qi php | grep 'Version' | awk {'print $3'}`
+    echo -n `rpm -qi ${PHP_PKG} | grep 'Version' | awk {'print $3'}`
 fi
 echo
 
@@ -249,11 +281,11 @@ fi
 
 
 TEMPLATE=$(grep -e '^template=' /usr/local/reqad/etc/server-software.ini | awk -F= {'print $2'})
-if [ "${TEMPLATE}" != "apache_modphp" ]; then
+if [ "${TEMPLATE}" != "${APACHE_TEMPLATE}" ]; then
     echo -n "Updating template and services in Reqad config   ";
     (
         sed -i "/^template=/d" /usr/local/reqad/etc/server-software.ini
-        sed -i '/\[reqad\]/a\template=apache_modphp' /usr/local/reqad/etc/server-software.ini
+        sed -i "/\[reqad\]/a\template=${APACHE_TEMPLATE}" /usr/local/reqad/etc/server-software.ini
 		sed -i -E 's/^services=(.*)nginx, (.*)/services=\1httpd, \2/' /usr/local/reqad/etc/server-software.ini
     ) >> ./install_reqad.log 2>&1
     echo -e "[ ${GREEN}OK${NC} ]"

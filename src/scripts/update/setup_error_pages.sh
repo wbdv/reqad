@@ -35,8 +35,16 @@ fi
 DRY=0
 [ "$1" = "--dry-run" ] && DRY=1
 
-PAGES=/usr/local/reqad/scripts/templates/error-pages
-[ -f "$PAGES/404.html" ] || { echo "  error pages: $PAGES missing, skipping"; exit 0; }
+SRC=/usr/local/reqad/scripts/templates/error-pages
+[ -f "$SRC/404.html" ] || { echo "  error pages: $SRC missing, skipping"; exit 0; }
+# Served from a copy: /usr/local/reqad is 0750 (fix_panel_tree_perms.sh), so
+# the web server cannot read the pages where they ship and answered every
+# error with 403. Refreshed on every run.
+PAGES=/usr/share/reqad/error-pages
+if [ "$DRY" = "0" ]; then
+    install -d -m 0755 -o root -g root /usr/share/reqad "$PAGES"
+    install -m 0644 -o root -g root "$SRC"/*.html "$PAGES"/
+fi
 
 # ---------------------------------------------------------------- nginx ----
 if command -v nginx >/dev/null 2>&1 && [ -d /etc/nginx/conf.d ]; then

@@ -9,6 +9,8 @@
 	);
 	$s_smtp_ok   = smtp_configured();
 	$s_forward   = root_mail_forward_active();
+	$s_rootalias = root_mail_has_alias();
+	$s_rootlog   = (int)@filesize('/var/log/reqad/root-mail') + (int)@filesize('/var/log/reqad/root-mail.1');
 	$s_welcome   = !setting_get('welcome_dismissed');
 	$s_telemetry = setting_get('telemetry') !== '0';
 	$s_upd       = auto_update_status();
@@ -104,6 +106,18 @@
 <?php else: ?>
 					<small class="set-hint"><span class="badge bg-orange">not configured</span> No sending method yet — root mail cannot be forwarded until one is set.</small>
 <?php endif; ?>
+<?php if (!$s_rootalias || $s_rootlog > 0): ?>
+					<!-- root's mail kept on the server (scripts/root_mail_log.sh); the
+					     text is fetched only when the modal opens -->
+					<small class="set-hint">
+<?php if (!$s_rootalias): ?>
+						<span class="badge bg-yellow-lt">not forwarded</span> Root mail stays on this server in <code>/var/log/reqad/root-mail</code> (at most 20 MB, the oldest is dropped).
+<?php else: ?>
+						Root mail kept on this server from before forwarding was on: <code>/var/log/reqad/root-mail</code>.
+<?php endif; ?>
+						<a href="#" id="root-mail-view" class="ms-1">View the last 100 lines</a>
+					</small>
+<?php endif; ?>
 				</div>
 			</div>
 
@@ -194,6 +208,25 @@
 		</div>
 		</div>
 		</form>
+
+<!-- ─── root mail kept on the server (read-only) ─────────────────────────── -->
+<div class="modal modal-blur fade" id="modal-root-mail" tabindex="-1" role="dialog" aria-hidden="true">
+	<div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable" role="document">
+		<div class="modal-content">
+			<div class="modal-header">
+				<h5 class="modal-title">Root mail — last 100 lines</h5>
+				<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+			</div>
+			<div class="modal-body">
+				<p class="text-muted mb-2">From <code>/var/log/reqad/root-mail</code>, newest at the bottom. Only root and the panel can read this file; mail to root can contain passwords and other secrets.</p>
+				<pre id="root-mail-text" style="max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:12px;">Loading…</pre>
+			</div>
+			<div class="modal-footer">
+				<a href="#" class="btn" data-bs-dismiss="modal">Close</a>
+			</div>
+		</div>
+	</div>
+</div>
 
 <!-- ─── sending method modal ───────────────────────────────────────────────
      Its own form and action, outside the main one (forms cannot nest). -->
@@ -340,6 +373,18 @@ jQuery(document).ready(function () {
 	}
 	$email.on('input', syncForward);
 	syncForward();
+
+	/* Root mail log: fetched each time the modal opens, never part of the
+	   page. .text() only - it is mail anyone can send to root. */
+	$('#root-mail-view').on('click', function (e) {
+		e.preventDefault();
+		var $pre = $('#root-mail-text').text('Loading…');
+		bootstrap.Modal.getOrCreateInstance(document.getElementById('modal-root-mail')).show();
+		$.post('/?ajax=1', { action: 'ajax-root-mail-log' }, function (r) {
+			$pre.text(r && r.text ? r.text : 'No root mail has been kept yet.');
+			$pre.scrollTop($pre[0].scrollHeight);
+		}, 'json').fail(function () { $pre.text('Could not read the root mail log.'); });
+	});
 
 	/* The modals are forms of their own, so submitting one reloads the page and
 	   anything changed but not saved in the main form would be lost. Carry

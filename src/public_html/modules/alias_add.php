@@ -7,7 +7,6 @@ $acct_user = preg_replace('/[^a-z0-9]/', '', trim($_POST['user'] ?? ''));
 $alias     = strtolower(trim($_POST['alias'] ?? ''));
 $add_dns   = isset($_POST['add_dns']) && $_POST['add_dns'] == 'on';
 
-$is_apache = (substr(trim($ini['template'] ?? ''), 0, 7) == 'apache_');
 $errmsg = '';
 
 /* DNS provider (for optional record creation). */
@@ -31,6 +30,10 @@ if($errmsg === '') {
 		$errmsg = 'Error: '.$v;
 }
 
+/* plan limits (limit_allows: core allows all; a hosting-package plugin may not) */
+if($errmsg === '' && ($limit_err = limit_allows($acct_user, 'alias', array('alias' => $alias))) !== '')
+	$errmsg = 'Error: '.$limit_err;
+
 if($errmsg === '') {
 	$is_wild = (substr($alias, 0, 2) === '*.') ? 1 : 0;
 	$stmt = $db->prepare('INSERT INTO aliases (account_id, alias, is_wildcard, ssl_status, created_at) VALUES (:aid, :alias, :wild, "none", datetime("now"))');
@@ -40,7 +43,7 @@ if($errmsg === '') {
 	$stmt->execute();
 
 	/* Reflect the new alias in the live vhost server_name and reload. */
-	$vh = apply_account_vhost_names($db, $acct['domain'], $is_apache);
+	$vh = apply_account_vhost_names($db, $acct['domain']);
 	if($vh !== '')
 		$errmsg = 'Error: alias saved but web server update failed: '.$vh;
 
@@ -58,6 +61,9 @@ if($errmsg === '') {
 				$errmsg = 'Error: alias added, but DNS record failed: '.preg_replace('/^Error:\s*/', '', $dnserr);
 		}
 	}
+
+	if($errmsg === '' || strpos($errmsg, 'Error: alias added') === 0)
+		plugin_hook('alias.created', array('user' => $acct['user'], 'alias' => $alias, 'dns' => $add_dns && $dns_provider !== ''));
 
 	/* If the account already uses Let's Encrypt, extend the cert in the background.
 	   A standard alias goes via HTTP-01; a wildcard triggers the DNS-01 re-issue.

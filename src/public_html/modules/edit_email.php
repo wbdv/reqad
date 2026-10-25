@@ -6,6 +6,7 @@ $r = email_edit(array(
 	'email'    => trim($_POST['email'] ?? ''),
 	'password' => trim($_POST['password'] ?? ''),
 	'enabled'  => isset($_POST['login_enabled']) && $_POST['login_enabled'] == '1',
+	'size'     => trim($_POST['size'] ?? ''),      // mailbox size (Hosting Pro's field)
 ));
 
 $msg_base = $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/email-accounts/';

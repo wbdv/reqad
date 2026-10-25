@@ -1,0 +1,79 @@
+#!/bin/bash
+# Runs one cron job of a hosting account and keeps a record of its runs
+# (Advanced > Cron jobs in the account panel; app/functions/cron.php).
+#
+#   reqad-cron <id> '<command>'
+#
+# The panel writes the account's crontab lines as
+#   <schedule> /usr/local/bin/reqad-cron <id> '<command>'
+# so this runs as the account (from crond, or "Run now"), and inside the
+# account's sandbox when its shell is jailed (SHELL= at the top of the
+# crontab). Each run:
+#   - runs the command with bash, at lower priority (nice 10, I/O best-effort 7)
+#   - never overlaps the previous run of the same job: a run that finds it
+#     still going is skipped and recorded as skipped
+#   - keeps the first 64 KB of its output (stdout and stderr) in
+#     ~/.reqad/cron/<id>/<start>.out, for the newest 20 runs
+#   - adds lines to ~/.reqad/cron/runs: "<id> <start ms> - -" when it starts,
+#     "<id> <start ms> <duration ms> <exit code>" when it ends,
+#     "<id> <start ms> 0 skip" when skipped
+# The output is kept, so cron mails nothing.
+#
+# The source is /usr/local/reqad/bin/reqad-cron; scripts/cron/cron_helper.sh
+# installs a root-owned copy in /usr/local/bin (the panel tree is 0750, an
+# account cannot run anything from it).
+
+set -u
+id=${1:-}
+cmd=${2:-}
+if ! [[ $id =~ ^[a-z0-9]{8}$ ]] || [ -z "$cmd" ]; then
+	echo "usage: reqad-cron <id> '<command>'" >&2
+	exit 2
+fi
+if [ "$(id -u)" -lt 1000 ]; then
+	echo "reqad-cron: not for system users" >&2
+	exit 2
+fi
+H=${HOME:-}
+if [ -z "$H" ] || [ ! -d "$H" ]; then
+	echo "reqad-cron: no home folder" >&2
+	exit 2
+fi
+
+umask 077
+base=$H/.reqad/cron
+dir=$base/$id
+mkdir -p "$dir" || exit 2
+
+# cron's own PATH is /usr/bin:/bin; wp and composer live in /usr/local/bin
+[ "${PATH:-}" = /usr/bin:/bin ] && export PATH=/usr/local/bin:/usr/bin:/bin
+
+now_ms() { date +%s%3N; }
+record() { { flock 8; echo "$*" >> "$base/runs"; } 8>>"$base/.runs.lock"; }
+
+start=$(now_ms)
+exec 9>>"$dir/.lock"
+if ! flock -n 9; then
+	record "$id $start 0 skip"
+	exit 0
+fi
+record "$id $start - -"
+
+cd "$H" || exit 2
+# fd 9 (the lock) is not passed on: something the job leaves running in the
+# background must not keep every later run waiting
+nice -n 10 ionice -c 2 -n 7 /bin/bash -c "$cmd" </dev/null 9>&- 2>&1 | { head -c 65536 > "$dir/$start.out"; cat > /dev/null; }
+rc=${PIPESTATUS[0]}
+record "$id $start $(( $(now_ms) - start )) $rc"
+exec 9>&-
+
+# the newest 20 outputs of this job
+ls -1 "$dir" | grep -E '^[0-9]+\.out$' | sort -rn | tail -n +21 | while read -r f; do rm -f "$dir/$f"; done
+# the run list stays short
+{
+	flock 8
+	if [ "$(wc -l < "$base/runs")" -gt 4000 ]; then
+		tail -n 2000 "$base/runs" > "$base/runs.new" && mv -f "$base/runs.new" "$base/runs"
+	fi
+} 8>>"$base/.runs.lock"
+exit "$rc"

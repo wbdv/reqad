@@ -29,6 +29,37 @@ cp -f "$SRC" "$DEST_DIR/reqad_autologin.php"
 chown -R reqad:reqad "$DEST_DIR" 2>/dev/null || true
 chmod 0644 "$DEST_DIR/reqad_autologin.php"
 
+# Webmail sends with SMTP AUTH as the mailbox ('%u' / '%p'), so Exim's sending
+# limits (setup_mail_limits.sh: authenticated = *) apply to it. Servers set up
+# by install-exim-dovecot.sh until 2026-10-18 have smtp_user/smtp_pass '' -- no
+# AUTH, mail from 127.0.0.1 relayed unlimited. Switched only from exactly '',
+# so an admin's own value is kept, and only once the plugin above (whose
+# smtp_connect binds the master user in auto-logged-in sessions) is in place
+# and Exim offers AUTH PLAIN on 127.0.0.1 -- otherwise every send would fail.
+smtp_auth_on() {
+    grep -Eq "^\s*\\\$config\['smtp_(user|pass)'\]\s*=\s*''\s*;" "$CONFIG" || return 0
+    printf 'EHLO localhost\r\nQUIT\r\n' | /usr/sbin/exim -bh 127.0.0.1 2>/dev/null | grep -Eq '^250.AUTH.* PLAIN' \
+        || { say "exim offers no AUTH PLAIN on 127.0.0.1, webmail keeps sending without SMTP AUTH"; return 0; }
+    local new="$CONFIG.smtp-new"
+    sed -E \
+        -e "s/^(\s*\\\$config\['smtp_user'\]\s*=\s*)''\s*;/\1'%u';/" \
+        -e "s/^(\s*\\\$config\['smtp_pass'\]\s*=\s*)''\s*;/\1'%p';/" \
+        -e "s#^// No SMTP auth .*#// SMTP AUTH as the mailbox, so Exim's sending limits apply (auto-login binds the master user)#" \
+        -e "s#^// SMTP: no auth .*#// SMTP: AUTH as the mailbox, so Exim's sending limits apply (auto-login binds the master user)#" \
+        "$CONFIG" > "$new" || { rm -f "$new"; return 0; }
+    for php in php php82 php83 php81 php80 /usr/bin/php /opt/remi/php82/root/usr/bin/php; do
+        if command -v "$php" >/dev/null 2>&1; then
+            "$php" -l "$new" >/dev/null 2>&1 || { rm -f "$new"; say "SMTP AUTH edit failed the PHP syntax check, $CONFIG left as it was" >&2; return 0; }
+            break
+        fi
+    done
+    cp -a "$CONFIG" "$CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+    cat "$new" > "$CONFIG"
+    rm -f "$new"
+    say "webmail now sends with SMTP AUTH as the mailbox"
+}
+smtp_auth_on
+
 if grep -q "['\"]$PLUGIN['\"]" "$CONFIG"; then
     say "already enabled in roundcube config"
     exit 0

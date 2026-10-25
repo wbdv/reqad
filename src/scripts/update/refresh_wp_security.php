@@ -24,7 +24,8 @@ if (!wp_is_nginx($ini) || !is_dir(WP_SEC_INC_DIR)) {
 }
 
 $done = 0; $fail = 0;
-$res = $db->query('SELECT user, domain, path FROM wordpress ORDER BY domain');
+/* one pass per site (vhost): its rules cover every install on it */
+$res = $db->query('SELECT user, domain, path FROM wordpress GROUP BY lower(domain) ORDER BY domain');
 while ($row = $res->fetchArray(SQLITE3_ASSOC)) {
 	$keys = wp_sec_nginx_enabled($row['domain']);
 	if (empty($keys))

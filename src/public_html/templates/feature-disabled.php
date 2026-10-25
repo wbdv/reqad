@@ -10,6 +10,10 @@
 		'transfer'      => 'Transfer Tool',
 		'addon_domains' => 'Addon Domains',
 		'root_access' => 'Root Access',
+		'deployments' => 'Deployments',
+		'api'         => 'API access',
+		'mcp'         => 'AI access',
+		'hostingpro'  => 'Hosting packages',
 	);
 	$feature_name = isset($feature_labels[$blocked_feature]) ? $feature_labels[$blocked_feature] : $blocked_feature;
 	include('templates/header.php');

@@ -9,8 +9,19 @@ fi
 
 CONF_DIR="/etc/httpd/conf.d"
 
-if [ ! -d "$CONF_DIR" ]; then
+# the directory alone is not enough: httpd-filesystem is pulled in by other
+# packages on nginx servers, without httpd itself
+if [ ! -d "$CONF_DIR" ] || ! command -v httpd >/dev/null 2>&1; then
     echo "  Apache not installed, skipping"
+    exit 0
+fi
+
+# only where Apache is the front server: behind nginx (nginx_apache_php-fpm)
+# it listens on loopback only and nginx answers for the hostname
+. /usr/local/reqad/scripts/web_caps.sh
+web_caps
+if [ "$WEB_FRONT" != httpd ]; then
+    echo "  Apache is not the front web server, skipping"
     exit 0
 fi
 

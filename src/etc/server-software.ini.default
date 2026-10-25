@@ -11,7 +11,12 @@ terminal=0
 transfer=0
 root_access=1
 filemanager=1
+filemanager_compression=1
 addon_domains=0
+deployments=0
+api=0
+mcp=0
+dnscluster=0
 
 [web]
 php_versions=8.3

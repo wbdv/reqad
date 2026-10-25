@@ -178,6 +178,8 @@ if [ -d "$HTTPD_CONF_DIR" ]; then
         grep -q "/var/lib/reqad/autoconfig/" "$conf" 2>/dev/null && continue
 
         domain=$(basename "$conf" .conf)
+        # certbot's https copy of a site's vhost (merge_le_ssl_vhosts.sh moves it back)
+        domain=${domain%-le-ssl}
         case "$domain" in *.*) ;; *) continue ;; esac
 
         backup_conf "$conf"

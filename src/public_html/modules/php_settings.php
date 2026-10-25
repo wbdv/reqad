@@ -89,7 +89,7 @@ if($errmsg == '') {
 				$val = $parsed_line[1];
 				if(array_key_exists($var, $php_ini_allowed)) {
 					$php_ini[$var] = $val;
-					error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." $phpini_path_cur $var -> $val\n", 3, '../log/debug_log');
+					error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." $phpini_path_cur $var -> $val\n", 3, '../log/debug_log');
 				}
 			}
 	#		ksort($php_ini);
@@ -105,12 +105,12 @@ if($errmsg == '') {
 						shell_exec("echo '$var =' | sudo tee --append $phpini_path_cur");
 					} else {
 						// if found, uncomment setting and parse it
-						error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." sudo sed -i 's/^;$var =/$var =/' $phpini_path_cur\n", 3, '../log/debug_log');
+						error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." sudo sed -i 's/^;$var =/$var =/' $phpini_path_cur\n", 3, '../log/debug_log');
 						shell_exec("sudo sed -i 's/^;$var =/$var =/' $phpini_path_cur");
 						$parsed_line = array_map('trim', explode("=", trim($output)));
 						$val = $parsed_line[1];
 						$php_ini[$var] = $val;
-						error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." $phpini_path_cur $var -> $val\n", 3, '../log/debug_log');
+						error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." $phpini_path_cur $var -> $val\n", 3, '../log/debug_log');
 					}
 				}
 				if($type=='boolean') {
@@ -140,7 +140,7 @@ if($errmsg == '') {
 						$errmsg = 'Invalid value for '.$var.'.';
 						continue;
 					}
-					error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." $phpini_path_cur $var = $newval\n", 3, '../log/debug_log');
+					error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." $phpini_path_cur $var = $newval\n", 3, '../log/debug_log');
 					/* Match on the KEY, not on the current value. The old pattern
 					   interpolated the existing value into the regex unescaped, so
 					   any setting already holding a slash (date.timezone =
@@ -329,7 +329,7 @@ if($errmsg == '' && isset($_POST['apcu_present'])) {
 
 if($errmsg == '' && $successmsg == '') {
     // All ok
-    #error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." create forwarder $email -> $forward\n", 3, '../log/route_log');
+    #error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." create forwarder $email -> $forward\n", 3, '../log/route_log');
 	$successmsg =  "No change was made in php.ini";
 }
 ?>

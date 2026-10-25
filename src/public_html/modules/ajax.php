@@ -34,11 +34,28 @@
 		}
 	}
 
+	/* DNS Zones (templates/dns.php): every request of the zone list and the
+	   zone editor, by op. Answers JSON and exits. */
+	if(isset($_POST["action"]) && $_POST["action"] === 'ajax-dns') {
+		include(__DIR__.'/dns_admin.php');
+		exit;
+	}
+
 	/* Progress for a running whole-server restore. Read-only: it parses
 	   log/restore_server.status, which restore_server.sh appends to. */
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-restore-server-status') {
 		header('Content-Type: application/json');
 		echo json_encode(restore_server_status());
+		exit;
+	}
+
+	/* Settings > System mail: the end of root's mail kept on the server. Loaded
+	   on demand only, the page itself never carries it (it can hold secrets). */
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-root-mail-log') {
+		header('Content-Type: application/json');
+		header('Cache-Control: no-store');
+		$rm = root_mail_log_tail(100);
+		echo json_encode(array('ok' => true, 'text' => implode("\n", $rm['lines']), 'size' => $rm['size']), JSON_INVALID_UTF8_SUBSTITUTE);
 		exit;
 	}
 
@@ -296,6 +313,11 @@
        the live file. Returns {ok:true} or {ok:false, error:"..."}. */
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-config-validate' && isset($_POST["user"]) && isset($_POST["file"])) {
         header('Content-Type: application/json');
+        /* nginx -t opens the log paths as root: same gate as saving */
+        if(!account_config_editable($ini)) {
+            echo json_encode(array('ok' => false, 'error' => 'Editing config files needs root access (root_access=1 in server-software.ini).'));
+            exit;
+        }
         $acct_user = preg_replace('/[^a-z0-9]/', '', trim($_POST["user"]));
         $which = (($_POST["file"] ?? '') === 'fpm') ? 'fpm' : 'nginx';
         $res = $db->query('SELECT domain FROM accounts WHERE user="'.$db->escapeString($acct_user).'"');
@@ -332,300 +354,144 @@
     }
 
     /* ===================== File Manager (ajax-fm-*) =====================
-       Account-level file manager. Every op runs as the account user
-       (sudo -u <user>), all paths are jailed inside /home/<user> via
-       fm_resolve(). Feature-gated to `filemanager` (ajax_required_feature).
-       Helpers live in modules/functions.php. */
+       Account-level file manager (templates/file-manager-modal.php). Every
+       operation is app/functions/files.php, which runs it AS the account
+       (scripts/files/fm-run.sh + fm-helper.php: the account's uid, paths
+       kept inside /home/<user>) - the same code as the API and the account
+       panel. Feature-gated to `filemanager` (ajax_required_feature). */
 
-    // List a directory -> {ok:true, rows:[...], path:"..."} or {error:"..."}.
+    // the account of an ajax-fm-* request, or answer {error} and stop
+    $fm_user = function($raw) use ($db) {
+        $u = fm_account_user($db, $raw);
+        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
+        return $u;
+    };
+    // a files_* result in the modal's shape: {ok:true, ...} or {error}
+    $fm_out = function(array $r, array $extra = array()) {
+        echo json_encode($r['ok'] ? array('ok' => true) + $extra : array('error' => $r['error']));
+        exit;
+    };
+
+    // List a directory -> {ok:true, rows:[{name,type,size,mtime,perms,link?,broken?}]} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-list' && isset($_POST["user"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"] ?? '');
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        // must be a directory we can enter
-        $type = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' stat -c %F '.escapeshellarg($abs).' 2>/dev/null'));
-        if(strpos($type, 'directory') === false) { echo json_encode(array('error' => 'Not a directory.')); exit; }
-        echo json_encode(array('ok' => true, 'rows' => fm_list($u, $abs)));
-        exit;
+        $u = $fm_user($_POST["user"]);
+        $r = files_list($u, (string)($_POST["path"] ?? ''));
+        if(!$r['ok']) $fm_out($r);
+        $rows = array();
+        foreach($r['data']['entries'] as $e) {
+            $dir = $e['t'] === 'd' || ($e['lt'] ?? '') === 'd';
+            $row = array('name' => $e['n'], 'type' => $dir ? 'dir' : 'file', 'size' => $e['s'],
+                         'mtime' => date('Y-m-d H:i', $e['m']), 'perms' => files_mode_symbolic($e['p'], $e['t']));
+            if($e['t'] === 'l') {
+                $row['link'] = true;
+                if(($e['lt'] ?? '') === 'x') $row['broken'] = true;
+            }
+            $rows[] = $row;
+        }
+        $fm_out($r, array('rows' => $rows));
     }
 
-    // Read a small text file for editing -> {ok:true, content:"..."} or {error}.
+    // Read a text file for editing -> {ok:true, content:"..."} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-read' && isset($_POST["user"]) && isset($_POST["path"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"]);
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        if(!fm_is_text($u, $abs)) { echo json_encode(array('error' => 'File is not editable (binary or too large).')); exit; }
-        $content = shell_exec('sudo -u '.escapeshellarg($u).' cat '.escapeshellarg($abs).' 2>/dev/null');
-        echo json_encode(array('ok' => true, 'content' => (string)$content));
-        exit;
+        $r = files_read($fm_user($_POST["user"]), (string)$_POST["path"]);
+        $fm_out($r, array('content' => $r['data']['content'] ?? ''));
     }
 
-    // Save editor content back to a file (via `tee` over stdin, so no temp-file
-    // readability issues and content isn't shell-escaped) -> {ok:true} or {error}.
+    // Save editor content back to a file -> {ok:true} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-save' && isset($_POST["user"]) && isset($_POST["path"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"]);
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        // refuse to clobber a directory
-        $type = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' stat -c %F '.escapeshellarg($abs).' 2>/dev/null'));
-        if(strpos($type, 'directory') !== false) { echo json_encode(array('error' => 'Target is a directory.')); exit; }
-        // Stream the editor content to `sudo -u <user> tee <dest>` over stdin — no
-        // temp file, and the content is never shell-escaped. tee into an existing
-        // file preserves that file's ownership + permissions.
-        $content = (string)($_POST["content"] ?? '');
-        $descriptors = array(0 => array('pipe','r'), 1 => array('pipe','w'), 2 => array('pipe','w'));
-        $proc = proc_open('sudo -u '.escapeshellarg($u).' tee '.escapeshellarg($abs).' > /dev/null',
-                          $descriptors, $pipes);
-        if(!is_resource($proc)) { echo json_encode(array('error' => 'Could not write file.')); exit; }
-        fwrite($pipes[0], $content); fclose($pipes[0]);
-        $err = stream_get_contents($pipes[2]);
-        fclose($pipes[1]); fclose($pipes[2]);
-        $rc = proc_close($proc);
-        echo json_encode($rc === 0 ? array('ok' => true) : array('error' => trim($err) !== '' ? trim($err) : 'Write failed.'));
-        exit;
+        $fm_out(files_save($fm_user($_POST["user"]), (string)$_POST["path"], (string)($_POST["content"] ?? '')));
     }
 
-    // Create a directory -> {ok:true} or {error}. `path` is the new folder's full
-    // relative path (parent + name), built client-side.
+    // Create a directory / an empty file -> {ok:true} or {error}. `path` = parent + name.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-mkdir' && isset($_POST["user"]) && isset($_POST["path"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"]);
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        $err = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' mkdir -m 755 '.escapeshellarg($abs).' 2>&1'));
-        echo json_encode($err === '' ? array('ok' => true) : array('error' => $err));
-        exit;
+        $fm_out(files_mkdir($fm_user($_POST["user"]), (string)$_POST["path"]));
     }
-
-    // Create an empty file -> {ok:true} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-newfile' && isset($_POST["user"]) && isset($_POST["path"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"]);
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        // don't overwrite an existing entry
-        $exists = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -e '.escapeshellarg($abs).' && echo 1'));
-        if($exists === '1') { echo json_encode(array('error' => 'A file with that name already exists.')); exit; }
-        $err = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' touch '.escapeshellarg($abs).' 2>&1'));
-        echo json_encode($err === '' ? array('ok' => true) : array('error' => $err));
-        exit;
+        $fm_out(files_create($fm_user($_POST["user"]), (string)$_POST["path"]));
     }
 
-    // Rename / move within the home -> {ok:true} or {error}. Both src and dst jailed.
+    // Rename / move within the home -> {ok:true} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-rename' && isset($_POST["user"]) && isset($_POST["src"]) && isset($_POST["dst"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $src = fm_resolve($u, $_POST["src"]);
-        $dst = fm_resolve($u, $_POST["dst"]);
-        if($src === false || $dst === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        if($src === fm_home($u)) { echo json_encode(array('error' => 'Cannot rename the home directory.')); exit; }
-        // refuse if the destination already exists — otherwise `mv` would either
-        // clobber it or (with -n) silently no-op while reporting success
-        if($dst !== $src) {
-            $exists = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -e '.escapeshellarg($dst).' && echo 1'));
-            if($exists === '1') { echo json_encode(array('error' => 'An entry with that name already exists.')); exit; }
-        }
-        $err = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' mv '.escapeshellarg($src).' '.escapeshellarg($dst).' 2>&1'));
-        echo json_encode($err === '' ? array('ok' => true) : array('error' => $err));
-        exit;
+        $fm_out(files_rename($fm_user($_POST["user"]), (string)$_POST["src"], (string)$_POST["dst"]));
     }
 
     // Change permissions -> {ok:true} or {error}. `mode` is a 3-digit octal string.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-chmod' && isset($_POST["user"]) && isset($_POST["path"]) && isset($_POST["mode"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"]);
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        $mode = $_POST["mode"];
-        if(!preg_match('/^[0-7]{3,4}$/', $mode)) { echo json_encode(array('error' => 'Invalid mode.')); exit; }
-        $err = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' chmod '.escapeshellarg($mode).' '.escapeshellarg($abs).' 2>&1'));
-        echo json_encode($err === '' ? array('ok' => true) : array('error' => $err));
-        exit;
+        $fm_out(files_chmod($fm_user($_POST["user"]), (string)$_POST["path"], (string)$_POST["mode"]));
     }
 
     // Delete a file or directory (recursive) -> {ok:true} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-delete' && isset($_POST["user"]) && isset($_POST["path"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $abs = fm_resolve($u, $_POST["path"]);
-        if($abs === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        if($abs === fm_home($u)) { echo json_encode(array('error' => 'Cannot delete the home directory.')); exit; }
-        $err = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' rm -rf '.escapeshellarg($abs).' 2>&1'));
-        echo json_encode($err === '' ? array('ok' => true) : array('error' => $err));
-        exit;
+        $r = files_delete($fm_user($_POST["user"]), array((string)$_POST["path"]));
+        if($r['ok'] && !empty($r['data']['errors'])) $r = result_error($r['data']['errors'][0]['error']);
+        $fm_out($r);
     }
 
     // Upload file(s) into the current directory -> {ok:true, count:N} or {error}.
-    // Each uploaded temp is installed as <user>:<user> 0644 (preserves quota/ownership).
+    // Each file is written by the helper as the account (its quota, its owner).
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-upload' && isset($_POST["user"]) && isset($_FILES["files"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $dir = fm_resolve($u, $_POST["path"] ?? '');
-        if($dir === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
+        $u = $fm_user($_POST["user"]);
         $names = (array)$_FILES["files"]["name"];
         $tmps  = (array)$_FILES["files"]["tmp_name"];
         $errs  = (array)$_FILES["files"]["error"];
         $count = 0;
+        $last = '';
         for($i = 0; $i < count($names); $i++) {
             if($errs[$i] !== UPLOAD_ERR_OK || !is_uploaded_file($tmps[$i])) continue;
-            $base = basename((string)$names[$i]);                     // strip any path
-            if($base === '' || $base === '.' || $base === '..') continue;
-            $dest = fm_resolve($u, ($_POST["path"] ?? '') . '/' . $base);
-            if($dest === false || strpos($dest, $dir . '/') !== 0) continue;   // stay in this dir
-            $stage = _PATH . '/tmp/fm_up_' . bin2hex(random_bytes(6));
-            if(!move_uploaded_file($tmps[$i], $stage)) continue;
-            chmod($stage, 0644);
-            // count only if install actually succeeded (exit 0 -> sentinel); a
-            // quota-exceeded / permission failure must not be reported as uploaded
-            $out = trim((string)shell_exec('sudo install -o '.escapeshellarg($u).' -g '.escapeshellarg($u).
-                       ' -m 0644 '.escapeshellarg($stage).' '.escapeshellarg($dest).' 2>&1 && echo __FM_OK__'));
-            @unlink($stage);
-            if(substr($out, -9) === '__FM_OK__') $count++;
+            $fh = fopen($tmps[$i], 'rb');
+            if(!$fh) continue;
+            $r = files_upload($u, (string)($_POST["path"] ?? ''), basename((string)$names[$i]), filesize($tmps[$i]),
+                              function($pipe) use ($fh) { stream_copy_to_stream($fh, $pipe); }, true);
+            fclose($fh);
+            if($r['ok']) $count++; else $last = $r['error'];
         }
+        if(!$count && $last !== '') { echo json_encode(array('error' => $last)); exit; }
         echo json_encode(array('ok' => true, 'count' => $count));
         exit;
     }
 
-    // Compress selected items in a directory into a zip or tar.gz archive created
-    // in that same directory -> {ok:true, archive:"name.ext"} or {error}.
+    // Compress selected items of a directory into a zip or tar.gz there
+    // -> {ok:true, archive:"name.ext"} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-compress' && isset($_POST["user"]) && isset($_POST["items"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $dir = fm_resolve($u, $_POST["path"] ?? '');
-        if($dir === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
         $type = ($_POST["type"] ?? 'zip') === 'tgz' ? 'tgz' : 'zip';
-        $base = trim((string)($_POST["name"] ?? ''));
-        if($base === '' || strpos($base, '/') !== false || $base[0] === '.') { echo json_encode(array('error' => 'Invalid archive name.')); exit; }
-        $arcname = $base . ($type === 'tgz' ? '.tar.gz' : '.zip');
-        // don't clobber an existing entry
-        $arcabs = fm_resolve($u, ($_POST["path"] ?? '') . '/' . $arcname);
-        if($arcabs === false) { echo json_encode(array('error' => 'Invalid archive name.')); exit; }
-        $exists = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -e '.escapeshellarg($arcabs).' && echo 1'));
-        if($exists === '1') { echo json_encode(array('error' => 'An entry named “'.$arcname.'” already exists.')); exit; }
-        // validate each selected item is a plain child of this directory
-        $items = array();
-        foreach((array)$_POST["items"] as $it) {
-            $b = basename((string)$it);
-            if($b === '' || $b === '.' || $b === '..' || strpos((string)$it, '/') !== false) { echo json_encode(array('error' => 'Invalid selection.')); exit; }
-            $items[] = './' . $b;   // ./ prefix so a leading-dash name isn't read as an option
-        }
-        if(!$items) { echo json_encode(array('error' => 'Nothing selected.')); exit; }
-        $items_esc = implode(' ', array_map('escapeshellarg', $items));
-        // run inside the directory as the user; archive named relatively (./name)
-        if($type === 'tgz')
-            $inner = 'cd '.escapeshellarg($dir).' && tar czf '.escapeshellarg('./'.$arcname).' '.$items_esc;
-        else
-            $inner = 'cd '.escapeshellarg($dir).' && zip -r -q '.escapeshellarg('./'.$arcname).' '.$items_esc;
-        $err = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' bash -c '.escapeshellarg($inner).' 2>&1'));
-        // zip prints progress to stdout even with -q sometimes; treat non-existence as failure
-        $ok = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -f '.escapeshellarg($arcabs).' && echo 1'));
-        if($ok !== '1') { echo json_encode(array('error' => $err !== '' ? $err : 'Compression failed.')); exit; }
-        echo json_encode(array('ok' => true, 'archive' => $arcname));
-        exit;
+        $r = files_compress($fm_user($_POST["user"]), (string)($_POST["path"] ?? ''), array_map('strval', (array)$_POST["items"]), (string)($_POST["name"] ?? ''), $type);
+        $fm_out($r, array('archive' => $r['data']['name'] ?? ''));
     }
 
-    // Extract a zip / tar.gz archive into a destination directory (created if needed)
-    // -> {ok:true} or {error}. Runs as the account user; contained to the home jail.
+    // Extract a zip / tar archive into a destination directory (made if needed)
+    // -> {ok:true} or {error}.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-fm-extract' && isset($_POST["user"]) && isset($_POST["path"]) && isset($_POST["name"])) {
         header('Content-Type: application/json');
-        $u = fm_account_user($db, $_POST["user"]);
-        if(!$u) { echo json_encode(array('error' => 'Account not found.')); exit; }
-        $name = basename((string)$_POST["name"]);
-        $arc  = fm_resolve($u, ($_POST["path"] ?? '') . '/' . $name);
-        if($arc === false) { echo json_encode(array('error' => 'Invalid path.')); exit; }
-        $isfile = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -f '.escapeshellarg($arc).' && echo 1'));
-        if($isfile !== '1') { echo json_encode(array('error' => 'Archive not found.')); exit; }
-        // destination directory (relative to home), default handled client-side
-        $dest = fm_resolve($u, $_POST["dest"] ?? ($_POST["path"] ?? ''));
-        if($dest === false) { echo json_encode(array('error' => 'Invalid destination.')); exit; }
-        $lname = strtolower($name);
-        if(substr($lname, -4) === '.zip')            $kind = 'zip';
-        elseif(substr($lname, -7) === '.tar.gz' || substr($lname, -4) === '.tgz') $kind = 'tgz';
-        elseif(substr($lname, -4) === '.tar')        $kind = 'tar';
-        else { echo json_encode(array('error' => 'Unsupported archive type (use .zip, .tar.gz or .tgz).')); exit; }
-        // ensure destination exists
-        shell_exec('sudo -u '.escapeshellarg($u).' mkdir -p '.escapeshellarg($dest).' 2>&1');
-        // tar strips a leading "/" by default; runs as the unprivileged account
-        // user so extraction is confined to that user's own files either way.
-        if($kind === 'zip')
-            $cmd = 'unzip -q -o '.escapeshellarg($arc).' -d '.escapeshellarg($dest);
-        elseif($kind === 'tgz')
-            $cmd = 'tar xzf '.escapeshellarg($arc).' -C '.escapeshellarg($dest);
-        else
-            $cmd = 'tar xf '.escapeshellarg($arc).' -C '.escapeshellarg($dest);
-        // append a sentinel so we can tell success from a nonzero exit regardless of
-        // warnings the tool may print (unzip warns but still exits 0 on minor issues)
-        $out = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' '.$cmd.' 2>&1 && echo __FM_OK__'));
-        if(substr($out, -9) === '__FM_OK__') { echo json_encode(array('ok' => true)); exit; }
-        echo json_encode(array('error' => $out !== '' ? $out : 'Extraction failed.'));
-        exit;
+        $dir = rtrim((string)$_POST["path"], '/');
+        $arc = ($dir !== '' ? $dir.'/' : '').basename((string)$_POST["name"]);
+        $fm_out(files_extract($fm_user($_POST["user"]), $arc, (string)($_POST["dest"] ?? $dir), true));
     }
 
-    // Stream a file download (GET). fm_resolve + is_file, then `cat` as the user so
-    // reqad-unreadable files still download. Jail identical to the POST handlers.
+    // Stream a file download (GET); a folder comes as a zip made on the way.
     if(isset($_GET["action"]) && $_GET["action"] == 'ajax-fm-download' && isset($_GET["user"]) && isset($_GET["path"])) {
         $u = fm_account_user($db, $_GET["user"]);
         if(!$u) { header('HTTP/1.1 404 Not Found'); echo 'Account not found.'; exit; }
-        $abs = fm_resolve($u, $_GET["path"]);
-        if($abs === false) { header('HTTP/1.1 400 Bad Request'); echo 'Invalid path.'; exit; }
-        $isfile = trim((string)shell_exec('sudo -u '.escapeshellarg($u).' test -f '.escapeshellarg($abs).' && echo 1'));
-        if($isfile !== '1') { header('HTTP/1.1 404 Not Found'); echo 'Not a file.'; exit; }
-        // reqad's php.ini disables passthru, and the file may be reqad-unreadable,
-        // so stage a copy in reqad's tmp, stream that, then remove it.
-        //
-        // The copy is read by `cat` running as the ACCOUNT USER, not as root.
-        // It used to be `sudo cp` (root): fm_resolve had already jailed $abs to
-        // /home/<user>, but between that check and the copy the account user can
-        // swap the final component for a symlink to, say, /etc/shadow -- and root's
-        // cp would follow it out of the jail (a time-of-check/time-of-use race).
-        // Reading as the account user makes that pointless: the symlink resolves
-        // with the tenant's own privileges, so it can only reach what they could
-        // already read. Every other ajax-fm-* handler runs `sudo -u <user>` for
-        // exactly this reason; the download was the one that did not.
-        //
-        // stdout goes straight to the stage file, whose handle is opened here as
-        // reqad -- the child inherits the already-open fd, so it never needs write
-        // access to _PATH/tmp itself, and the file lands owned by reqad (no chown).
-        $name  = basename($abs);
-        $stage = _PATH . '/tmp/fm_dl_' . bin2hex(random_bytes(6));
-        $dl_desc = array(0 => array('file', '/dev/null', 'r'),
-                         1 => array('file', $stage, 'w'),
-                         2 => array('pipe', 'w'));
-        $dl_proc = proc_open('sudo -u '.escapeshellarg($u).' cat '.escapeshellarg($abs),
-                             $dl_desc, $dl_pipes);
-        $dl_rc = -1;
-        if(is_resource($dl_proc)) {
-            fclose($dl_pipes[2]);
-            $dl_rc = proc_close($dl_proc);
-        }
-        clearstatcache(true, $stage);
-        if($dl_rc !== 0 || !is_file($stage)) {
-            @unlink($stage);
-            header('HTTP/1.1 500 Internal Server Error'); echo 'Could not read file.'; exit;
-        }
-        @chmod($stage, 0600);
-        header('Content-Description: File Transfer');
-        header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="'.str_replace('"', '', $name).'"');
-        header('Content-Transfer-Encoding: binary');
-        header('Cache-Control: must-revalidate');
-        header('Pragma: public');
-        header('Content-Length: '.filesize($stage));
-        readfile($stage);
-        @unlink($stage);
+        $r = files_download($u, (string)$_GET["path"], function($meta, $pipe) {
+            $name = (string)$meta['name'];
+            header('Content-Type: application/octet-stream');
+            header('X-Content-Type-Options: nosniff');
+            header('Content-Disposition: attachment; filename="'.str_replace(array('"', '\\', "\r", "\n"), '_', $name).'"; filename*=UTF-8\'\''.rawurlencode($name));
+            header('Cache-Control: no-store');
+            if($meta['size'] !== null) header('Content-Length: '.(int)$meta['size']);
+            while(ob_get_level()) ob_end_flush();
+            while(!feof($pipe) && ($buf = fread($pipe, 1048576)) !== false && $buf !== '') { echo $buf; flush(); }
+        });
+        if(!$r['ok']) { header('HTTP/1.1 404 Not Found'); header('Content-Type: text/plain'); echo $r['error']; }
         exit;
     }
 
@@ -709,7 +575,7 @@
 		header('Content-Type: application/json');
 		$dbname = trim($_POST["dbname"]);
 		if(!db_is_managed($dbname)) { echo json_encode(array('error' => 'Database not found.')); exit; }
-		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." optimize database $dbname\n", 3, '../log/route_log');
+		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." optimize database $dbname\n", 3, '../log/route_log');
 		@set_time_limit(0);
 		echo json_encode(array('ok' => true) + db_optimize($dbname));
 		exit;
@@ -752,7 +618,7 @@
 				exit;
 			}
 
-			error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." $act $dbname $dbuser ".($old !== '' && $old !== $ip ? "$old -> " : '')."$ip\n", 3, '../log/route_log');
+			error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." $act $dbname $dbuser ".($old !== '' && $old !== $ip ? "$old -> " : '')."$ip\n", 3, '../log/route_log');
 			if($act == 'ajax-db-remote-add')
 				$err = db_remote_add($dbname, $dbuser, $ip);
 			elseif($act == 'ajax-db-remote-remove')
@@ -1022,7 +888,7 @@
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-ssl-getkey' && isset($_POST["domain"])) {
         $domain = trim($_POST["domain"]);
         if(valid_domain($domain)) {
-			if($ini["template"] == 'nginx_php-fpm' && is_file("/etc/nginx/conf.d/".$domain.".conf")) {
+			if(web_front($ini) === 'nginx' && is_file("/etc/nginx/conf.d/".$domain.".conf")) {
 				$privkey_file = trim(shell_exec("sudo grep 'ssl_certificate_key' /etc/nginx/conf.d/".$domain.".conf | awk {'print $2'} | sed 's/;//'"));
 				if($privkey_file!='') {
                     $privkey = trim(shell_exec("sudo cat ".$privkey_file." | sed -ne '/-BEGIN.* PRIVATE KEY-/,/-END.* PRIVATE KEY-/p'"));
@@ -1049,13 +915,13 @@
         if(valid_domain($domain)) {
             $results = $db->query('SELECT * FROM accounts WHERE domain="'.$domain.'"');
             if ($row = $results->fetchArray()) {
-				$user = $row["user"];
-				$output = trim(shell_exec('ls -1 ~'.$user.'/public_html/'));
-				if($output=='index.php' || $output=='') {
-					echo "OK";
-				} else {
-					echo "Error: Domain $domain contains files (other than index.php).";
-				}
+				/* why the site cannot take a WordPress (PHP off, deployed, ...); an
+				   occupied folder is reported by the install itself (it looks as the account) */
+				$why = '';
+				foreach (wordpress_install_targets($row["user"]) as $t)
+					if ($t['domain'] === strtolower($domain))
+						$why = $t['blocked'];
+				echo $why === '' ? "OK" : "Error: $why";
             } else {
 				echo "Error: Domain $domain not found.";
 			}
@@ -1106,7 +972,7 @@
 
 		if($_POST["action"] == 'ajax-wp-rescan') {
 			if(!$rescan_running()) {
-				error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-rescan started\n", 3, '../log/route_log');
+				error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." wp-rescan started\n", 3, '../log/route_log');
 				// Seed the log before launching so the first status poll can't
 				// mistake "not started yet" for "finished". unlink first: a previous
 				// run left it root-owned, but the dir is ours.
@@ -1145,24 +1011,15 @@
 		$enable = (isset($_POST["enable"]) && ($_POST["enable"] === '1' || $_POST["enable"] === 'true'));
 
 		// Resolve the site server-side (never trust a client-supplied domain/path).
-		$res = $db->query('SELECT user, domain, path FROM wordpress WHERE user="'.$db->escapeString($user).'"');
-		$row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+		$row = wp_site_row($db, $user);
 		if(!$row) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
-		$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
 
-		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-manage-toggle $option=".($enable?'on':'off')." user=$user\n", 3, '../log/route_log');
+		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." wp-manage-toggle $option=".($enable?'on':'off')." user=$user\n", 3, '../log/route_log');
 
-		if($option === 'nginx_cache')
-			$r = $enable ? wp_nginx_cache_enable($ini, $row['user'], $row['domain'], $docroot)
-			             : wp_nginx_cache_disable($ini, $row['user'], $row['domain'], $docroot);
-		elseif($option === 'wp_cron')
-			$r = $enable ? wp_wpcron_enable($row['user'], $docroot)
-			             : wp_wpcron_disable($row['user'], $docroot);
-		elseif($option === 'indexing')
-			$r = wp_indexing_set($row['user'], $docroot, $enable);
-		elseif($option === 'maintenance')
-			$r = wp_maintenance_set($row['user'], $docroot, $enable);
-		else { echo json_encode(array('error' => 'Unknown option.')); exit; }
+		/* the same as the account panel's WordPress Toolkit (app/functions/wordpress_tools.php) */
+		if(!in_array($option, array('nginx_cache', 'wp_cron', 'indexing', 'maintenance'), true)) { echo json_encode(array('error' => 'Unknown option.')); exit; }
+		$t = wordpress_tool_set($row, $option, $enable);
+		$r = array('error' => $t['ok'] ? '' : $t['error'], 'success' => $t['ok'] ? $t['message'] : '', 'log' => (string)($t['data']['log'] ?? ''));
 
 		$st = wp_manage_status($db, $ini, $user);
 		echo json_encode(array(
@@ -1182,7 +1039,7 @@
 		$user = trim($_POST["user"]);
 		$row  = valid_username($user) ? wp_site_row($db, $user) : false;
 		if(!$row) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
-		$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
+		$docroot = wp_site_docroot($row['user'], $row['path'] ?? '', $row['domain']);
 		$probe = wp_site_probe($row['user'], $docroot);
 		list($wp_versions, ) = wp_stable_versions();
 		$shot = wp_screenshot_file($row['user']);
@@ -1211,16 +1068,17 @@
 		$row  = valid_username($user) ? wp_site_row($db, $user) : false;
 		if(!$row) { echo json_encode(array('error' => 'Unknown WordPress site.')); exit; }
 		$want = array_values(array_intersect(array_keys(wp_security_options()), (array)($_POST["on"] ?? array())));
-		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-security-apply user=$user on=".implode(',', $want)."\n", 3, '../log/route_log');
+		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." wp-security-apply user=$user on=".implode(',', $want)."\n", 3, '../log/route_log');
 		$r = wp_security_apply($ini, $row, $want, $_POST["login_slug"] ?? '', ($_POST["regen_keys"] ?? '') === '1',
 			preg_split('/[\s,]+/', (string)($_POST["allow_ips"] ?? ''), -1, PREG_SPLIT_NO_EMPTY));
-		$probe = wp_site_probe($row['user'], wp_site_docroot($row['user'], $row['path'] ?? ''));
+		$probe = wp_site_probe($row['user'], wp_site_docroot($row['user'], $row['path'] ?? '', $row['domain']));
 		echo json_encode(array(
 			'ok'       => empty($r['error']),
 			'error'    => implode("\n", $r['error']),
 			'log'      => $r['log'],
 			'security' => wp_security_status($ini, $row, $probe),
 			'login_slug' => $probe['login_slug'] ?? '',
+			'login_url'  => $probe['login_url'] ?? '',
 			'allow_ips'  => wp_sec_allowed_ips($row['domain']),
 		));
 		exit;
@@ -1239,7 +1097,7 @@
 		$url  = 'https://'.$row['domain'].'/'.($path !== '' ? $path.'/' : '');
 
 		if($_POST["action"] == 'ajax-wp-job') {
-			error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." wp-job $kind user=$user\n", 3, '../log/route_log');
+			error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." wp-job $kind user=$user\n", 3, '../log/route_log');
 			wp_bg_job_run($kind, $row['user'], function () use ($kind, $row, $url) {
 				if($kind === 'screenshot')
 					return wp_screenshot_make($row['user'], $url);
@@ -1508,7 +1366,7 @@
 	// PHP: install a new PHP version from Remi repo
 	if (isset($_POST["action"]) && $_POST["action"] == 'ajax-php-install') {
 		header('Content-Type: application/json');
-		$known = ['7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
+		$known = php_installable_versions();
 		$version = trim($_POST["version"] ?? '');
 		$php_versions = array_map('trim', explode(',', $ini['php_versions']));
 		if (!in_array($version, $known) || in_array($version, $php_versions)) {
@@ -1543,12 +1401,7 @@
 		$php_file = "/tmp/reqad_job_{$job_id}_ini.php";
 		file_put_contents($php_file, $php_update);
 
-		$default_modules = [
-			'php-xml', 'php-pdo', 'php-mysqlnd', 'php-mysql', 'php-mbstring', 'php-pear',
-			'php-gd', 'php-mcrypt', 'php-intl', 'php-process', 'php-soap',
-			'php-pecl-redis', 'php-pecl-igbinary', 'php-common', 'php-json', 'php-cli',
-			'php-bcmath', 'php-pecl-zip', 'php-opcache', 'php-sodium', 'php-pecl-imagick-im7',
-		];
+		$default_modules = php_install_modules($version);
 		$install_pkgs = array_map(function($m) use ($ver_suffix) {
 			return "php{$ver_suffix}-" . $m;
 		}, $default_modules);
@@ -1566,7 +1419,7 @@
 		$script .= "  echo " . escapeshellarg($www_conf_content) . " | sudo -n tee " . escapeshellarg($www_conf_path) . " > /dev/null\n";
 		$script .= "  sudo -n systemctl enable " . escapeshellarg($fpm_service) . " 2>&1 || EXIT=1\n";
 		$script .= "  sudo -n systemctl restart " . escapeshellarg($fpm_service) . " 2>&1 || EXIT=1\n";
-		$script .= "  php " . escapeshellarg($php_file) . " 2>&1 || EXIT=1\n";
+		$script .= "  /opt/reqad/php-current/usr/bin/php -c /etc/reqad/php-fpm/php.ini " . escapeshellarg($php_file) . " 2>&1 || EXIT=1\n";
 		$script .= "fi\n";
 		$script .= "rm -f " . escapeshellarg($php_file) . "\n";
 
@@ -1652,6 +1505,122 @@
 	}
 
 	// Dashboard data (slow shell commands — served from cache after first load)
+	/* Dashboard "Needs attention" card (app/functions/health.php). The checks
+	   run as root - certificates, exim, dnf - through the CLI; the panel only
+	   reads the stored result and records dismissals. */
+	/* Accounts > Deployments: start / stop / restart, logs, the environment file,
+	   Install packages and runtimes (app/functions/apps.php) */
+	if (isset($_POST["action"]) && in_array($_POST["action"], array('ajax-app-control', 'ajax-app-logs', 'ajax-app-env',
+	                                                                'ajax-app-env-save', 'ajax-app-runtime', 'ajax-app-available',
+	                                                                'ajax-app-install', 'ajax-app-install-log', 'ajax-app-detect'), true)) {
+		header('Content-Type: application/json');
+		$a = isset($_POST['id']) ? app_get((string)(int)$_POST['id']) : null;
+		$need = !in_array($_POST["action"], array('ajax-app-runtime', 'ajax-app-available', 'ajax-app-detect'), true);
+		if ($need && !$a) { echo json_encode(array('ok' => false, 'error' => 'No such app.')); exit; }
+		switch ($_POST["action"]) {
+		case 'ajax-app-control':
+			$op = isset($_POST['op']) ? (string)$_POST['op'] : '';
+			route_log('app '.$op.' '.$a['domain']);
+			echo json_encode(app_control($a['id'], $op));
+			break;
+		case 'ajax-app-logs':
+			echo json_encode(array('ok' => true, 'text' => app_logs($a, 300), 'status' => app_status($a)));
+			break;
+		case 'ajax-app-env':
+			echo json_encode(array('ok' => true, 'text' => app_env_read($a), 'file' => app_env_file($a)));
+			break;
+		case 'ajax-app-env-save':
+			route_log('app env '.$a['domain']);
+			echo json_encode(app_env_write($a, isset($_POST['text']) ? (string)$_POST['text'] : ''));
+			break;
+		case 'ajax-app-install':
+			route_log('app install '.$a['domain']);
+			echo json_encode(app_pkg_start($a['id'], auth_user()));
+			break;
+		case 'ajax-app-detect':
+			/* the start command the site's code needs (read as the account) */
+			$kind = isset($_POST['runtime']) && in_array($_POST['runtime'], array('node', 'python'), true) ? $_POST['runtime'] : '';
+			echo json_encode(app_detect_site((string)($_POST['domain'] ?? ''), isset($_POST['app_dir']) ? (string)$_POST['app_dir'] : null, $kind));
+			break;
+		case 'ajax-app-install-log':
+			list($text, $next) = app_pkg_output($a, isset($_POST['offset']) ? (int)$_POST['offset'] : 0);
+			echo json_encode(array('ok' => true, 'install' => app_pkg_state($a), 'text' => $text, 'next' => $next));
+			break;
+		case 'ajax-app-runtime':
+			$op = isset($_POST['op']) ? (string)$_POST['op'] : '';
+			route_log('app runtime '.$op.' '.($_POST['kind'] ?? '').' '.($_POST['version'] ?? ''));
+			echo json_encode(app_runtime_run($op, (string)($_POST['kind'] ?? ''), (string)($_POST['version'] ?? '')));
+			break;
+		case 'ajax-app-available':
+			$rows = array();
+			foreach (explode("\n", trim((string)shell_exec('sudo '.APP_RUNTIME.' available node 2>/dev/null'))) as $l) {
+				$f = preg_split('/\s+/', trim($l));
+				if (count($f) >= 2 && ctype_digit($f[0]))
+					$rows[] = array('major' => $f[0], 'latest' => $f[1], 'lts' => $f[2] ?? '');
+			}
+			echo json_encode(array('ok' => true, 'node' => $rows));
+			break;
+		}
+		exit;
+	}
+
+	/* Accounts > Deployments: deploy now, roll back, the live log, releases and
+	   the repository connection details (app/functions/deploy.php) */
+	if (isset($_POST["action"]) && in_array($_POST["action"], array('ajax-deploy-run', 'ajax-deploy-rollback', 'ajax-deploy-log',
+	                                                                'ajax-deploy-releases', 'ajax-deploy-connect'), true)) {
+		header('Content-Type: application/json');
+		$id = isset($_POST['id']) ? (string)(int)$_POST['id'] : '0';
+		switch ($_POST["action"]) {
+		case 'ajax-deploy-run':
+			route_log('deploy run '.$id);
+			echo json_encode(deploy_trigger($id, 'manual', auth_user()));
+			break;
+		case 'ajax-deploy-rollback':
+			route_log('deploy rollback '.$id);
+			$rel = isset($_POST['release']) && preg_match('/^[0-9]{14}$/', (string)$_POST['release']) ? $_POST['release'] : '';
+			echo json_encode(deploy_trigger($id, 'rollback', auth_user(), $rel));
+			break;
+		case 'ajax-deploy-log':
+			$run = deploy_run_get(isset($_POST['run']) ? (int)$_POST['run'] : 0);
+			if (!$run) { echo json_encode(array('error' => 'No such run.')); break; }
+			list($text, $next) = deploy_run_log($run['id'], isset($_POST['offset']) ? (int)$_POST['offset'] : 0);
+			echo json_encode(array('status' => $run['status'], 'message' => $run['message'], 'text' => $text, 'next' => $next,
+			                       'release' => $run['release_name'], 'commit' => substr($run['commit_sha'], 0, 10)));
+			break;
+		case 'ajax-deploy-releases':
+			$d = deploy_get($id);
+			echo json_encode($d ? array('current' => $d['current_release'], 'releases' => deploy_releases($d)) : array('error' => 'No such deployment.'));
+			break;
+		case 'ajax-deploy-connect':
+			$d = deploy_get($id);
+			echo json_encode($d ? array('domain' => $d['domain'], 'public_key' => deploy_public_key($d), 'webhook_url' => deploy_webhook_url($d),
+			                            'webhook_secret' => $d['webhook_secret'], 'webhook_ready' => deploy_webhook_ready(),
+			                            'repo_url' => deploy_url_safe($d['repo_url']), 'ssh' => !preg_match('#^https?://#i', $d['repo_url']))
+			                     : array('error' => 'No such deployment.'));
+			break;
+		}
+		exit;
+	}
+
+	if (isset($_POST["action"]) && in_array($_POST["action"], array('ajax-health', 'ajax-health-run', 'ajax-health-dismiss', 'ajax-health-restore'), true)) {
+		header('Content-Type: application/json');
+		$err = '';
+		$id  = isset($_POST['id']) ? (string)$_POST['id'] : '';
+		if ($_POST["action"] === 'ajax-health-run') {
+			route_log('health run');
+			shell_exec('sudo '._PATH.'/bin/reqad health run --quiet > /dev/null 2>&1');
+		} elseif ($_POST["action"] === 'ajax-health-dismiss') {
+			$days = isset($_POST['days']) ? (int)$_POST['days'] : 7;
+			$r = health_dismiss($db, $id, $days > 0 ? min($days, 365) : 0, auth_user());
+			if (!$r['ok']) $err = $r['error'];
+		} elseif ($_POST["action"] === 'ajax-health-restore') {
+			$r = health_restore($db, $id);
+			if (!$r['ok']) $err = $r['error'];
+		}
+		echo json_encode(health_payload($db) + array('error' => $err));
+		exit;
+	}
+
 	if (isset($_POST["action"]) && $_POST["action"] == 'ajax-dashboard-data') {
 		header('Content-Type: application/json');
 		$cache_file = '../log/dashboard_data.cache';
@@ -2108,12 +2077,28 @@
         exit;
     }
 
-    // Run the whole queue (exim -qff). Returns whatever exim reported.
+    // Run the whole queue (exim -qff). Starts in the background and returns at
+    // once -- a big queue takes far longer than a web request may last. The page
+    // follows it with ajax-mq-runq-status.
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-runq') {
         header('Content-Type: application/json');
-        $out = mq_helper(array('runq'), $rc);
+        $out = trim(mq_helper(array('runq'), $rc));
         mq_cache_clear();
-        echo json_encode(array('ok' => true, 'log' => trim($out) !== '' ? trim($out) : 'Queue run started.'));
+        if($rc !== 0) { echo json_encode(array('error' => $out !== '' ? $out : 'Could not start the queue run.')); exit; }
+        $started = (strpos($out, 'started') === 0);
+        echo json_encode(array('ok' => true, 'started' => $started, 'running' => true,
+                               'runners' => $started ? (int)substr($out, 8) : 0));
+        exit;
+    }
+
+    // Is a background queue run still going, and how many messages are left.
+    // The queue changes under a run, so cached listings are dropped every poll.
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mq-runq-status') {
+        header('Content-Type: application/json');
+        $running = (trim(mq_helper(array('runq-status'), $rc)) === 'running');
+        $n = mq_count();
+        mq_cache_clear();
+        echo json_encode(array('ok' => true, 'running' => $running, 'total' => $n, 'max' => MQ_MAX_LIST));
         exit;
     }
 
@@ -2136,6 +2121,75 @@
     // written to the nginx access log, the browser history and any Referer sent
     // from the webmail page; single-use + 30s made that survivable, but a POST
     // body is not recorded in any of them.
+    /* Sudo mode: confirm the password (+ 2FA code) for sensitive changes for
+       the next auth-sudo-minutes. Used by templates/sudo-modal.php; failures
+       count as failed logins (auth_reauth). */
+    if(isset($_POST["action"]) && $_POST["action"] == 'ajax-sudo') {
+        header('Content-Type: application/json');
+        header('Cache-Control: no-store');
+        if(!auth_web_enabled()) { echo json_encode(array('ok' => true, 'left' => 86400)); exit; }
+        $sudo_s = auth_session_current();
+        $sudo_p = $sudo_s ? auth_principal_by_id($sudo_s['principal_id']) : null;
+        if(!$sudo_p) { echo json_encode(array('error' => 'Your session has ended. Please log in again.')); exit; }
+        $sudo_e = auth_reauth($sudo_p,
+                              isset($_POST['password']) && is_string($_POST['password']) ? substr($_POST['password'], 0, 256) : '',
+                              isset($_POST['code']) && is_string($_POST['code']) ? substr($_POST['code'], 0, 20) : '');
+        if($sudo_e !== '') { echo json_encode(array('error' => $sudo_e)); exit; }
+        $sudo_left = auth_sudo_grant();
+        auth_log_event('sudo', 'password'.((int)$sudo_p['totp_enabled'] === 1 ? ' + 2FA' : '').' confirmed for '.auth_cfg('auth-sudo-minutes').' minutes',
+                       (int)$sudo_p['id'], $sudo_p['username']);
+        echo json_encode(array('ok' => true, 'left' => $sudo_left));
+        exit;
+    }
+
+    /* Passkeys: add one (Security page, needs sudo mode) and confirm a change
+       with one instead of the password (sudo dialog). The ceremony is two
+       calls each: *-options hands out the challenge, the other checks the
+       browser's answer (app/auth/auth.php). */
+    if(isset($_POST["action"]) && in_array($_POST["action"], array('ajax-passkey-add-options', 'ajax-passkey-add',
+                                                                   'ajax-sudo-passkey-options', 'ajax-sudo-passkey'), true)) {
+        header('Content-Type: application/json');
+        header('Cache-Control: no-store');
+        $pk_s = auth_web_enabled() ? auth_session_current() : null;
+        $pk_p = $pk_s ? auth_principal_by_id($pk_s['principal_id']) : null;
+        if(!$pk_p) { echo json_encode(array('error' => 'Passkeys need the web login (reqad auth mode web).')); exit; }
+        if(auth_rp_id() === '') { echo json_encode(array('error' => 'Passkeys need the panel to be opened by its hostname, not its IP address.')); exit; }
+        if(!auth_passkeys_on()) { echo json_encode(array('error' => 'Passkeys are turned off (Settings > Security).')); exit; }
+        $pk_v = function ($k) { return isset($_POST[$k]) && is_string($_POST[$k]) ? auth_b64u_decode(substr($_POST[$k], 0, 16384)) : ''; };
+        switch($_POST["action"]) {
+        case 'ajax-passkey-add-options':
+            if(auth_sudo_left() <= 0) { echo json_encode(array('error' => 'Please confirm your password first.', 'sudo' => true)); exit; }
+            echo json_encode(auth_passkey_create_args($pk_p, $pk_s['id']));
+            exit;
+        case 'ajax-passkey-add':
+            if(auth_sudo_left() <= 0) { echo json_encode(array('error' => 'Please confirm your password first.', 'sudo' => true)); exit; }
+            $pk_e = auth_passkey_register($pk_p, $pk_s['id'], $pk_v('clientDataJSON'), $pk_v('attestationObject'),
+                                          isset($_POST['name']) && is_string($_POST['name']) ? substr($_POST['name'], 0, 120) : '');
+            if($pk_e !== '') { echo json_encode(array('error' => $pk_e)); exit; }
+            echo json_encode(array('ok' => true, 'msg' => msg_add('Passkey added. You can now log in with it - no password or code needed.', 'success')));
+            exit;
+        case 'ajax-sudo-passkey-options':
+            if(!auth_passkeys_list($pk_p['id'])) { echo json_encode(array('error' => 'You have no passkey yet.')); exit; }
+            echo json_encode(auth_passkey_get_args($pk_s['id'], 'passkey-sudo', $pk_p));
+            exit;
+        case 'ajax-sudo-passkey':
+            if(($pk_left = auth_ip_locked(auth_ip())) > 0) { echo json_encode(array('error' => 'Too many failed attempts. Try again later.')); exit; }
+            $pk_k = auth_passkey_verify($pk_s['id'], 'passkey-sudo', isset($_POST['id']) && is_string($_POST['id']) ? substr($_POST['id'], 0, 1400) : '',
+                                        $pk_v('clientDataJSON'), $pk_v('authenticatorData'), $pk_v('signature'), (int)$pk_p['id']);
+            if(is_string($pk_k)) {
+                auth_attempt_record(auth_ip(), $pk_p['username'], 'bad_passkey');
+                auth_log_event('reauth_fail', 'passkey: '.$pk_k, (int)$pk_p['id'], $pk_p['username']);
+                auth_after_failure(auth_ip(), $pk_p['username']);
+                echo json_encode(array('error' => $pk_k));
+                exit;
+            }
+            $pk_left = auth_sudo_grant();
+            auth_log_event('sudo', 'passkey "'.$pk_k['name'].'" confirmed for '.auth_cfg('auth-sudo-minutes').' minutes', (int)$pk_p['id'], $pk_p['username']);
+            echo json_encode(array('ok' => true, 'left' => $pk_left));
+            exit;
+        }
+    }
+
     if(isset($_POST["action"]) && $_POST["action"] == 'ajax-webmail-ticket' && isset($_POST["email"])) {
         header('Content-Type: application/json');
         if(!webmail_autologin_enabled()) { echo json_encode(array('error' => 'Webmail auto-login is not enabled.')); exit; }

@@ -33,7 +33,9 @@ if($domain=='' || !isset($domain) || $user=='' || !isset($user)) {
    	 	SSLCertificateChainFile /etc/letsencrypt/live/%DOMAIN%/chain.pem';
 		}
 
-        $file_contents = str_replace('%DOMAIN%', $domain, str_replace('%USER%', $user, str_replace('%CERTS%', $certs, $template_ssl)));
+        /* both blocks answer to the same names, or certbot cannot pair them for its redirect */
+        $names = template_server_names($domain, $account_aliases ?? null, !empty($has_email));
+        $file_contents = str_replace('%DOMAIN%', $domain, str_replace('%USER%', $user, str_replace('%CERTS%', $certs, str_replace('%NAMES%', $names, $template_ssl))));
 	    $tmpfname = tempnam("/tmp", "reqad");
     	error_log("tmpfname $tmpfname\n", 3, __DIR__.'/../../log/debug_log');
         file_put_contents($tmpfname, $file_contents);
@@ -60,6 +62,11 @@ if($errmsg=='') {
 	shell_exec('sudo cp '.__DIR__.'/default-template.html ~'.$user.'/public_html/index.php');
     shell_exec('sudo chown '.$user.':'.$user.' ~'.$user.'/public_html/index.php');
     shell_exec('sudo chmod a+x ~'.$user);
+    /* only the account and apache reach the docroot; with mod_php PHP runs as
+       apache, so it also writes the sessions/uploads in tmp/ and the PHP log
+       in logs/ (scripts/update/harden_account_perms.sh) */
+    shell_exec('sudo chgrp apache ~'.$user.'/public_html ~'.$user.'/tmp ~'.$user.'/logs');
+    shell_exec('sudo chmod 0750 ~'.$user.'/public_html && sudo chmod 0770 ~'.$user.'/tmp ~'.$user.'/logs');
 
     if($letsencrypt) {
 		$IP = trim(shell_exec("/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print \$2'} | awk -F/ {'print \$1'}"));
@@ -67,7 +74,7 @@ if($errmsg=='') {
 		$domain_www = false;
 		if(trim(shell_exec('dig +short a '.$domain))==$IP)
 			$domain_main = true;
-		if(trim(shell_exec('dig +short a www.'.$domain))==$IP)
+		if(strpos(' '.$names.' ', ' www.'.$domain.' ') !== false && trim(shell_exec('dig +short a www.'.$domain))==$IP)
 			$domain_www = true;
 
 		if($domain_main && $domain_www) {
@@ -78,6 +85,8 @@ if($errmsg=='') {
             $errmsg = "Error: Cannot obtain an Let's Encrypt certificate because domain $domain does not resolve to this server IP $IP.";
             error_log ($errmsg."\n", 3, __DIR__.'/../../log/debug_log');
         }
+		/* an https vhost certbot wrote to <domain>-le-ssl.conf goes back into <domain>.conf */
+		shell_exec('sudo '.__DIR__.'/../update/merge_le_ssl_vhosts.sh --quiet --domain='.escapeshellarg($domain).' >> '.__DIR__.'/../../log/debug_log 2>&1');
 	}
 
 } else {

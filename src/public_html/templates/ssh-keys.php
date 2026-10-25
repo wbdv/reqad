@@ -41,6 +41,16 @@
 	}
 
 	foreach($users as $user) {
+		// an account's file is read AS the account (app/functions/ssh.php), never by root
+		if($user !== 'root') {
+			$r = ssh_keys_list($user);
+			$parsed = array();
+			foreach($r['ok'] ? $r['data']['keys'] : array() as $k)
+				$parsed[] = ($k['options'] !== '' ? $k['options'].' ' : '').$k['type'].' '.$k['key'].($k['name'] !== '' ? ' '.$k['name'] : '');
+			if(!empty($parsed))
+				$ssh_keys[$user] = $parsed;
+			continue;
+		}
 		$keys_raw = trim(shell_exec('sudo cat ~'.$user.'/'.trim($authorized).' 2>/dev/null'));
 		if($keys_raw != '') {
 			$parsed = array();

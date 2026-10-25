@@ -25,7 +25,7 @@ foreach (mail_setting_keys($which) as $key => $def) {
 
 $r = mail_settings_apply($which, $posted);
 
-error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.$_SERVER['USER']
+error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.auth_user()
         .' save mail settings ['.$which.'] '.($r['error'] === '' ? 'ok' : 'FAILED')."\n", 3, '../log/route_log');
 
 /* Back to the tab the form was on. Whitelisted, because it is pasted into a

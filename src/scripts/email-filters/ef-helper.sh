@@ -16,6 +16,7 @@
 #   user-list     <email>
 #   user-folders  <email>
 #   user-get      <email>
+#   user-read     <email>                       (exit 3: home unknown, use user-get)
 #   user-get-all
 #   user-put      <email>                       < source
 #   user-delete   <email>
@@ -204,6 +205,21 @@ user_get_all() {
     done < "$USERS_FILE"
 }
 
+# One mailbox's personal script read straight from its home, like user-get-all
+# and without doveadm (two doveadm calls cost ~100ms; the account panel shows
+# the filters on every view). Exit 3 when the userdb gives no home, so the
+# caller falls back to user-get.
+user_read() {
+    valid_email "$1" || die "invalid address: $1"
+    [ -r "$USERS_FILE" ] || exit 3
+    local home
+    home=$(awk -F: -v u="$1" 'tolower($1) == u { print $6; exit }' "$USERS_FILE")
+    [ -n "$home" ] || exit 3
+    [ -f "$home/sieve/$SCRIPT_NAME.sieve" ] || exit 0
+    awk '{ a[NR] = $0 } END { n = NR; while (n > 0 && a[n] == "") n--;
+                              for (i = 1; i <= n; i++) print a[i] }' "$home/sieve/$SCRIPT_NAME.sieve"
+}
+
 user_put()    { valid_email "$1" || die "invalid address: $1"
                 doveadm sieve put -a -u "$1" "$SCRIPT_NAME" && echo "ok"; }
 user_delete() { valid_email "$1" || die "invalid address: $1"
@@ -219,6 +235,7 @@ case "$verb" in
     user-list)     [ $# -eq 1 ] || die "usage: user-list <email>";   user_list "$1" ;;
     user-folders)  [ $# -eq 1 ] || die "usage: user-folders <email>"; user_folders "$1" ;;
     user-get)      [ $# -eq 1 ] || die "usage: user-get <email>";    user_get "$1" ;;
+    user-read)     [ $# -eq 1 ] || die "usage: user-read <email>";   user_read "$1" ;;
     user-get-all)  [ $# -eq 0 ] || die "usage: user-get-all";        user_get_all ;;
     user-put)      [ $# -eq 1 ] || die "usage: user-put <email>";    user_put "$1" ;;
     user-delete)   [ $# -eq 1 ] || die "usage: user-delete <email>"; user_delete "$1" ;;

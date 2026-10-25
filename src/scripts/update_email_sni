@@ -1,6 +1,8 @@
 #!/opt/reqad/php-current/usr/bin/php -c/etc/reqad/php-fpm/php.ini
 <?php
 chdir("/usr/local/reqad/scripts/");
+/* exim (uid exim) and dovecot read what this writes */
+umask(0022);
 if(php_sapi_name() != "cli" || posix_getuid() != 0) {
     echo "You can only run this script as root from cli.\n";
     exit;
@@ -28,14 +30,18 @@ $db = new SQLite3('/usr/local/reqad/db/reqad.db');
 $dovecot_version = trim(shell_exec("dovecot --version 2>/dev/null | awk '{print \$1}'"));
 $is_dovecot24 = ($dovecot_version == '') ? true : version_compare($dovecot_version, '2.4', '>=');
 
+/* Dovecot reads the certificates when it starts: the file's time in a
+   comment makes sni.conf change when a certificate is renewed or reissued
+   under the same path, so the restart below picks the new one up. */
 $sni_block = function($name, $cert, $key) use ($is_dovecot24) {
+	$stamp = '# '.$name.' '.$cert.' '.(int)@filemtime($cert)."\n";
 	if($is_dovecot24) {
-		return "\n".'local_name '.$name.' {
+		return "\n".$stamp.'local_name '.$name.' {
   ssl_server_cert_file = '.$cert.'
   ssl_server_key_file = '.$key.'
 }'."\n";
 	}
-	return "\n".'local_name '.$name.' {
+	return "\n".$stamp.'local_name '.$name.' {
   ssl_cert = <'.$cert.'
   ssl_key = <'.$key.'
 }'."\n";
@@ -53,6 +59,10 @@ $sni_keys  = [];
 $get_cert_sans = function($cert_file, $key_file) {
 	// Fix permissions: cert world-readable, key readable by root+exim only
 	shell_exec("chmod a+r ".escapeshellarg($cert_file)." 2>/dev/null");
+	/* certbot makes a new lineage's folders 0700: exim and dovecot's login
+	   processes need to pass through them (the key itself stays 0640) */
+	if(preg_match('#^/etc/letsencrypt/live/([^/]+)/#', $cert_file, $le))
+		shell_exec("chmod 0755 ".escapeshellarg('/etc/letsencrypt/live/'.$le[1])." ".escapeshellarg('/etc/letsencrypt/archive/'.$le[1])." 2>/dev/null");
 	shell_exec("chown root:exim ".escapeshellarg($key_file)." 2>/dev/null; chmod 640 ".escapeshellarg($key_file)." 2>/dev/null");
 	// Parse SANs from cert (handles multi-domain and wildcard certs)
 	$out = shell_exec("openssl x509 -noout -text -in ".escapeshellarg($cert_file)." 2>/dev/null | grep -oP '(?<=DNS:)[^,\s]+'");
@@ -103,32 +113,46 @@ if($ssl_cert!='') {
 	shell_exec("if ! cmp -s $ssl_cert /etc/pki/tls/certs/exim.pem; then cat $ssl_cert > /etc/pki/tls/certs/exim.pem && cat $ssl_cert_key > /etc/pki/tls/private/exim.pem && systemctl restart exim ; fi");
 }
 
+/* The mail domains to serve: the main domain of each active account with
+   email, and the other userdomains lines of those accounts (addon sites with
+   mail, domain_mail_enable()), whose own vhost holds their certificate. */
+$mail_users = [];
+$mail_domains = [];
 $results = $db->query("SELECT * FROM accounts WHERE has_email=1");
 while ($row = $results->fetchArray()) {
 	if($row["status"]=='active') {
-		$d = $row["domain"];
-		if(!in_array($d, $userdomains)) {
-			echo "Domain $d not found in /etc/exim/userdomains\n";
-		} else {
-			// check if ssl exists
-			[$ssl_cert, $ssl_cert_key] = $get_ssl_from_domain($d);
-			if($ssl_cert!='') {
-				#echo $d."---------\n".$ssl_cert."\n".$ssl_cert_key."\n\n";
-				$sni .= $sni_block('mail.'.$d, $ssl_cert, $ssl_cert_key);
-				$sni .= $sni_block($d, $ssl_cert, $ssl_cert_key);
+		$mail_users[$row["user"]] = true;
+		$mail_domains[] = $row["domain"];
+	}
+}
+foreach(explode("\n", (string)shell_exec('cat /etc/exim/userdomains 2>/dev/null')) as $line) {
+	if(strpos($line, ':') === false) continue;
+	[$ld, $lu] = array_map('trim', explode(':', $line, 2));
+	if(isset($mail_users[$lu]) && preg_match('/^[a-z0-9.-]+$/i', $ld) && !in_array($ld, $mail_domains, true))
+		$mail_domains[] = $ld;
+}
+foreach ($mail_domains as $d) {
+	if(!in_array($d, $userdomains)) {
+		echo "Domain $d not found in /etc/exim/userdomains\n";
+	} else {
+		// check if ssl exists
+		[$ssl_cert, $ssl_cert_key] = $get_ssl_from_domain($d);
+		if($ssl_cert!='') {
+			#echo $d."---------\n".$ssl_cert."\n".$ssl_cert_key."\n\n";
+			$sni .= $sni_block('mail.'.$d, $ssl_cert, $ssl_cert_key);
+			$sni .= $sni_block($d, $ssl_cert, $ssl_cert_key);
 
-				$sans = $get_cert_sans($ssl_cert, $ssl_cert_key);
-				if(!empty($sans)) {
-					foreach($sans as $san) {
-						$sni_certs[$san] = $ssl_cert;
-						$sni_keys[$san]  = $ssl_cert_key;
-					}
-				} else {
-					$sni_certs[$d]         = $ssl_cert;
-					$sni_certs['mail.'.$d] = $ssl_cert;
-					$sni_keys[$d]          = $ssl_cert_key;
-					$sni_keys['mail.'.$d]  = $ssl_cert_key;
+			$sans = $get_cert_sans($ssl_cert, $ssl_cert_key);
+			if(!empty($sans)) {
+				foreach($sans as $san) {
+					$sni_certs[$san] = $ssl_cert;
+					$sni_keys[$san]  = $ssl_cert_key;
 				}
+			} else {
+				$sni_certs[$d]         = $ssl_cert;
+				$sni_certs['mail.'.$d] = $ssl_cert;
+				$sni_keys[$d]          = $ssl_cert_key;
+				$sni_keys['mail.'.$d]  = $ssl_cert_key;
 			}
 		}
 	}

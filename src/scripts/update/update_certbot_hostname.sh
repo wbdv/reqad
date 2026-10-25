@@ -17,12 +17,13 @@ if [ ! -f "$RENEWAL" ]; then
     exit 0
 fi
 
-# Determine authenticator/installer from template setting
-TEMPLATE=$(grep -oP '^template=\K.*' "$INI" | tr -d '[:space:]')
+# Authenticator/installer: the front web server of the template
+. /usr/local/reqad/scripts/web_caps.sh
+web_caps "$INI"
 
-case "$TEMPLATE" in
-    nginx_php-fpm)  PLUGIN="nginx"  ;;
-    apache_modphp)  PLUGIN="apache" ;;
+case "$WEB_FRONT" in
+    nginx)  PLUGIN="nginx"  ;;
+    httpd)  PLUGIN="apache" ;;
     *)
         echo "  Unknown template '${TEMPLATE}', skipping"
         exit 0

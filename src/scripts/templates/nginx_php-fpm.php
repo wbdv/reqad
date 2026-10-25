@@ -59,8 +59,8 @@ server {
    	root        /home/'.$user.'/public_html;
    	autoindex   off;
    	index       index.php index.html index.htm;
-   	include /etc/nginx/reqad-error-pages.conf;
-
+'.(is_file('/etc/nginx/reqad-error-pages.conf') ? '   	include /etc/nginx/reqad-error-pages.conf;
+' : '').'
     # Rocket-Nginx configuration
     # include rocket-nginx/conf.d/default.conf;
 
@@ -102,7 +102,10 @@ server {
             #NOTE: You should have "cgi.fix_pathinfo = 0;" in php.ini
             include         /etc/nginx/fastcgi_params;
             fastcgi_index   index.php;
-            fastcgi_param   SCRIPT_FILENAME     $document_root$fastcgi_script_name;
+            # the resolved path: a document root that is a symlink (Git deploys)
+            # switches releases without PHP mixing old and new files
+            fastcgi_param   SCRIPT_FILENAME     $realpath_root$fastcgi_script_name;
+            fastcgi_param   DOCUMENT_ROOT       $realpath_root;
             fastcgi_pass    php-fpm-'.$user.';
         }
 
@@ -154,19 +157,19 @@ if(!is_file($nginx_file)) {
 $phpfpm_file = '/etc/php-fpm.d/'.$domain.'.conf';
 $phpfpm_content = '['.$domain.']
 user = '.$user.'
-group = nginx
+group = '.$user.'
 listen = /run/php-fpm-'.$user.'.sock
 listen.owner = '.$user.'
 listen.group = nginx
 listen.allowed_clients = 127.0.0.1
 
-pm = dynamic
-pm.max_children = 200
-pm.start_servers = 10
-pm.min_spare_servers = 5
-pm.max_spare_servers = 50
-pm.process_idle_timeout = 1s;
-pm.max_requests = 1000
+; workers start with the first request and stop after 10 s idle, so a quiet
+; site holds no memory; 20 at once per site, a stuck script is killed at 300 s
+pm = ondemand
+pm.max_children = 20
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+request_terminate_timeout = 300s
 
 ping.path = /ping
 slowlog = /var/log/php-fpm/'.$domain.'-slow.log
@@ -197,13 +200,26 @@ if(!is_file($phpfpm_file)) {
 
 #file_put_contents('/etc/php-fpm.d/www.conf', '');
 if($errmsg=='') {
-	shell_exec('sudo systemctl restart nginx php-fpm >> '.__DIR__.'/../../log/debug_log 2>&1');
+	/* never take every site down for one vhost: test the config first, and
+	   reload (not restart) so a running nginx keeps serving while it loads */
+	if (strpos((string)shell_exec('sudo nginx -t 2>&1'), 'test is successful') !== false) {
+		shell_exec('sudo systemctl reload nginx >> '.__DIR__.'/../../log/debug_log 2>&1');
+	} else {
+		shell_exec('sudo mv '.escapeshellarg($nginx_file).' '.escapeshellarg($nginx_file.'.failed').' 2>&1');
+		$errmsg = 'Error: the new nginx vhost did not pass "nginx -t", so it was set aside as '.$nginx_file.'.failed - nginx keeps running.';
+		error_log($errmsg."\n", 3, __DIR__.'/../../log/debug_log');
+	}
+	shell_exec('sudo systemctl restart php-fpm >> '.__DIR__.'/../../log/debug_log 2>&1');
 	shell_exec('sudo su - '.$user.' -c "mkdir public_html logs tmp && ln -s public_html www"');
 	error_log ('sudo su - '.$user.' -c "mkdir public_html logs tmp && ln -s public_html www"'."\n", 3, __DIR__.'/../../log/debug_log');
 
 	shell_exec('sudo cp '.__DIR__.'/default-template.html ~'.$user.'/public_html/index.php');
 	shell_exec('sudo chown '.$user.':'.$user.' ~'.$user.'/public_html/index.php');
 	shell_exec('sudo chmod a+x ~'.$user);
+	/* only the account and nginx reach the docroot; tmp/ (sessions, uploads)
+	   and logs/ are the account's own (scripts/update/harden_account_perms.sh) */
+	shell_exec('sudo chgrp nginx ~'.$user.'/public_html && sudo chmod 0750 ~'.$user.'/public_html');
+	shell_exec('sudo chmod 0770 ~'.$user.'/tmp ~'.$user.'/logs');
 
     if($letsencrypt) {
         $IP = trim(shell_exec("/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print \$2'} | awk -F/ {'print \$1'}"));

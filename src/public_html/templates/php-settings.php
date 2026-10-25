@@ -155,7 +155,7 @@
 
 	$tab = (isset($_GET['tab']) && $_GET['tab'] === 'modules') ? 'modules' : 'settings';
 
-	$known_php_versions = ['7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
+	$known_php_versions = php_installable_versions();
 	$missing_php_versions = array_values(array_diff($known_php_versions, $php_versions));
 
 	include('templates/header.php');
@@ -233,11 +233,12 @@
 		</div></div></form>
 
 		<style>
-		#php-main-card { border: none; }
-		#php-main-card > .card-header { padding-bottom: 0; background: #f6f8fb; }
+		#php-main-card { border: none; box-shadow: none; background: transparent; }
+		#php-main-card > .card-header { padding-bottom: 0; background: transparent; border-bottom-color: #dee2e6; }
 		#php-tabs { border-bottom: 0; gap: 30px; }
 		#php-tabs .nav-link {
 			display: block;
+			transition: background-color .15s ease-in-out, color .15s ease-in-out;   /* the border goes at once: no ghost of it */
 			border: 1px solid transparent;
 /*			border-radius: 4px 4px 0 0; */
 			padding: 10px 20px !important;
@@ -249,8 +250,8 @@
 		}
 		#php-tabs .nav-link:hover { border-color: #dee2e6 #dee2e6 transparent; background: #475db41a; color: #354052; }
 		#php-tabs .nav-link.active { background: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #354052; font-weight: bold; }
-		#tab-settings { border: 1px solid; border-color: transparent #dee2e6 #dee2e6 #dee2e6; padding-left: 6px;  }
-		#tab-modules { border: 1px solid; border-color: transparent #dee2e6 #dee2e6 #dee2e6; padding-left: 0px;  }
+		#tab-settings { border: 1px solid; border-color: transparent #dee2e6 #dee2e6 #dee2e6; background: #fff; box-shadow: rgba(35,46,60,.04) 0 2px 4px 0; padding-left: 6px;  }
+		#tab-modules { border: 1px solid; border-color: transparent #dee2e6 #dee2e6 #dee2e6; background: #fff; box-shadow: rgba(35,46,60,.04) 0 2px 4px 0; padding-left: 0px;  }
 		#tab-modules > .card-body { padding: 10px; }
 		#tab-modules .table-hover tbody tr:hover td { background-color: #475db41a; }
 		</style>

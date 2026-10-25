@@ -2,8 +2,8 @@
 	/* File Manager — modal-xl, opened from the Accounts list "Files" action.
 	   Account-level browse / edit / upload / create / rename / chmod / delete for
 	   files under /home/<user>. Every filesystem op is served by an ajax-fm-*
-	   handler in modules/ajax.php (each shells `sudo -u <user>` and jails paths
-	   inside the home via fm_resolve() — see modules/functions.php). Endpoints:
+	   handler in modules/ajax.php, which calls app/functions/files.php (run as the
+	   account itself, paths kept inside its home). Endpoints:
 	     list   POST ajax-fm-list    {user,path}          -> {rows:[...]}
 	     read   POST ajax-fm-read    {user,path}          -> {content}
 	     save   POST ajax-fm-save    {user,path,content}
@@ -14,7 +14,9 @@
 	     delete POST ajax-fm-delete  {user,path}
 	     upload POST ajax-fm-upload  {user,path,files[]}   (multipart)
 	     download GET ajax-fm-download {user,path}         (streamed)
-	   Gated by the `filemanager` ini flag (feature_enabled / ajax_required_feature). */
+	   Gated by the `filemanager` ini flag (feature_enabled / ajax_required_feature).
+   "Compress and download" also needs `filemanager_compression` (default on). */
+	$fm_compress = feature_enabled($ini, 'filemanager_compression');
 ?>
 <!-- Reuse the CodeMirror that Advanced Config already vendors (dist/libs/codemirror). -->
 <link href="./dist/libs/codemirror/codemirror.min.css" rel="stylesheet">
@@ -149,10 +151,12 @@
             </div>
             <!-- selection toolbar (shown while selecting) -->
             <div class="btn-list d-none" id="fm-tools-select">
+              <?php if($fm_compress): ?>
               <button class="btn btn-primary" id="fm-compress" disabled>
                 <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2"/><path d="M7 11l5 5l5 -5"/><path d="M12 4l0 12"/></svg>
                 Compress and download<span id="fm-selcount"></span>
               </button>
+              <?php endif; ?>
               <button class="btn btn-outline-danger" id="fm-delete-selected" disabled>
                 <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M4 7l16 0"/><path d="M10 11l0 6"/><path d="M14 11l0 6"/><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12"/><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3"/></svg>
                 Delete<span id="fm-delcount"></span>
@@ -317,8 +321,8 @@ jQuery(document).ready(function () {
 	$('#modal-file-manager').appendTo(document.body);
 
 	/* All filesystem operations run server-side via the ajax-fm-* handlers
-	   (modules/ajax.php), each shelling `sudo -u <user>` and jailing paths inside
-	   /home/<user>. fmPost() is the shared JSON caller; the current directory's
+	   (modules/ajax.php -> app/functions/files.php, as the account, inside
+	   /home/<user>). fmPost() is the shared JSON caller; the current directory's
 	   rows are cached in FM_ROWS so click/dblclick handlers can look a row up. */
 	var FM_ROWS = [];
 

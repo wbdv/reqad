@@ -2,8 +2,15 @@
 # $1 = comma-separated domain list (e.g. example.com,www.example.com)
 # $2 = optional messages.db token: if given, post the outcome to the flash-message
 #      queue so the panel (accounts list) can show a toast when issuance finishes.
-sleep 30 && sudo certbot --non-interactive --nginx -d $1 >> ../log/debug_log 2>&1
+# certbot plugin = the front web server of the template
+. /usr/local/reqad/scripts/web_caps.sh
+web_caps
+PLUGIN=nginx; [ "$WEB_FRONT" = httpd ] && PLUGIN=apache
+sleep 30 && sudo certbot --non-interactive --"$PLUGIN" -d $1 >> ../log/debug_log 2>&1
 RC=$?
+# certbot's Apache plugin writes the https vhost of a site that had none to
+# <domain>-le-ssl.conf; Reqad keeps it in <domain>.conf
+[ "$PLUGIN" = apache ] && sudo /usr/local/reqad/scripts/update/merge_le_ssl_vhosts.sh --quiet --domain="${1%%,*}" >> /usr/local/reqad/log/debug_log 2>&1
 
 if [ -n "$2" ]; then
     DB=/usr/local/reqad/db/messages.db

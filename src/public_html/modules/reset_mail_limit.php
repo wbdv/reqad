@@ -18,7 +18,7 @@ $r = ($kind === '' && $domain === '')
 	? exim_limits_reset('', '')
 	: exim_limits_reset($kind, $domain);
 
-error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.$_SERVER['USER']
+error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.auth_user()
         .' reset mail limit ['.($domain !== '' ? $domain.'/'.$kind : 'all').'] '
         .($r['error'] === '' ? 'ok' : 'FAILED')."\n", 3, '../log/route_log');
 

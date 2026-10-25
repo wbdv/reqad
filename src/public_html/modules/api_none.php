@@ -40,3 +40,17 @@ function export_zone_records($domain) {
 function import_zone_records($domain, $records, &$error = null) {
 	return true;
 }
+/* No DNS provider: no zone holds anything. */
+function dns_rrset_get($name, $type) {
+	return null;
+}
+function dns_rrset_set($name, $type, $values) {
+	return '';
+}
+/* No DNS provider: no zones to edit. */
+function dns_zone_rrsets($zone) {
+	return null;
+}
+function dns_zone_put($zone, $name, $type, $ttl, $values) {
+	return 'Error: No DNS provider is set up on this server.';
+}

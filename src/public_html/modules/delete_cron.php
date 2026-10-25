@@ -55,7 +55,7 @@ if ($errmsg == '') {
         $successmsg = $cron_type === 'global'
             ? "Cron job successfully deleted."
             : "Cron job for user $cron_user successfully deleted.";
-        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " delete cron ($cron_type, user=$cron_user): $cron_line\n", 3, '../log/route_log');
+        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user() . " delete cron ($cron_type, user=$cron_user): $cron_line\n", 3, '../log/route_log');
     }
 }
 ?>

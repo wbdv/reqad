@@ -50,6 +50,11 @@ if ($errmsg == '' && $cron_cmd == '') {
 
 $schedule = "$cron_min $cron_hour $cron_dom $cron_mon $cron_dow";
 
+// plan limits for an account's own crontab (limit_allows: core allows all)
+if ($errmsg == '' && $cron_user !== 'root' && ($limit_err = limit_allows($cron_user, 'cron', array('line' => $cron_cmd))) !== '') {
+    $errmsg = 'Error: '.$limit_err;
+}
+
 if ($cron_user === 'root') {
     // root → /etc/crontab (includes user field in line)
     $line      = "$schedule root $cron_cmd";
@@ -65,7 +70,7 @@ if ($cron_user === 'root') {
     if ($errmsg == '') {
         shell_exec('echo ' . escapeshellarg($line) . ' | sudo tee --append ' . $cron_file . ' > /dev/null');
         $successmsg = "Cron job successfully added to /etc/crontab.";
-        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " create cron (global): $line\n", 3, '../log/route_log');
+        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user() . " create cron (global): $line\n", 3, '../log/route_log');
     }
 
 } else {
@@ -86,8 +91,10 @@ if ($cron_user === 'root') {
         // crontab with group/other bits set, so the job would never run.
         shell_exec('sudo chown ' . escapeshellarg($cron_user . ':' . $cron_user) . ' ' . escapeshellarg($cron_file));
         shell_exec('sudo chmod 600 ' . escapeshellarg($cron_file));
+        // jailed / SFTP-only accounts: SHELL= first, so the job runs in the sandbox
+        account_shell_cron_sync($cron_user);
         $successmsg = "Cron job successfully added for user $cron_user.";
-        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " create cron (user=$cron_user): $line\n", 3, '../log/route_log');
+        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user() . " create cron (user=$cron_user): $line\n", 3, '../log/route_log');
     }
 }
 ?>

@@ -397,6 +397,13 @@ jQuery(document).ready(function () {
 		});		
 	});
 
+	/* ?domain=<d> (the dashboard's Needs attention card): open its details at once */
+	var want = new URLSearchParams(window.location.search).get('domain');
+	if (want) {
+		var link = $('a[data-bs-target="#modal-info"]').filter(function () { return $(this).attr('data-bs-domain') === want; }).get(0);
+		if (link) link.click();
+	}
+
 	$("#modal-info").on('hide.bs.modal', function(event) {
 		$("#fixsettiings").prop('enabled', true);
 		$("#fixsettiings").html('Fix Email Settings');

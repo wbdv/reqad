@@ -15,7 +15,50 @@ define('REQAD_ROOT', realpath(__DIR__.'/..'));
 
 $prog = basename($argv[0]);
 
+/* Commands that add-ons (plugins) bring, from their cli.txt files:
+   "<command>  <summary>" per line. Read without loading the panel, so the help
+   and the completion list them; the command itself is in the plugin manifest. */
+function cli_plugin_list() {
+    $list = array();
+    foreach (glob(REQAD_ROOT.'/public_html/plugins/*/cli.txt') ?: array() as $f)
+        foreach (file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array() as $line)
+            if (preg_match('/^([a-z][a-z0-9-]*)\s+(\S.*)$/', trim($line), $m))
+                $list[$m[1]] = $m[2];
+    return $list;
+}
+
+/* Subcommands that add-ons add to core commands, from their cli-subs.txt
+   files: "<command> <sub> <arguments><TAB><summary>" per line, e.g.
+   "account suspend <account> [--reason=TEXT]<TAB>Suspend the account". Read
+   without loading the panel, for the help and the completion; the code is the
+   manifest's 'cli_subs' => array('<command>' => array('<sub>' => array(
+   'opts' => array(...), 'arg' => '', 'run' => fn($prog, $sub, $pos, $opts)))).
+   Returns command => sub => array(arguments, summary). */
+function cli_plugin_subs() {
+    $list = array();
+    foreach (glob(REQAD_ROOT.'/public_html/plugins/*/cli-subs.txt') ?: array() as $f)
+        foreach (file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: array() as $line)
+            if (preg_match('/^([a-z][a-z0-9-]*) ([a-z][a-z0-9-]*)([^\t]*)\t+(\S.*)$/', rtrim($line), $m))
+                $list[$m[1]][$m[2]] = array(trim($m[3]), $m[4]);
+    return $list;
+}
+
+/* The add-on subcommands of $cmd, for the end of its help. */
+function usage_plugin_subs($prog, $cmd) {
+    $subs = cli_plugin_subs()[$cmd] ?? array();
+    if (!$subs)
+        return;
+    $text = "\nFrom add-ons:\n";
+    foreach ($subs as $sub => $x)
+        $text .= "  {$prog} {$cmd} {$sub}".($x[0] !== '' ? " {$x[0]}" : '')."\n      {$x[1]}\n";
+    cli_help(rtrim($text, "\n"));
+    echo "\n";
+}
+
 function usage($prog) {
+    $addons = '';
+    foreach (cli_plugin_list() as $c => $summary)
+        $addons .= sprintf("  %-16s %s\n", $c, $summary);
     cli_help(<<<HELP
 !Reqad — the alternate hosting control panel.
 
@@ -29,9 +72,22 @@ Options:
 Commands:
   info             Show the web server and installed PHP versions
   account          List, show, create, edit and delete hosting accounts
-  db               List, create and delete MySQL databases, change passwords
+  db               List, create, delete and export MySQL databases, change passwords
   email            List, create, edit and delete mailboxes
-
+  auth             Panel login: web/basic mode, password, 2FA, sessions, blocked IPs
+  health           What needs attention: certificates, mail DNS, PHP versions, services...
+  api              REST API: turn it on or off, make and revoke access tokens
+  deploy           Git deployments: deploy a site from a branch, roll back, see the log
+  app              Node.js / Python apps: run a domain from a process, runtimes, logs
+  wordpress        WordPress sites: find them, versions and updates, update, dashboard login
+  backup           An account's backups: list them, what is in one, put files, a database or a mailbox back
+  stats            Visitor stats and bandwidth per site, counted from the web server logs
+  logs             A site's web server log, a day at a time: its requests and errors
+  resources        CPU, memory and processes of each account, the limits it reached
+  shelllog         Commands run by hosting accounts (SSH, terminal, cron, sites): on/off, list
+  dns              DNS cluster health, and the zones this server's sites need (dns zones)
+  mcp              AI assistants (MCP): turn on or off, tokens, the server they connect to
+{$addons}
 Run '{$prog} <command> --help' for the command's own options.
 
 HELP);
@@ -42,9 +98,15 @@ function usage_account($prog) {
 Usage: {$prog} account list
        {$prog} account show   <user>
        {$prog} account create <user> <domain> [--dns] [--letsencrypt] [--email] [--www]
-                                          [--quota=MB] [password option]
+                                          [--quota=MB] [--php=VERSION|off] [--shell=MODE] [--package=NAME]
+                                          [password option]
        {$prog} account edit   <user> [--password] [--php=VERSION[:fpm|mod_php]|off] [--email=on|off]
+                                          [--shell=full|jailed|none]
        {$prog} account delete <user> [--yes]
+       {$prog} account limits [<user>] [--cpu=%] [--memory=MB|G] [--processes=N] [--default|--none]
+                                          [--db-connections=N|default] [--sync-db]
+       {$prog} account can-create <user|-> <resource> [--domain=DOMAIN]
+       {$prog} account perms  <user> [--fix] [--keep-root]
 
 create:
   --dns             Create the DNS zone at the configured DNS provider
@@ -52,12 +114,53 @@ create:
   --email           Enable mail for the domain (exim, DKIM, MX/SPF/DMARC)
   --www             Add the www.<domain> alias
   --quota=MB        Disk quota (ignored when quotas are off)
+  --php=8.3         PHP version (default: the server's), off = no PHP (static
+                    site or app); with mod_php also 8.2:fpm
+  --shell=MODE      Shell access, see edit (default: Settings > Security)
+  --package=NAME    Hosting package (Reqad Hosting Pro; default: its default package)
 
 edit:
   --password        Set a new password (prompt, or --password-stdin)
-  --php=8.3         Switch PHP version; on Apache also 8.2:mod_php or 8.2:fpm
+  --php=8.3         Switch PHP version; with mod_php also 8.2:mod_php or 8.2:fpm
   --php=off         Disable PHP (pool removed, .php answers 403); a version re-enables it
   --email=on|off    Enable or disable mail for the domain
+  --shell=jailed    Shell access for SSH, cron and the web terminal: full (bash),
+                    jailed (sandbox: own home only) or none (SFTP only; cron
+                    jobs still run, jailed). New accounts get the default from
+                    Settings > Security unless create gets --shell too.
+
+limits:
+  CPU, memory and processes for the account's SSH, cron and web-terminal
+  sessions, all together; website PHP has its own pool settings.
+  without a user    The latest hits of all accounts
+  without options   Show the limits, what is in use now and recent hits
+  --cpu=150         CPU in percent, 100 = one core
+  --memory=2G       Memory (MB, or with G); at the cap the kernel kills the
+                    account's largest process
+  --processes=512   Processes at once; more are refused
+  --default         Back to the server defaults (follow them when they change)
+  --none            No limits for this account
+  Options left out keep their current value. Hits are logged in
+  /var/log/reqad/session-limits.log.
+  --db-connections=30  Connections at once for each of the account's MySQL
+                    users (0 = no limit, default = back to the server default
+                    of 30); MariaDB counts per database user, not per account
+  --sync-db         Apply the stored database limits again (e.g. after users
+                    were made in phpMyAdmin); without <user>: every account
+
+perms checks the owners and permissions of everything in the account's home:
+files of other users or of root, foreign groups, world-writable files,
+setuid files, wp-config.php / .env readable by everyone, ~/.ssh modes. Exit 0
+= fine, 3 = problems found. --fix repairs them (a restore script is written
+first, /var/lib/reqad/perms-restore-<user>-<time>.sh) and sets the top folders
+and the php-fpm pool by the permissions model; --keep-root leaves root's files
+alone (e.g. published files the site must not change).
+
+can-create asks the limits hook whether <user> may create one more <resource>
+(account with '-', database, mailbox, forwarder, autoresponder, alias, addon,
+cron, ssh_key): exit 0, or exit 1 with the reason. Core has no limits; hosting
+packages (a plugin) add them. For scripts, e.g. scripts/adddomain, which passes
+--domain so a hosting package can count blog.example.com as a subdomain.
 
 delete removes the vhost, mail, certificates, DNS zone, the home directory and
 every database and database user prefixed "<user>_". Databases assigned to
@@ -69,20 +172,30 @@ HELP);
 
 function usage_db($prog) {
     cli_help(<<<HELP
-Usage: {$prog} db list   [--account=USER]
-       {$prog} db create <account> <name> [--user=NAME] [password option]
+Usage: {$prog} db list   [--account=ACCOUNT]
+       {$prog} db create <account> <name> [--dbuser=NAME] [password option]
        {$prog} db delete <database> [--yes]
        {$prog} db passwd <dbuser> [password option]
        {$prog} db assign <database> <account>
        {$prog} db unassign <database>
+       {$prog} db export <database> [--output=FILE|-] [--no-gzip]
 
-Names are prefixed with the account: 'db create bob wp' creates database bob_wp
-and user bob_wp (or bob_<NAME> with --user=NAME). delete and passwd take the
-full name (bob_wp). Users left without any database are dropped with it.
+<account> is the hosting account the database belongs to, and it is the
+prefix of every name: 'db create bob wp' creates database bob_wp and database
+user bob_wp. --dbuser=NAME picks another user name, still prefixed, so
+'db create bob wp --dbuser=shop' creates database bob_wp and user bob_shop.
+delete and passwd take the full, prefixed name (bob_wp). Users left without
+any database are dropped with it.
 
 assign gives a database without an account prefix (imported, made in
 phpMyAdmin) to an account, so it is listed and backed up with it; unassign
 removes that again. Neither renames nor changes the database.
+
+export saves a database as SQL (mysqldump: one consistent snapshot, routines
+and triggers, no CREATE DATABASE, so it loads into a database of any name),
+gzip-compressed, as ./<database>-<date>.sql.gz unless --output names the file
+(made with mode 0600, never overwritten). --output=- writes it to standard
+output, for a pipe. --no-gzip = plain SQL.
 
 HELP);
     usage_common();
@@ -91,16 +204,456 @@ HELP);
 function usage_email($prog) {
     cli_help(<<<HELP
 Usage: {$prog} email list   [--domain=DOMAIN]
-       {$prog} email create <address> [password option]
-       {$prog} email edit   <address> [--password] [--enable|--disable]
+       {$prog} email create <address> [--size=SIZE] [password option]
+       {$prog} email edit   <address> [--password] [--enable|--disable] [--size=SIZE]
        {$prog} email delete <address> [--yes]
+       {$prog} email sites  <account>
+       {$prog} email site   <domain> on|off [--no-cert]
 
 edit:
   --password        Set a new password (prompt, or --password-stdin)
   --disable         Block IMAP/POP3/SMTP login (mail is still delivered)
   --enable          Allow login again
 
+create and edit:
+  --size=SIZE       Mailbox size, e.g. 500M or 2G; default = the account's
+                    default (Reqad Hosting Pro; see 'reqad package mail')
+
 delete also removes the mailbox's messages, filters and autoresponder.
+
+sites             The account's sites and their email: on, off, or missing (the
+                  site should have email but has none: 'site <domain> on' fixes it).
+site              Turn email on or off for an addon domain or subdomain (the main
+                  domain follows the account: 'account edit --email=on|off').
+                  New addon domains get email, new subdomains do not. off is
+                  refused while the site has mailboxes; its forwarders and
+                  autoresponders go, and when its DNS is at the DNS provider and
+                  its mail came here, its MX and DKIM records go and SPF says it
+                  sends no mail. A Let's Encrypt certificate is issued again to
+                  add or drop mail.<domain> (--no-cert: leave it as it is).
+
+HELP);
+    usage_common();
+}
+
+function usage_auth($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} auth status
+       {$prog} auth mode     [status|web|basic]
+       {$prog} auth passwd   [<user>] [password option]
+       {$prog} auth 2fa-reset [<user>]
+       {$prog} auth sessions
+       {$prog} auth logout   [<user>]
+       {$prog} auth unban    <ip>
+       {$prog} auth firewall [status|off]
+       {$prog} auth email-code [status|off|on]
+       {$prog} auth passkeys [<user>] [--remove-all]
+       {$prog} auth log      [--lines=N]
+
+mode            Show the current login mode (same as 'mode status').
+mode web        Replace the browser's password prompt on port 2087 with the login
+                page: sessions, two-factor authentication, lockouts and csf bans
+                for repeated failures. Existing nginx_auth passwords keep working.
+mode basic      Go back to nginx basic auth (same password).
+passwd          Set an admin password (creates the admin if missing; default user:
+                the only admin). Also updates nginx_auth. Logs out its sessions.
+2fa-reset       Turn two-factor authentication off - for a lost phone.
+logout          End every session (of <user>, or of everyone).
+unban           Unblock an IP that failed to log in too often (app lockout + csf).
+firewall off    Open port 2087 to every address again when the panel's IP allowlist
+                (Settings > Security) keeps you out. The saved list is kept.
+email-code off  Stop asking new devices for the emailed login code - when the code
+                does not arrive. It is asked for when 2FA is off and the panel can
+                send email (Settings > Security > New devices); 'on' restores that.
+passkeys        List the passkeys that can log in as <user>; --remove-all deletes
+                them (a lost or stolen device). The password keeps working.
+
+These are the way back in when you are locked out of the panel.
+
+HELP);
+    usage_common();
+}
+
+function usage_health($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} health list    [--account=ACCOUNT] [--all] [--json]
+       {$prog} health run     [--check=ID] [--quiet]
+       {$prog} health checks
+       {$prog} health dismiss <id> [--days=N|--forever]
+       {$prog} health restore <id>
+
+list            The problems the last run found, most severe first (the dashboard's
+                "Needs attention" card). --account: one account only ('-' = the
+                server's own); --all: dismissed ones too.
+run             Run the checks now and store the result. Cron runs them every 30
+                minutes; --check=ID runs one check (see 'checks').
+checks          The checks there are.
+dismiss         Hide a problem from the card and the list for 7 days, --days=N, or
+                --forever. It shows again when the time is up.
+restore         Show a dismissed problem again.
+
+HELP);
+    usage_common();
+}
+
+function usage_api($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} api status
+       {$prog} api on|off
+       {$prog} api tokens  [--all]
+       {$prog} api new     <name> [--account=ACCOUNT] [--write] [--delete] [--days=N] [--ip=LIST]
+       {$prog} api revoke  <id|name|prefix>
+       {$prog} api log     [--lines=N] [--token=ID]
+
+status          Whether the API answers, its address and the tokens in use.
+on / off        Turn the API on or off (https://<host>:2087/api/v1/). Off: every
+                request gets 403; the tokens are kept.
+tokens          The tokens: permissions, account, expiry, last use. --all: revoked
+                ones too.
+new             Make a token and print it - the only time it is shown. It can read
+                everything; --write adds create and change, --delete adds delete.
+                --account: it acts only on what that hosting account owns.
+                --days=N: expires after N days (default 90, 0 = never).
+                --ip: only from these addresses or networks (comma separated).
+revoke          Refuse the token from now on.
+log             The latest API calls (default 30).
+
+HELP);
+    usage_common();
+}
+
+function usage_wordpress($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} wordpress list   [--account=ACCOUNT]
+       {$prog} wordpress scan   <account>
+       {$prog} wordpress show   <site> [--refresh]
+       {$prog} wordpress update <site> [--core] [--plugins[=LIST]] [--themes[=LIST]]
+       {$prog} wordpress login  <site>
+       {$prog} wordpress auto   <site> [--core=off|minor|all] [--plugins=off|all|LIST]
+                                [--themes=off|all|LIST] [--when=daily|sun..sat] [--hour=H] [--wait=DAYS] [--off]
+       {$prog} wordpress auto-run [--quiet]
+       {$prog} wordpress cache  <site> [--pages=LIST] [--cookies=LIST]
+       {$prog} wordpress cache-refresh [--dry-run] [--quiet]
+
+<site> is the id from 'list', a domain, a domain with the folder of the
+install (example.com/blog) or an account name (its first site).
+
+scan            Look for the account's WordPress installs in the folders of all
+                its sites (main, addon domains, subdomains) and update the list.
+show            Version, core / plugin / theme updates, plugins and themes, read
+                live from the site. --refresh asks wordpress.org again first.
+update          Save the database to the account's ~/wp-backups/, then update
+                WordPress (--core), plugins and themes (all with an update, or
+                the comma-separated folder names given) and empty the caches.
+login           A one-time link to the site's dashboard (first administrator),
+                valid for 2 minutes.
+auto            Auto-updates of the site: without options it shows them; with
+                options it changes them (--core=minor: security and fix releases
+                only; LIST = comma-separated folder names; --when and --hour in
+                the server's time; --wait: days a release must be old; --off:
+                all off). Each run saves the database, leaves out updates that
+                need a newer PHP and puts plugins and themes back if the home
+                page stops opening.
+auto-run        Start the auto-update runs that are due (cron, every 15 minutes).
+cache           The site's own page cache rules: without options it shows them;
+                --pages = paths that are never cached (comma-separated, each
+                starts with /, * = any text), --cookies = cookie names that turn
+                the cache off (name* = every cookie starting so). A list given
+                replaces that list; --pages= (empty) clears it.
+cache-refresh   Write the page cache blocks of every site that has the cache on
+                again, from the current version and the sites' rules (update
+                script update_wp_cache_blocks.sh). One nginx reload at the end;
+                the old files are kept in /var/lib/reqad/vhost-backups/.
+
+HELP);
+}
+
+function usage_backup($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} backup list     <account> [--refresh]
+       {$prog} backup show     <account> <backup>
+       {$prog} backup restore  <account> <backup> --files=PATH|--database=NAME|--email=MAILBOX
+                               [--mode=MODE] [--name=NEW_DB] [--grant=DBUSER]
+       {$prog} backup restores <account>
+
+list            The account's backups, newest first: the nightly ones on the backup
+                server (remote-YYYYMMDD) and archives in /usr/local/reqad/backup
+                (local-YYYYMMDD-HHMM). --refresh asks the backup server again.
+show            What one backup holds: its databases, mailboxes and top folders.
+restore         Put something back, in the background (the same as the account panel's
+                Backups pages):
+                  --files=PATH      a file or folder of the home folder ('' = all of
+                                    it, without mail); --mode=missing (default: only
+                                    what is not there now), overwrite or replace
+                  --database=NAME   one of the backup's databases; --mode=tables
+                                    (default), replace, or new with --name (and
+                                    --grant to give it to a database user)
+                  --email=MAILBOX   one mailbox; --mode=missing (default) or replace
+                What is replaced is kept in the account's ~/backup-restores/.
+restores        The latest restores of the account and how they ended.
+
+HELP);
+}
+
+function usage_stats($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} stats show    <domain|all> [--period=30d|12m|YYYY-MM] [--account=USER]
+       {$prog} stats usage   [--month=YYYY-MM]
+       {$prog} stats collect [--domain=DOMAIN] [--quiet]
+       {$prog} stats geoip   [--update] [--auto] [--monthly=on|off] [--quiet]
+       {$prog} stats on|off
+
+show            Visitors, page views, requests, bandwidth and server errors of a
+                site per day (12m: per month), with its top pages, referring
+                sites, missing pages, bots and countries. 'all' = every site of
+                --account. Default period: the last 30 days.
+usage           Bandwidth and visitors of every account and its sites in a month,
+                busiest first (the same as Accounts > Bandwidth Usage).
+collect         Count what the sites' logs got since the last count. Cron runs it
+                every hour; a log seen for the first time is read with its
+                rotated copies of the last 60 days.
+geoip           The country database in use. --update downloads this month's
+                DB-IP Lite database now (CC BY 4.0); --auto does it only when the
+                monthly update is on and the file is older than this month (cron,
+                monthly); --monthly=on|off turns the monthly update on or off.
+on, off         Turn visitor stats on or off for the whole server (on by default).
+                Off: nothing is counted; what was counted stays.
+
+No visitor's address is stored: visitors are counted per day with a hash
+that cannot be turned back into an address.
+
+HELP);
+}
+
+function usage_shelllog($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} shelllog status
+       {$prog} shelllog on      [--days=7|30|90|180]
+       {$prog} shelllog off
+       {$prog} shelllog days    <7|30|90|180>
+       {$prog} shelllog accounts
+       {$prog} shelllog show    <account> [--day=YYYY-MM-DD] [--source=SRC] [--flagged] [--q=TEXT]
+                                          [--admin] [--page=N]
+       {$prog} shelllog collect [--quiet]
+
+status          On or off, the days kept, the last read of the audit log.
+on, off         Log every program the hosting accounts start (auditd rule
+                /etc/audit/rules.d/reqad-commands.rules). Off by default. Off
+                removes the rule; what was logged stays for the days kept.
+days            How long logged commands are kept (default 30).
+accounts        Every account: commands in 24 hours and 7 days, red flags, the
+                newest command (Accounts & Domains > Shell Activity).
+show            One account's commands, newest first. --source=ssh, terminal,
+                cron, web, account, login or admin; without it admin rows (root
+                or an admin running something as the account) are left out
+                unless --admin. --flagged: only red flags.
+collect         Read the audit log since the last time. Cron runs it every minute.
+
+Programs are logged by the kernel, also inside the jailed shell; shell
+builtins (cd, echo > file) start no program and are not seen. The same command
+again within the hour adds to one line (x N).
+
+HELP);
+}
+
+function usage_dns($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} dns status
+       {$prog} dns check [--wait=SECONDS] [--registry] [--quiet]
+       {$prog} dns zones [--all] [--plain] [--export=DIR]
+
+status          The DNS cluster as the last check saw it (Settings > DNS Settings >
+                Cluster): this server, each secondary, the registries.
+check           Check the cluster now and keep the result (cron runs it every
+                5 minutes): every zone's serial on each secondary, UDP and TCP
+                answers, a test change timed until each secondary has it
+                (--wait: how long to wait for it, default 45), zone transfers
+                and recursion refused to others; once an hour (or with
+                --registry) where each domain points at its registry.
+                Needs dnscluster=1 in server-software.ini and a secondary.
+zones           The DNS zones this server's sites need (main, addon and alias
+                domains, mail domains), for moving its DNS to another Reqad
+                server: import them there, then paste the list into "Zones
+                already here" when you make this server's DNS API key (the
+                list: --plain). Shows whether each zone is at this server's
+                DNS provider now.
+                --all: also the provider's zones no site uses. --plain: only
+                the zone names, one per line. --export=DIR: write each zone
+                that is at the provider as DIR/<zone>.db (zone files for DNS
+                Zones > Import zone). Works without dnscluster=1.
+
+HELP);
+}
+
+function usage_resources($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} resources usage     [--range=day|week|month]
+       {$prog} resources show      <account> [--range=day|week|month]
+       {$prog} resources processes <account>
+       {$prog} resources stop      <account> <pid> --start=TICKS
+       {$prog} resources collect   [--quiet]
+
+usage           CPU, memory and processes of every account and of the whole
+                server, busiest first (the same as Accounts > Resource Usage).
+                Default range: the last 24 hours.
+show            One account: its sessions (SSH, cron, terminal), each site's
+                PHP, email and background jobs, PHP workers per site, database
+                connections per user, the limits it reached and its limits.
+processes       What the account runs now, with CPU over the last minute.
+stop            Stop one of its processes (TERM, then KILL after 5 seconds);
+                --start is the start time 'processes --json' shows, so a pid
+                used again by another process is never hit.
+collect         One check of every account. Cron runs it every minute.
+
+CPU: 100% = one core. Memory: what the processes hold, a page several of
+them share counted once.
+
+HELP);
+}
+
+function usage_logs($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} logs site <domain> [--day=YYYY-MM-DD] [--filter=all|err|5xx] [--bots=no]
+                                  [--q=TEXT] [--ip=ADDRESS] [--offset=N]
+       {$prog} logs site <domain> --errors [--day=YYYY-MM-DD] [--all-lines]
+       {$prog} logs days <domain>
+
+site            The requests of a day in the site's web server log, newest first,
+                50 at a time (--offset=N skips the newest N): --filter=err only
+                4xx and 5xx answers, 5xx only server errors; --bots=no leaves bots
+                and scanners out; --q only requests with that text in the address,
+                IP, browser or referrer; --ip only that address. Default: today.
+                --errors: the web server's errors for the site that day, grouped
+                by kind (newest lines with --all-lines).
+days            The days the server still keeps (logrotate's daily copies).
+
+The log itself is /var/log/nginx/<domain>_log (Apache: /var/log/httpd/), rotated
+every day. Accounts see the same in their panel, Metrics > Logs.
+
+HELP);
+}
+
+function usage_deploy($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} deploy list     [--account=ACCOUNT]
+       {$prog} deploy show     <id|domain> [--secret]
+       {$prog} deploy create   <domain> --repo=URL [settings]
+       {$prog} deploy edit     <id|domain> [settings] [--new-secret]
+       {$prog} deploy run      <id|domain> [--wait]
+       {$prog} deploy rollback <id|domain> [--release=NAME] [--wait]
+       {$prog} deploy log      <id|domain> [--run=ID]
+       {$prog} deploy delete   <id|domain> [--yes]
+
+create          Deploy <domain> (a main or addon domain) from Git. It prints the
+                deploy key to give the repository read access to, and the
+                webhook address + secret for deploys on push. Nothing is changed
+                on the site until the first 'run'.
+run             Fetch the branch, build it as the account in a new release and
+                switch the site to it. --wait shows the output until it ends.
+rollback        Switch back to the release before the current one, or --release.
+log             The output of the last run (or --run=ID).
+delete          Stop deploying. The site keeps running from its last release.
+
+Settings (create and edit):
+  --repo=URL        https://host/you/site.git or git@host:you/site.git
+  --branch=NAME     the branch to deploy (default main)
+  --dir=PATH        the folder in the repository the web serves (default: its root)
+  --build=COMMANDS  run in the new release, as the account; e.g.
+                    "composer install --no-dev" or "npm ci && npm run build"
+  --shared=LIST     paths kept between releases, comma separated; end folders with /
+                    e.g. ".env,storage/,wp-content/uploads/"
+  --keep=N          releases kept for rolling back (default 5)
+  --check=PATH      after the switch, this page must answer 2xx/3xx or the deploy
+                    goes back to the previous release (e.g. /)
+  --auto=on|off     deploy when the webhook reports a push (default on)
+
+HELP);
+    usage_common();
+}
+
+function usage_app($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} app list      [--account=ACCOUNT]
+       {$prog} app show      <id|domain>
+       {$prog} app create    <domain> --runtime=node:24|python:3.12 [--start=CMD] [settings]
+       {$prog} app edit      <id|domain> [settings]
+       {$prog} app start|stop|restart <id|domain>
+       {$prog} app logs      <id|domain> [--lines=N]
+       {$prog} app env       <id|domain> [--file=PATH]
+       {$prog} app install   <id|domain> [--wait]
+       {$prog} app detect    <domain> [--dir=PATH] [--runtime=node|python]
+       {$prog} app delete    <id|domain> [--yes]
+       {$prog} app runtimes  [--available]
+       {$prog} app runtime   install|update|remove node <major> | python <3.x>
+
+create          Serve <domain> (a main or addon domain) from a process of the account:
+                the start command runs in the app folder with PORT and HOST set, and
+                nginx proxies the domain to it (websockets too). PHP is off for the
+                domain until the app is deleted. The app restarts after every Git
+                deploy of the domain.
+env             Print the app's environment file, or replace it with --file (KEY=value
+                lines) and restart the app.
+install         Install the app's packages as the account, in the background, then
+                restart it. Python: its own .venv (made again when the app's Python
+                version changed), requirements.txt, else pyproject.toml, else
+                setup.py, plus the server the start command names (gunicorn,
+                uvicorn...). Node.js: npm ci (or npm install), then npm run build if
+                package.json has a build script. --wait: follow the output.
+detect          Look at the code (as the account; nothing runs) and print the start
+                command it needs: Django, Flask, FastAPI and other Python apps,
+                Next.js, Nuxt, SvelteKit, NestJS, package.json's start script... The
+                folder: --dir, else the app's, else the Git deployment's current
+                release, else apps/<domain>/app. --runtime: that kind's commands first.
+runtimes        Installed Node.js and Python versions; --available: Node.js majors
+                that can be installed.
+runtime         Install a Node.js major (official build, checksum verified) or a
+                Python version (OS packages). update restarts the apps using it.
+
+Settings (create and edit):
+  --runtime=KIND:VERSION  node:24, node:22, python:3.12, ...
+  --start=CMD             e.g. "node server.js", "npm start",
+                          ".venv/bin/gunicorn -b 127.0.0.1:\$PORT app:app" (see app detect;
+                          required, except for a Git deployment with no release yet:
+                          the first deploy finds it)
+  --dir=PATH              the app folder in the account's home (default: the Git
+                          deployment's current release, else apps/<domain>/app)
+  --static=on|off         nginx serves files that exist in the document root first
+  --memory=MB             memory limit (default 512)
+
+HELP);
+    usage_common();
+}
+
+function usage_mcp($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} mcp status
+       {$prog} mcp on|off
+       {$prog} mcp tokens  [--all]
+       {$prog} mcp new     <name> [--account=ACCOUNT] [--write] [--delete] [--days=N] [--ip=LIST]
+       {$prog} mcp revoke  <id|name|prefix>
+       {$prog} mcp log     [--lines=N] [--token=ID]
+       {$prog} mcp tools   [--token-file=PATH]
+       {$prog} mcp serve   --token-file=PATH
+
+AI assistants (Claude, Cursor and other MCP clients) manage this server with
+the same operations as the REST API. The assistant logs in over SSH as root
+and runs 'reqad mcp serve'; the token decides what it may do.
+
+status          Whether AI access is on, and the tokens in use.
+on / off        Turn AI access on or off. Off: assistants cannot connect, running
+                sessions stop at their next call; the tokens are kept.
+tokens          The AI access tokens. --all: revoked ones too.
+new             Make a token and print the settings for the assistant. It can read
+                everything; --write adds create and change (accounts, databases,
+                mailboxes, restarts, deploys), --delete adds delete - every delete
+                still needs a second, confirmed call. --account: only what that
+                hosting account owns. --days=N: expires after N days (default 30,
+                at most 90). --ip: only from these SSH client addresses.
+                The token is saved in /var/lib/reqad/mcp/<id>.token (root only).
+revoke          Refuse the token from now on, also in running sessions.
+log             The latest tool calls (default 30).
+tools           The tools assistants get; with --token-file only that token's.
+serve           Speak MCP on stdin/stdout (what the assistant runs over SSH).
 
 HELP);
     usage_common();
@@ -117,6 +670,9 @@ Password option (passwords are never taken as an argument):
 Common:
   --json            Print the result as JSON
   -y, --yes         Do not ask for confirmation (required for delete without a terminal)
+  --user=ACCOUNT    Act as this hosting account: only its own databases, mailboxes and
+                    settings (what account-level access - API tokens, the account
+                    panel - will be allowed). Admin-only commands are refused.
 
 HELP);
 }
@@ -132,6 +688,18 @@ function find_bin($name, $fallback = '') {
     return '';
 }
 
+/* Full version (e.g. 7.4.33) of an installed PHP: the CLI binary, else php-fpm.
+   -n skips php.ini and extensions, so each call stays fast. */
+function php_full_version($pv, $default) {
+    $root = ($pv === $default) ? '/usr' : '/opt/remi/php'.str_replace('.', '', $pv).'/root/usr';
+    foreach (array($root.'/bin/php', $root.'/sbin/php-fpm') as $bin) {
+        if (!is_executable($bin)) continue;
+        $raw = (string)shell_exec(escapeshellarg($bin).' -n -v 2>/dev/null');
+        if (preg_match('#^PHP (\d+\.\d+\.\d+\S*)#', $raw, $m)) return $m[1];
+    }
+    return $pv;
+}
+
 function show_info() {
     $ini = parse_ini_file(REQAD_ROOT.'/etc/server-software.ini');
     if ($ini === false) {
@@ -145,12 +713,14 @@ function show_info() {
     $os  = ($osr && !empty($osr['PRETTY_NAME'])) ? $osr['PRETTY_NAME'] : 'unknown';
     echo "OS:          {$os}\n";
 
-    $template  = trim($ini['template'] ?? '');
-    $is_apache = (substr($template, 0, 7) == 'apache_');
+    // info runs before the panel bootstrap; functions.php loads on its own
+    require_once REQAD_ROOT.'/public_html/modules/functions.php';
+    $template = trim($ini['template'] ?? '');
+    $modphp   = (php_mode($ini) === 'modphp');
 
     // Web server type follows the configured template; the version comes from
     // the running binary (-v writes to stderr, hence the 2>&1).
-    if ($is_apache) {
+    if (web_front($ini) === 'httpd') {
         $server = 'Apache';
         $bin    = find_bin('httpd', '/usr/sbin/httpd');
         $raw    = $bin ? shell_exec(escapeshellarg($bin).' -v 2>&1') : '';
@@ -177,10 +747,10 @@ function show_info() {
     foreach ($php_versions as $pv) {
         // Under nginx everything runs via php-fpm; under apache the default
         // version is served by mod_php, the rest via php-fpm.
-        $handler = (!$is_apache || $pv != $default) ? 'php-fpm' : 'mod_php';
+        $handler = (!$modphp || $pv != $default) ? 'php-fpm' : 'mod_php';
 
         $tag = ($pv == $default) ? '  (default)' : '';
-        printf("  %-5s %-8s %s\n", $pv, $handler, $tag);
+        printf("  %-8s %-8s %s\n", php_full_version($pv, $default), $handler, $tag);
     }
 }
 
@@ -221,7 +791,7 @@ function cli_parse(array $args) {
 
 /* Reject options the subcommand does not know, so a typo is not silently ignored. */
 function cli_allow(array $opts, array $allowed) {
-    $allowed = array_merge($allowed, array('json', 'help'));
+    $allowed = array_merge($allowed, array('json', 'help', 'user'));
     foreach (array_keys($opts) as $k)
         if (!in_array($k, $allowed, true))
             cli_die("unknown option '--$k'");
@@ -309,8 +879,8 @@ function cli_colors() {
 function cli_white($s) { return cli_colors() ? "\033[97m".$s."\033[0m" : $s; }
 function cli_grey($s)  { return cli_colors() ? "\033[90m".$s."\033[0m" : $s; }
 
-/* Print help text: headings (a line ending in ':', the "Usage:" label, or a
-   line marked with a leading '!') in white, descriptions and prose in grey.
+/* Print help text: headings (a line ending in ':' with no two-space column
+   gap, the "Usage:" label, or a line marked with a leading '!') in white, descriptions and prose in grey.
    The usage block itself stays plain so the syntax stands out. */
 function cli_help($text) {
     $in_usage = false;
@@ -324,10 +894,11 @@ function cli_help($text) {
             echo cli_white('Usage:').substr($line, 6);
         } elseif ($in_usage)
             echo $line;
-        elseif ($line[0] !== ' ' && substr($line, -1) === ':')
-            echo cli_white($line);
-        elseif (preg_match('/^(\s+\S.*?)(\s{2,})(\S.*)$/', $line, $m))
-            echo $m[1].$m[2].cli_grey($m[3]);   // "  --opt      description"
+        elseif ($line[0] !== ' ' && substr($line, -1) === ':' && strpos($line, '  ') === false
+                && strlen($line) <= 64 && strpos($line, '. ') === false)
+            echo cli_white($line);              // "create:" - a short heading, not a sentence
+        elseif (preg_match('/^(\s*\S.*?)(\s{2,})(\S.*)$/', $line, $m))
+            echo $m[1].$m[2].cli_grey($m[3]);   // "  --opt      description" or "mode web    description"
         else
             echo cli_grey($line);               // prose paragraph
     }
@@ -335,7 +906,8 @@ function cli_help($text) {
 
 /* Display width, so box borders line up with multibyte text. */
 function cli_width($s) {
-    return function_exists('mb_strwidth') ? mb_strwidth((string)$s, 'UTF-8') : strlen((string)$s);
+    $s = preg_replace('/\033\[[0-9;]*m/', '', (string)$s);   // colour codes take no room
+    return function_exists('mb_strwidth') ? mb_strwidth($s, 'UTF-8') : strlen($s);
 }
 
 /* A box-drawn table (same style as scripts/scan_for_wordpress); $cols maps
@@ -403,23 +975,145 @@ function cli_spec() {
         'account' => array(
             'list'   => array('opts' => array(),                                                                          'arg' => ''),
             'show'   => array('opts' => array(),                                                                          'arg' => 'account'),
-            'create' => array('opts' => array_merge($pw, array('dns', 'letsencrypt', 'email', 'www', 'quota')),            'arg' => ''),
-            'edit'   => array('opts' => array_merge($pw, array('php', 'email')),                                          'arg' => 'account'),
+            'create' => array('opts' => array_merge($pw, array('dns', 'letsencrypt', 'email', 'www', 'quota', 'php', 'shell', 'package')), 'arg' => ''),
+            'edit'   => array('opts' => array_merge($pw, array('php', 'email', 'shell')),                                 'arg' => 'account'),
             'delete' => array('opts' => array('yes'),                                                                     'arg' => 'account'),
+            'limits' => array('opts' => array('cpu', 'memory', 'processes', 'default', 'none', 'db-connections', 'sync-db', 'quiet'), 'arg' => 'account'),
+            'can-create' => array('opts' => array('domain'),                                                           'arg' => 'account'),
+            'perms'  => array('opts' => array('fix', 'keep-root', 'quiet'),                                               'arg' => 'account'),
         ),
         'db' => array(
             'list'   => array('opts' => array('account'),                                                                 'arg' => ''),
-            'create' => array('opts' => array_merge($pw, array('user')),                                                  'arg' => 'account'),
+            'create' => array('opts' => array_merge($pw, array('dbuser')),                                                'arg' => 'account'),
             'delete' => array('opts' => array('yes'),                                                                     'arg' => 'database'),
             'passwd' => array('opts' => $pw,                                                                              'arg' => 'dbuser'),
             'assign'   => array('opts' => array(),                                                                        'arg' => 'database'),
             'unassign' => array('opts' => array(),                                                                        'arg' => 'database'),
+            'export'   => array('opts' => array('output', 'no-gzip'),                                                     'arg' => 'database'),
+        ),
+        'auth' => array(
+            'status'    => array('opts' => array(),                                                                       'arg' => ''),
+            'mode'      => array('opts' => array(),                                                                       'arg' => 'authmode'),
+            'passwd'    => array('opts' => $pw,                                                                           'arg' => 'admin'),
+            '2fa-reset' => array('opts' => array(),                                                                       'arg' => 'admin'),
+            'sessions'  => array('opts' => array(),                                                                       'arg' => ''),
+            'logout'    => array('opts' => array(),                                                                       'arg' => 'admin'),
+            'unban'     => array('opts' => array(),                                                                       'arg' => ''),
+            'firewall'  => array('opts' => array(),                                                                       'arg' => 'fwop'),
+            'email-code' => array('opts' => array(),                                                                      'arg' => 'codeop'),
+            'passkeys'  => array('opts' => array('remove-all'),                                                           'arg' => 'admin'),
+            'log'       => array('opts' => array('lines'),                                                                'arg' => ''),
+        ),
+        'health' => array(
+            'list'    => array('opts' => array('account', 'all'),                                                         'arg' => ''),
+            'run'     => array('opts' => array('check', 'quiet'),                                                         'arg' => ''),
+            'checks'  => array('opts' => array(),                                                                         'arg' => ''),
+            'dismiss' => array('opts' => array('days', 'forever'),                                                        'arg' => 'healthitem'),
+            'restore' => array('opts' => array(),                                                                         'arg' => 'healthitem'),
+        ),
+        'api' => array(
+            'status' => array('opts' => array(),                                                                          'arg' => ''),
+            'on'     => array('opts' => array(),                                                                          'arg' => ''),
+            'off'    => array('opts' => array(),                                                                          'arg' => ''),
+            'tokens' => array('opts' => array('all'),                                                                     'arg' => ''),
+            'new'    => array('opts' => array('account', 'write', 'delete', 'days', 'ip'),                                'arg' => ''),
+            'revoke' => array('opts' => array(),                                                                          'arg' => 'apitoken'),
+            'log'    => array('opts' => array('lines', 'token'),                                                          'arg' => ''),
+        ),
+        'mcp' => array(
+            'status' => array('opts' => array(),                                                                          'arg' => ''),
+            'on'     => array('opts' => array(),                                                                          'arg' => ''),
+            'off'    => array('opts' => array(),                                                                          'arg' => ''),
+            'tokens' => array('opts' => array('all'),                                                                     'arg' => ''),
+            'new'    => array('opts' => array('account', 'write', 'delete', 'days', 'ip'),                                'arg' => ''),
+            'revoke' => array('opts' => array(),                                                                          'arg' => 'apitoken'),
+            'log'    => array('opts' => array('lines', 'token'),                                                          'arg' => ''),
+            'tools'  => array('opts' => array('token-file'),                                                              'arg' => ''),
+            'serve'  => array('opts' => array('token-file'),                                                              'arg' => ''),
+        ),
+        'deploy' => array(
+            'list'     => array('opts' => array('account'),                                                               'arg' => ''),
+            'show'     => array('opts' => array('secret'),                                                                'arg' => 'deployment'),
+            'create'   => array('opts' => array('repo', 'branch', 'dir', 'build', 'shared', 'keep', 'check', 'auto'),     'arg' => 'domain'),
+            'edit'     => array('opts' => array('repo', 'branch', 'dir', 'build', 'shared', 'keep', 'check', 'auto', 'new-secret'), 'arg' => 'deployment'),
+            'run'      => array('opts' => array('wait'),                                                                  'arg' => 'deployment'),
+            'rollback' => array('opts' => array('release', 'wait'),                                                       'arg' => 'deployment'),
+            'log'      => array('opts' => array('run'),                                                                   'arg' => 'deployment'),
+            'delete'   => array('opts' => array('yes'),                                                                   'arg' => 'deployment'),
+        ),
+        'app' => array(
+            'list'     => array('opts' => array('account'),                                                               'arg' => ''),
+            'show'     => array('opts' => array(),                                                                        'arg' => 'app'),
+            'create'   => array('opts' => array('runtime', 'start', 'dir', 'static', 'memory', 'no-start'),               'arg' => 'domain'),
+            'edit'     => array('opts' => array('runtime', 'start', 'dir', 'static', 'memory'),                           'arg' => 'app'),
+            'start'    => array('opts' => array(),                                                                        'arg' => 'app'),
+            'stop'     => array('opts' => array(),                                                                        'arg' => 'app'),
+            'restart'  => array('opts' => array(),                                                                        'arg' => 'app'),
+            'logs'     => array('opts' => array('lines'),                                                                 'arg' => 'app'),
+            'env'      => array('opts' => array('file'),                                                                  'arg' => 'app'),
+            'install'  => array('opts' => array('wait'),                                                                  'arg' => 'app'),
+            'detect'   => array('opts' => array('dir', 'runtime'),                                                        'arg' => 'domain'),
+            'delete'   => array('opts' => array('yes'),                                                                   'arg' => 'app'),
+            'runtimes' => array('opts' => array('available'),                                                             'arg' => ''),
+            'runtime'  => array('opts' => array(),                                                                        'arg' => 'runtimeop'),
+        ),
+        'wordpress' => array(
+            'list'   => array('opts' => array('account'),                                                                 'arg' => ''),
+            'scan'   => array('opts' => array(),                                                                          'arg' => 'account'),
+            'show'   => array('opts' => array('refresh'),                                                                 'arg' => 'wpsite'),
+            'update' => array('opts' => array('core', 'plugins', 'themes'),                                               'arg' => 'wpsite'),
+            'login'  => array('opts' => array(),                                                                          'arg' => 'wpsite'),
+            'auto'   => array('opts' => array('core', 'plugins', 'themes', 'when', 'hour', 'wait', 'off'),                       'arg' => 'wpsite'),
+            'auto-run' => array('opts' => array('quiet'),                                                                 'arg' => ''),
+            'cache'    => array('opts' => array('pages', 'cookies'),                                                       'arg' => 'wpsite'),
+            'cache-refresh' => array('opts' => array('quiet', 'dry-run'),                                                            'arg' => ''),
+        ),
+        'backup' => array(
+            'list'     => array('opts' => array('refresh'),                                                         'arg' => 'account'),
+            'show'     => array('opts' => array(),                                                                  'arg' => 'account'),
+            'restore'  => array('opts' => array('files', 'database', 'email', 'mode', 'name', 'grant'),             'arg' => 'account'),
+            'restores' => array('opts' => array(),                                                                  'arg' => 'account'),
+        ),
+        'logs' => array(
+            'site'    => array('opts' => array('day', 'filter', 'bots', 'q', 'ip', 'offset', 'errors', 'all-lines'),           'arg' => 'domain'),
+            'days'    => array('opts' => array(),                                                                     'arg' => 'domain'),
+        ),
+        'resources' => array(
+            'usage'     => array('opts' => array('range'),                                                          'arg' => ''),
+            'show'      => array('opts' => array('range'),                                                          'arg' => 'account'),
+            'processes' => array('opts' => array(),                                                                 'arg' => 'account'),
+            'stop'      => array('opts' => array('start'),                                                          'arg' => 'account'),
+            'collect'   => array('opts' => array('quiet'),                                                          'arg' => ''),
+        ),
+        'dns' => array(
+            'status'   => array('opts' => array(),                                                                  'arg' => ''),
+            'check'    => array('opts' => array('wait', 'registry', 'quiet'),                                       'arg' => ''),
+            'zones'    => array('opts' => array('all', 'plain', 'export'),                                          'arg' => ''),
+        ),
+        'shelllog' => array(
+            'status'   => array('opts' => array(),                                                                  'arg' => ''),
+            'on'       => array('opts' => array('days'),                                                            'arg' => ''),
+            'off'      => array('opts' => array(),                                                                  'arg' => ''),
+            'days'     => array('opts' => array(),                                                                  'arg' => ''),
+            'accounts' => array('opts' => array(),                                                                  'arg' => ''),
+            'show'     => array('opts' => array('day', 'source', 'flagged', 'q', 'admin', 'page'),                  'arg' => 'account'),
+            'collect'  => array('opts' => array('quiet'),                                                           'arg' => ''),
+        ),
+        'stats' => array(
+            'show'    => array('opts' => array('period', 'account'),                                                  'arg' => 'domain'),
+            'usage'   => array('opts' => array('month'),                                                              'arg' => ''),
+            'collect' => array('opts' => array('domain', 'quiet'),                                                    'arg' => ''),
+            'geoip'   => array('opts' => array('update', 'auto', 'monthly', 'quiet'),                                 'arg' => ''),
+            'on'      => array('opts' => array(),                                                                     'arg' => ''),
+            'off'     => array('opts' => array(),                                                                     'arg' => ''),
         ),
         'email' => array(
             'list'   => array('opts' => array('domain'),                                                                  'arg' => ''),
-            'create' => array('opts' => $pw,                                                                              'arg' => ''),
-            'edit'   => array('opts' => array_merge($pw, array('enable', 'disable')),                                     'arg' => 'mailbox'),
+            'create' => array('opts' => array_merge($pw, array('size')),                                                  'arg' => ''),
+            'edit'   => array('opts' => array_merge($pw, array('enable', 'disable', 'size')),                             'arg' => 'mailbox'),
             'delete' => array('opts' => array('yes'),                                                                     'arg' => 'mailbox'),
+            'sites'  => array('opts' => array(),                                                                          'arg' => 'account'),
+            'site'   => array('opts' => array('no-cert'),                                                                 'arg' => ''),
         ),
     );
 }
@@ -457,16 +1151,17 @@ function cmd_complete(array $argv) {
        splits --opt=value, so $prev is the option name). */
     switch ($prev) {
     case '--account': $out = complete_values('account'); break;
+    case '--user':    $out = complete_values('account'); break;
     case '--domain':  $out = complete_values('domain');  break;
     case '--email':   $out = ($cmd === 'account') ? array('on', 'off') : array(); break;
     case '--php':     $out = complete_php();            break;
     }
 
     if (!$out && $cword <= 1)
-        $out = array_merge(array_keys($spec), array('info', '--help', '--version'));
+        $out = array_merge(array_keys($spec), array_keys(cli_plugin_list()), array('info', '--help', '--version'));
     elseif (!$out && isset($spec[$cmd])) {
         if ($cword == 2)
-            $out = array_keys($spec[$cmd]);
+            $out = array_merge(array_keys($spec[$cmd]), array_keys(cli_plugin_subs()[$cmd] ?? array()));
         elseif (isset($spec[$cmd][$sub])) {
             if (substr($cur, 0, 1) === '-')
                 foreach (array_merge($spec[$cmd][$sub]['opts'], array('json')) as $o)
@@ -496,15 +1191,103 @@ function complete_php() {
    out of the panel db (world-readable, so this also works for a non-root
    shell); databases, database users and mailboxes need root. */
 function complete_values($kind) {
-    if ($kind === 'account' || $kind === 'domain') {
+    if ($kind === 'authmode')
+        return array('status', 'web', 'basic');
+    if ($kind === 'fwop')
+        return array('status', 'off');
+    if ($kind === 'codeop')
+        return array('status', 'off', 'on');
+    if ($kind === 'runtimeop')
+        return array('install', 'update', 'remove');
+    if ($kind === 'app') {
         $file = REQAD_ROOT.'/db/reqad.db';
         if (!is_readable($file))
             return array();
         try {
             $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
-            $sql = ($kind === 'account')
-                 ? 'SELECT user FROM accounts ORDER BY user'
-                 : 'SELECT domain FROM accounts WHERE has_email=1 ORDER BY domain';
+            $out = array();
+            $res = $db->query('SELECT domain FROM apps ORDER BY domain');
+            while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
+                $out[] = $row[0];
+            $db->close();
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+    if ($kind === 'wpsite') {
+        $file = REQAD_ROOT.'/db/reqad.db';
+        if (!is_readable($file))
+            return array();
+        try {
+            $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
+            $out = array();
+            $res = $db->query("SELECT domain || CASE WHEN trim(path, '/') <> '' THEN '/' || trim(path, '/') ELSE '' END FROM wordpress ORDER BY 1");
+            while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
+                $out[] = $row[0];
+            $db->close();
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+    if ($kind === 'deployment') {
+        $file = REQAD_ROOT.'/db/reqad.db';
+        if (!is_readable($file))
+            return array();
+        try {
+            $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
+            $out = array();
+            $res = $db->query('SELECT domain FROM deployments ORDER BY domain');
+            while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
+                $out[] = $row[0];
+            $db->close();
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+    if ($kind === 'apitoken') {
+        $file = REQAD_ROOT.'/db/reqad.db';
+        if (!is_readable($file))
+            return array();
+        try {
+            $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
+            $out = array();
+            $res = $db->query('SELECT name FROM api_tokens WHERE revoked = 0 ORDER BY name');
+            while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
+                $out[] = $row[0];
+            $db->close();
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+    if ($kind === 'healthitem') {
+        $file = REQAD_ROOT.'/db/reqad.db';
+        if (!is_readable($file))
+            return array();
+        try {
+            $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
+            $out = array();
+            $res = $db->query('SELECT id FROM health_items ORDER BY id');
+            while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
+                $out[] = $row[0];
+            $db->close();
+            return $out;
+        } catch (Throwable $e) {
+            return array();
+        }
+    }
+    if ($kind === 'account' || $kind === 'domain' || $kind === 'admin') {
+        $file = REQAD_ROOT.'/db/reqad.db';
+        if (!is_readable($file))
+            return array();
+        try {
+            $db  = new SQLite3($file, SQLITE3_OPEN_READONLY);
+            $sql = ($kind === 'account') ? 'SELECT user FROM accounts ORDER BY user'
+                 : (($kind === 'admin') ? "SELECT username FROM auth_principals WHERE type='admin' ORDER BY username"
+                 : 'SELECT domain FROM accounts WHERE has_email=1 ORDER BY domain');
             $out = array();
             $res = $db->query($sql);
             while ($res && ($row = $res->fetchArray(SQLITE3_NUM)))
@@ -538,6 +1321,780 @@ function complete_values($kind) {
     return array();
 }
 
+/* ---- backup -------------------------------------------------------------- */
+
+/* ---- stats --------------------------------------------------------------- */
+
+function cli_bytes($b) {
+    $b = (float)$b;
+    foreach (array('TB' => 1e12, 'GB' => 1e9, 'MB' => 1e6, 'KB' => 1e3) as $u => $f)
+        if ($b >= $f) return round($b / $f, $b >= 10 * $f ? 0 : 1).' '.$u;
+    return (int)$b.' B';
+}
+
+function cmd_logs($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('logs', $sub));
+    $json = !empty($opts['json']);
+    cli_need($pos, 1, 'the domain');
+    $domain = strtolower($pos[0]);
+    if (!isset(stats_sites()[$domain]))
+        cli_die("No site $domain on this server.", 1);
+    if ($sub === 'days') {
+        $days = sitelog_days($domain);
+        cli_result(result_ok(count($days).' days of '.$domain.': '.end($days).' to '.$days[0].'.', array('days' => $days)), $opts);
+    }
+    if ($sub !== 'site') {
+        usage_logs($prog);
+        exit(2);
+    }
+    $o = array('day' => isset($opts['day']) ? (string)$opts['day'] : '', 'tab' => !empty($opts['errors']) ? 'errors' : 'requests',
+               'filter' => isset($opts['filter']) ? (string)$opts['filter'] : 'all', 'q' => isset($opts['q']) ? (string)$opts['q'] : '',
+               'ip' => isset($opts['ip']) ? (string)$opts['ip'] : '', 'offset' => isset($opts['offset']) ? (int)$opts['offset'] : 0);
+    if (isset($opts['filter']) && !in_array($o['filter'], array('all', 'err', '5xx'), true))
+        cli_die('--filter=all, err or 5xx', 2);
+    if (isset($opts['bots']) && in_array(strtolower((string)$opts['bots']), array('no', 'off', '0', 'false'), true))
+        $o['bots'] = false;
+    if (!empty($opts['all-lines']))
+        $o['grouped'] = false;
+    $r = sitelog_read($domain, $o);
+    if ($json || !$r['ok'])
+        cli_result($r, $opts);
+    $d = $r['data'];
+    $sm = $d['summary'];
+    echo "$domain, {$d['day']}: ".number_format($sm['requests']).' requests ('.number_format($sm['errors']).' errors, '.number_format($sm['e5']).' 5xx, '
+        .cli_bytes($sm['bytes']).' sent), '.number_format($sm['error_lines']).' web server errors'.($d['errors_available'] ? '' : ' (Apache: in its shared log)').".\n";
+    if ($o['tab'] === 'requests') {
+        $rows = array();
+        foreach ($d['rows'] as $x)
+            $rows[] = array('t' => $x['t'], 's' => $x['s'], 'm' => $x['m'], 'p' => mb_strimwidth($x['p'].$x['q'], 0, 70, '…'), 'ip' => $x['ip'].($x['cc'] !== '' ? ' '.$x['cc'] : ''),
+                            'b' => $x['b'] ? cli_bytes($x['b']) : '-', 'w' => $x['bot'] !== '' ? $x['bot'] : ($x['scan'] ? 'scanner' : trim($x['br'].' / '.$x['os'], ' /')));
+        echo "\n";
+        cli_table($rows, array('TIME' => 't', 'CODE' => 's', 'METHOD' => 'm', 'ADDRESS' => 'p', 'IP' => 'ip', 'SIZE' => 'b', 'BROWSER OR BOT' => 'w'));
+        if ($d['more'])
+            echo "\n{$d['more']} older ".($o['filter'] === 'all' ? 'requests' : 'errors')." on this day: --offset=".($d['offset'] + count($d['rows']))."\n";
+        exit(0);
+    }
+    if (!$d['grouped']) {
+        echo "\n".implode("\n", $d['lines']).($d['lines'] ? "\n" : '');
+        exit(0);
+    }
+    $rows = array();
+    foreach ($d['groups'] as $g)
+        $rows[] = array('l' => $g['level'], 'n' => number_format($g['count']), 'w' => $g['first'] === $g['last'] ? $g['last'] : substr($g['first'], 0, 5).'-'.substr($g['last'], 0, 5),
+                        'k' => $g['kind'] !== '' ? $g['kind'] : 'other', 'm' => mb_strimwidth($g['message'], 0, 60, '…'),
+                        'i' => $g['items'] ? mb_strimwidth($g['items'][0][0], 0, 40, '…').($g['distinct'] > 1 ? ' +'.($g['distinct'] - 1) : '') : '');
+    echo "\n";
+    cli_table($rows, array('LEVEL' => 'l', 'TIMES' => 'n', 'WHEN' => 'w', 'KIND' => 'k', 'MESSAGE' => 'm', 'MOSTLY' => 'i'));
+    exit(0);
+}
+
+function cmd_stats($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('stats', $sub));
+    $json = !empty($opts['json']);
+    switch ($sub) {
+    case 'show':
+        cli_need($pos, 1, 'the domain (or all)');
+        $site = strtolower($pos[0]);
+        if ($site === 'all') {
+            $acct = cli_scope() ?? (isset($opts['account']) ? (string)$opts['account'] : '');
+            if ($acct === '' || !account_get($GLOBALS['db'], $acct))
+                cli_die("'stats show all' needs --account=USER", 2);
+        } else {
+            $acct = stats_sites()[$site] ?? '';
+            if ($acct === '')
+                cli_die("No site $site on this server.", 1);
+        }
+        $r = stats_report($acct, $site, isset($opts['period']) ? (string)$opts['period'] : '30d');
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $d = $r['data'];
+        if (!$d['enabled'])
+            echo "Visitor stats are off on this server ('$prog stats on').\n";
+        $t = $d['totals'];
+        $label = $d['period'] === '30d' ? 'last 30 days' : ($d['period'] === '12m' ? 'last 12 months' : $d['period']);
+        echo ($site === 'all' ? "All sites of $acct" : $site).", $label ({$d['from']} to {$d['to']})".($d['first_day'] !== '' ? ", counted since {$d['first_day']}" : ', nothing counted yet')."\n";
+        echo '  visitors '.number_format($t['v']).'   page views '.number_format($t['pages']).'   requests '.number_format($t['req'])
+            .'   bandwidth '.cli_bytes($t['bytes']).'   server errors '.number_format($t['e5'])
+            .($t['req'] ? ' ('.round($t['e5'] / $t['req'] * 100, 2).'%)' : '').'   bots '.($t['req'] ? round($t['bots'] / $t['req'] * 100).'%' : '0%')."\n";
+        if ($d['imported_days'])
+            echo "  {$d['imported_days']} days imported from AWStats, until {$d['imported_until']}\n";
+        echo "\n";
+        $rows = array();
+        foreach ($d['buckets'] as $b)
+            $rows[] = array('d' => $b['d'].($b['today'] ? ' *' : ''), 'v' => $b['none'] ? '-' : number_format($b['v']), 'p' => $b['none'] ? '-' : number_format($b['pages']),
+                            'r' => $b['none'] ? '-' : number_format($b['req']), 'b' => $b['none'] ? '-' : cli_bytes($b['bytes']), 'e' => $b['none'] ? '-' : number_format($b['e5']),
+                            's' => $b['none'] ? 'not counted' : (($b['src'] ?? 'log') === 'log' ? '' : ($b['src'] === 'awstats' ? 'AWStats' : 'partly AWStats')));
+        cli_table($rows, array($d['unit'] === 'day' ? 'DAY' : 'MONTH' => 'd', 'VISITORS' => 'v', 'PAGE VIEWS' => 'p', 'REQUESTS' => 'r', 'BANDWIDTH' => 'b', '5XX' => 'e', '' => 's'));
+        foreach (array('page' => 'Pages', 'ref' => 'Came from', '404' => 'Missing pages (404)', 'bot' => 'Bots (requests)', 'country' => 'Countries (visitors)') as $k => $title) {
+            if (!$d['lists'][$k]) continue;
+            echo "\n$title:\n";
+            foreach (array_slice($d['lists'][$k], 0, 10) as $x)
+                printf("  %10s  %s\n", number_format($x[1]), $k === 'country' ? $x[3].' ('.$x[0].')' : $x[0]);
+        }
+        exit(0);
+
+    case 'usage':
+        cli_need($pos, 0, '');
+        $r = stats_usage(isset($opts['month']) ? (string)$opts['month'] : '');
+        if (cli_scope() !== null && $r['ok'])
+            $r['data']['accounts'] = array_values(array_filter($r['data']['accounts'], function ($a) { return $a['user'] === cli_scope(); }));
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $rows = array();
+        foreach ($r['data']['accounts'] as $a)
+            foreach ($a['sites'] as $i => $st)
+                $rows[] = array('u' => $i ? '' : $a['user'], 's' => $st['site'], 'b' => cli_bytes($st['bytes']), 'v' => number_format($st['v']),
+                                'r' => number_format($st['req']), 'e' => number_format($st['e5']),
+                                'l' => $i || $a['limit_bytes'] === null ? '' : cli_bytes($a['bytes']).' of '.cli_bytes($a['limit_bytes']));
+        echo "Bandwidth in {$r['data']['month']}".($r['data']['collected'] ? ', counted at '.date('Y-m-d H:i', $r['data']['collected']) : ', not counted yet')."\n";
+        cli_table($rows, array('ACCOUNT' => 'u', 'SITE' => 's', 'BANDWIDTH' => 'b', 'VISITORS' => 'v', 'REQUESTS' => 'r', '5XX' => 'e', 'PACKAGE' => 'l'));
+        exit(0);
+
+    case 'collect':
+        cli_need($pos, 0, '');
+        $r = stats_collect(isset($opts['domain']) ? strtolower((string)$opts['domain']) : '');
+        if (!empty($opts['quiet']) && $r['ok'])
+            exit(0);
+        cli_result($r, $opts);
+
+    case 'geoip':
+        cli_need($pos, 0, '');
+        if (isset($opts['monthly'])) {
+            $on = strtolower((string)$opts['monthly']);
+            if (!in_array($on, array('on', 'off'), true))
+                cli_die('--monthly=on or off', 2);
+            stats_settings_set(null, $on === 'on');
+        }
+        if (!empty($opts['update']) || !empty($opts['auto'])) {
+            if (!empty($opts['auto']) && setting_get('stats-geoip-update', '1') === '0')
+                exit(0);
+            $r = stats_geo_update(!empty($opts['update']));
+            if (!empty($opts['quiet']) && $r['ok'])
+                exit(0);
+            cli_result($r, $opts);
+        }
+        $g = stats_geo_file();
+        $r = result_ok($g ? "Country database: {$g[1]} from {$g[2]} ({$g[0]})." : 'No country database: countries are not counted.',
+                       array('source' => $g[1] ?? null, 'date' => $g[2] ?? null, 'file' => $g[0] ?? null,
+                             'monthly_update' => setting_get('stats-geoip-update', '1') !== '0'));
+        if (!$json)
+            $r['message'] .= ' Monthly DB-IP update: '.($r['data']['monthly_update'] ? 'on' : 'off').'.';
+        cli_result($r, $opts);
+
+    case 'on':
+    case 'off':
+        cli_need($pos, 0, '');
+        stats_settings_set($sub === 'on', null);
+        cli_result(result_ok('Visitor stats are '.$sub.'.'.($sub === 'off' && stats_counting()
+            ? ' Accounts no longer see them; the logs are still counted for the hosting packages\' bandwidth limits.' : '')), $opts);
+
+    default:
+        usage_stats($prog);
+        exit(2);
+    }
+}
+
+/* ---- resources ----------------------------------------------------------- */
+
+function cli_mb($mb) {
+    return $mb >= 1024 ? round($mb / 1024, $mb >= 10240 ? 0 : 1).' GB' : round($mb).' MB';
+}
+
+function cli_pct($v) {
+    return ($v < 10 ? round($v, 1) : round($v)).'%';
+}
+
+function cmd_resources($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('resources', $sub));
+    $json = !empty($opts['json']);
+    $range = isset($opts['range']) ? (string)$opts['range'] : 'day';
+    if (!in_array($range, array('day', 'week', 'month'), true))
+        cli_die('--range=day, week or month', 2);
+    $label = array('day' => 'the last 24 hours', 'week' => 'the last 7 days', 'month' => 'the last 30 days')[$range];
+    $when = function ($t) { return $t ? date(date('Y-m-d', $t) === date('Y-m-d') ? 'H:i' : 'M j H:i', $t) : '-'; };
+    switch ($sub) {
+    case 'usage':
+        cli_need($pos, 0, '');
+        $r = resources_usage($range);
+        if (cli_scope() !== null && $r['ok']) {
+            $r['data']['accounts'] = array_values(array_filter($r['data']['accounts'], function ($a) { return $a['user'] === cli_scope(); }));
+            unset($r['data']['server']);
+        }
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $d = $r['data'];
+        echo "Resource usage in $label".($d['collected'] ? ', last check at '.date('H:i', $d['collected']) : ', not checked yet')
+            ." (100% = one core; this server has {$d['cores']}, ".cli_mb($d['ram_mb'])." of memory)\n";
+        $rows = array();
+        if (isset($d['server']))
+            $rows[] = array('u' => 'whole server', 'c' => cli_pct($d['server']['cpu']), 'cm' => cli_pct($d['server']['cpu_max']), 'm' => cli_mb($d['server']['mem']),
+                            'mm' => cli_mb($d['server']['mem_max']), 'p' => $d['server']['pr_max'], 'w' => '', 'e' => '');
+        foreach ($d['accounts'] as $a) {
+            $ev = array();
+            foreach ($a['events'] as $k => $x) $ev[] = $k.' '.$x['times'];
+            $w = array();
+            foreach ($a['workers'] as $site => $n) $w[] = "$site $n";
+            $rows[] = array('u' => $a['user'], 'c' => cli_pct($a['cpu']), 'cm' => cli_pct($a['cpu_max']), 'm' => cli_mb($a['mem']), 'mm' => cli_mb($a['mem_max']),
+                            'p' => $a['pr_max'], 'w' => implode(', ', $w), 'e' => implode(', ', $ev));
+        }
+        cli_table($rows, array('ACCOUNT' => 'u', 'CPU' => 'c', 'HIGHEST' => 'cm', 'MEMORY' => 'm', 'HIGHEST ' => 'mm', 'PROCESSES' => 'p', 'PHP WORKERS AT MOST' => 'w', 'LIMITS REACHED' => 'e'));
+        exit(0);
+
+    case 'show':
+        cli_need($pos, 1, 'the account');
+        $r = resources_report($pos[0], $range);
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $d = $r['data'];
+        $sum = array(); $top = array(0, 0, 0, 0, 0, 0); $n = 0;
+        foreach ($d['buckets'] as $b) {
+            $n += $b['n'];
+            foreach ($b['k'] as $k => $x) {
+                if (!isset($sum[$k])) $sum[$k] = array(0, 0, 0);
+                $sum[$k][0] += $x[0] * $b['n']; $sum[$k][1] += $x[1] * $b['n']; $sum[$k][2] = max($sum[$k][2], $x[3]);
+            }
+            foreach (array(0, 2, 4) as $i) if ($b['top'][$i] > $top[$i]) { $top[$i] = $b['top'][$i]; $top[$i + 1] = $b['top'][$i + 1]; }
+        }
+        echo "{$d['account']} in $label".($d['collected'] ? ', last check at '.date('H:i', $d['collected']) : ', not checked yet').":\n";
+        echo '  highest: CPU '.cli_pct($top[0]).' at '.$when($top[1]).', memory '.cli_mb($top[2]).' at '.$when($top[3]).', '.(int)$top[4].' processes at '.$when($top[5])."\n\n";
+        $rows = array();
+        foreach (array_merge($d['series'], $d['db_users']) as $s) {
+            $x = $sum[$s['k']] ?? null;
+            if (!$x) continue;
+            $db = strncmp($s['k'], 'db:', 3) === 0;
+            $rows[] = array('k' => $db ? 'database user '.$s['name'] : $s['name'], 'c' => $db ? '' : cli_pct($x[0] / max(1, $n)), 'm' => $db ? '' : cli_mb($x[1] / max(1, $n)),
+                            'p' => (strncmp($s['k'], 'php:', 4) === 0 ? $x[2].' workers' : ($db ? $x[2].' connections' : (int)$x[2])));
+        }
+        if ($rows)
+            cli_table($rows, array('WHAT' => 'k', 'CPU (AVERAGE)' => 'c', 'MEMORY (AVERAGE)' => 'm', 'AT MOST' => 'p'));
+        else
+            echo "  Nothing counted in this time.\n";
+        $l = $d['limits'];
+        $s = $l['session'];
+        echo "\nLimits: sessions ".(!$s || $s['mode'] === 'none' || $s['mode'] === 'missing' ? 'none'
+            : 'CPU '.$s['cpu'].'%, memory '.$s['memory_mb'].' MB, '.$s['tasks'].' processes ('.$s['mode'].')')
+            .'; '.($l['db_per_user'] ? $l['db_per_user'].' connections per database user' : 'no database connection limit')
+            .($l['package'] !== '' ? '; package '.$l['package'] : '')."\n";
+        foreach ($l['sites'] as $x)
+            echo '  '.$x['domain'].': '.($x['handler'] === 'fpm' ? 'PHP '.$x['version'].', '.$x['max_children'].' workers, time limit '.($x['timeout'] ? $x['timeout'].' s' : 'none')
+                : ($x['handler'] === 'mod_php' ? 'PHP '.$x['version'].' inside Apache (not counted per account)' : 'no PHP'))."\n";
+        echo "\n".($d['events'] ? count($d['events']).' limit(s) reached:' : 'No limits reached.')."\n";
+        foreach ($d['events'] as $e) {
+            $x = (array)$e['detail'];
+            $t = $e['first'] === $e['last'] ? $when($e['first']) : $when($e['first']).' to '.date('H:i', $e['last']);
+            $what = array('php_full' => $e['subject'].': all PHP workers busy', 'timeout' => $e['subject'].': a request stopped at its time limit'.(isset($x['script']) ? ' ('.$x['script'].')' : ''),
+                          'db_full' => 'database user '.$e['subject'].' at its connection limit', 'mem_kill' => 'stopped by the memory limit'.(isset($x['proc']) ? ': '.$x['proc'].' (pid '.$x['pid'].')' : ''),
+                          'tasks' => 'a new process was refused (process limit)', 'cpu_held' => 'sessions held at their CPU limit')[$e['kind']] ?? $e['kind'];
+            echo "  $t  $what".($e['n'] > 1 ? ' ('.$e['n'].($e['kind'] === 'cpu_held' ? ' minutes' : ' times').')' : '')."\n";
+        }
+        exit(0);
+
+    case 'processes':
+        cli_need($pos, 1, 'the account');
+        $r = resources_processes($pos[0]);
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $rows = array();
+        foreach ($r['data']['groups'] as $g)
+            foreach ($g['procs'] as $p)
+                $rows[] = array('g' => $g['name'], 'pid' => $p['pid'], 'c' => cli_pct($p['cpu']), 'm' => cli_mb($p['mem']),
+                                'a' => $p['age'] >= 3600 ? floor($p['age'] / 3600).' h' : ($p['age'] >= 60 ? floor($p['age'] / 60).' min' : $p['age'].' s'),
+                                'cmd' => mb_strimwidth($p['cmd'], 0, 70, '…'));
+        if (!$rows) { echo "{$r['data']['account']} runs nothing right now.\n"; exit(0); }
+        cli_table($rows, array('WHAT' => 'g', 'PID' => 'pid', 'CPU' => 'c', 'MEMORY' => 'm', 'RUNNING' => 'a', 'COMMAND' => 'cmd'));
+        exit(0);
+
+    case 'stop':
+        cli_need($pos, 2, 'the account and the pid');
+        if (!isset($opts['start']) || !ctype_digit((string)$opts['start']))
+            cli_die("--start=TICKS: the process's start time ('$prog resources processes {$pos[0]} --json')", 2);
+        cli_result(resources_stop($pos[0], (int)$pos[1], (string)$opts['start']), $opts);
+
+    case 'collect':
+        cli_need($pos, 0, '');
+        $r = resources_collect();
+        if (!empty($opts['quiet']) && $r['ok'])
+            exit(0);
+        cli_result($r, $opts);
+
+    default:
+        usage_resources($prog);
+        exit(2);
+    }
+}
+
+/* ---- shelllog ------------------------------------------------------------ */
+
+function cmd_shelllog($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('shelllog', $sub));
+    $json = !empty($opts['json']);
+    $when = function ($t) { return $t ? date(date('Y-m-d', $t) === date('Y-m-d') ? 'H:i' : 'M j H:i', $t) : '-'; };
+    switch ($sub) {
+    case 'status':
+        cli_need($pos, 0, '');
+        $s = shelllog_status();
+        if ($json)
+            cli_result(result_ok('', $s), $opts);
+        echo 'Command logging: '.($s['enabled'] ? 'on' : 'off').', kept '.$s['days']." days\n";
+        if ($s['enabled']) {
+            echo '  audit rule: '.($s['rule_loaded'] ? 'loaded' : 'NOT loaded').($s['rule_error'] !== '' ? ' - '.$s['rule_error'] : '')."\n";
+            echo '  last read:  '.($s['collected'] ? date('Y-m-d H:i:s', $s['collected']) : 'never (cron runs it every minute)')."\n";
+        }
+        echo '  logged:     '.$s['commands'].' command(s)'.($s['since'] ? ' since '.date('Y-m-d H:i', $s['since']) : '')."\n";
+        exit(0);
+
+    case 'on':
+        cli_need($pos, 0, '');
+        cli_result(shelllog_set(true, isset($opts['days']) ? (int)$opts['days'] : null), $opts);
+
+    case 'off':
+        cli_need($pos, 0, '');
+        cli_result(shelllog_set(false), $opts);
+
+    case 'days':
+        cli_need($pos, 1, 'the days to keep (7, 30, 90 or 180)');
+        cli_result(shelllog_set(null, (int)$pos[0]), $opts);
+
+    case 'accounts':
+        cli_need($pos, 0, '');
+        $list = shelllog_accounts();
+        if ($json)
+            cli_result(result_ok('', array('enabled' => shelllog_enabled(), 'accounts' => $list)), $opts);
+        if (!shelllog_enabled())
+            echo "Command logging is off ('$prog shelllog on').\n";
+        $rows = array();
+        foreach ($list as $a)
+            $rows[] = array('u' => $a['user'], 'sh' => $a['shell'], 'd' => $a['day'], 'w' => $a['week'],
+                            'f' => $a['flagged'] ? $a['flagged'].($a['flag_new'] ? ' ('.$a['flag_new'].' new)' : '') : '',
+                            'l' => $a['last'] ? $when($a['last']).'  '.mb_strimwidth($a['last_cmd'], 0, 60, '…') : '');
+        cli_table($rows, array('ACCOUNT' => 'u', 'SHELL' => 'sh', '24 H' => 'd', '7 DAYS' => 'w', 'RED FLAGS' => 'f', 'LAST COMMAND' => 'l'));
+        exit(0);
+
+    case 'show':
+        cli_need($pos, 1, 'the account');
+        global $db;
+        if (!account_get($db, $pos[0]))
+            cli_die("No hosting account '{$pos[0]}'.", 1);
+        if (isset($opts['source']) && !isset(shelllog_sources()[$opts['source']]))
+            cli_die('--source='.implode(', ', array_keys(shelllog_sources())), 2);
+        if (isset($opts['day']) && !preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$opts['day']))
+            cli_die('--day=YYYY-MM-DD', 2);
+        $l = shelllog_list($pos[0], array('day' => $opts['day'] ?? '', 'src' => $opts['source'] ?? '', 'flagged' => !empty($opts['flagged']),
+                                          'q' => $opts['q'] ?? '', 'admin' => !empty($opts['admin']), 'page' => (int)($opts['page'] ?? 0)));
+        if ($json)
+            cli_result(result_ok('', $l), $opts);
+        $src = shelllog_sources();
+        $rows = array();
+        foreach ($l['rows'] as $r)
+            $rows[] = array('t' => $when((int)$r['first']).((int)$r['n'] > 1 ? ' x'.$r['n'] : ''),
+                            's' => $src[$r['src']][0].($r['addr'] !== '' ? ' '.$r['addr'] : '').($r['via'] !== '' ? ' ('.$r['via'].')' : ''),
+                            'd' => preg_replace('#^/home/'.preg_quote($pos[0], '#').'(?=/|$)#', '~', (string)$r['cwd']),
+                            'c' => mb_strimwidth($r['cmd'], 0, 90, '…').((int)$r['err'] ? '  ['.shelllog_err_label($r['err']).']' : ''),
+                            'f' => $r['flag'] !== '' ? shelllog_flag_label($r['flag']) : '');
+        if (!$rows) { echo "Nothing logged".(shelllog_enabled() ? '' : " (command logging is off)").".\n"; exit(0); }
+        cli_table($rows, array('WHEN' => 't', 'FROM' => 's', 'FOLDER' => 'd', 'COMMAND' => 'c', 'RED FLAG' => 'f'));
+        if ($l['more'])
+            echo "More: --page=".($l['page'] + 1)."\n";
+        exit(0);
+
+    case 'collect':
+        cli_need($pos, 0, '');
+        $r = shelllog_collect();
+        if (!empty($opts['quiet']) && $r['ok'])
+            exit(0);
+        cli_result($r, $opts);
+
+    default:
+        usage_shelllog($prog);
+        exit(2);
+    }
+}
+
+function cmd_dns($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('dns', $sub));
+    $json = !empty($opts['json']);
+    switch ($sub) {
+    case 'check':
+        cli_need($pos, 0, '');
+        if (!dns_cluster_available() || !dns_cluster_on()) {
+            if (!empty($opts['quiet']))
+                exit(0);
+            cli_die(dns_cluster_available() ? (dns_cluster_unavailable() ?: 'No secondary is set up.') : dns_cluster_unavailable(), 1);
+        }
+        $r = dns_cluster_health_collect(isset($opts['wait']) ? max(5, min(300, (int)$opts['wait'])) : 45, !empty($opts['registry']));
+        if (!empty($opts['quiet']) && $r['ok'])
+            exit(0);
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $sub = 'status';
+        /* fall through: show what was found */
+    case 'status':
+        cli_need($pos, 0, '');
+        if (($why = dns_cluster_unavailable()) !== '')
+            cli_die($why, 1);
+        $v = dns_cluster_health_view();
+        if ($json)
+            cli_result(result_ok('', $v), $opts);
+        $state = array('o' => 'in step', 'b' => 'BEHIND', 'd' => 'NOT ANSWERING', '' => 'not checked yet');
+        echo 'Cluster:   '.($v['overall'] === 'ok' ? 'healthy' : ($v['overall'] === 'bad' ? 'PROBLEM - '.$v['problem'] : 'not checked yet'))."\n";
+        echo 'Checked:   '.($v['checked'] ? date('Y-m-d H:i:s', $v['checked']) : 'never')."\n";
+        $p = $v['primary'];
+        echo 'This server: PowerDNS '.($p['version'] ?: '?').', '.($p['running'] ? 'running' : 'NOT ANSWERING').($p['uptime'] ? ', up '.dns_cluster_health_ago($p['uptime']) : '')
+            .($p['queries_hour'] !== null ? ', '.$p['queries_hour'].' queries in the last hour ('.$p['servfail_hour'].' failed)' : '')."\n";
+        if ($v['probe_error'] !== '')
+            echo '  test zone: '.$v['probe_error']."\n";
+        $rows = array();
+        foreach ($v['secondaries'] as $s) {
+            $l = $s['last'] ?: array();
+            $rows[] = array('n' => $s['name'], 'a' => $s['addr'], 's' => $state[$s['state']],
+                            'z' => isset($l['total']) ? $l['in_step'].'/'.$l['total'] : '-',
+                            'u' => isset($l['udp_ms']) && $l['udp_ms'] !== null ? $l['udp_ms'].' ms' : '-',
+                            't' => isset($l['tcp_ms']) && $l['tcp_ms'] !== null ? $l['tcp_ms'].' ms' : '-',
+                            'd' => isset($l['delay']) && $l['delay'] !== null ? $l['delay'].' s' : '-',
+                            'x' => ($l['axfr'] ?? '-').' / '.($l['open'] ?? '-'),
+                            'p' => $s['pct'] !== null ? $s['pct'].'%' : '-');
+        }
+        cli_table($rows, array('SECONDARY' => 'n', 'ADDRESS' => 'a', 'STATE' => 's', 'ZONES' => 'z', 'UDP' => 'u', 'TCP' => 't',
+                               'CHANGE' => 'd', 'AXFR / OPEN' => 'x', '7 DAYS' => 'p'));
+        $d = $v['delegation'];
+        if ($d['checked']) {
+            echo "\nRegistries (".date('Y-m-d H:i', $d['checked'])."): {$d['ours']} of {$d['total']} domains use ".implode(' + ', $v['expected'])."\n";
+            foreach ($d['rows'] as $r)
+                echo '  '.str_pad($r['zone'], 32).' '.$r['kind'].($r['names'] ? ': '.implode(', ', $r['names']) : '')."\n";
+        }
+        if ($v['out'])
+            echo "\nNot in the cluster yet: ".implode(', ', $v['out'])."\n";
+        exit($v['overall'] === 'bad' ? 1 : 0);
+
+    case 'zones':
+        cli_need($pos, 0, '');
+        $v = dns_zones_needed(!empty($opts['all']));
+        $dir = isset($opts['export']) ? rtrim((string)$opts['export'], '/') : '';
+        if (isset($opts['export']) && ($dir === '' || $opts['export'] === true))
+            cli_die('--export needs a folder: --export=/root/zones', 2);
+        $written = array();
+        if ($dir !== '') {
+            if (!is_dir($dir) && !@mkdir($dir, 0700, true))
+                cli_die("Cannot make the folder $dir.", 1);
+            foreach ($v['zones'] as $z) {
+                if (!$z['there'])
+                    continue;
+                $r = dns_zonefile_export($z['zone']);
+                if (!$r['ok']) {
+                    fwrite(STDERR, $z['zone'].': '.$r['message']."\n");
+                    continue;
+                }
+                $f = $dir.'/'.$z['zone'].'.db';
+                if (@file_put_contents($f, $r['data']['text']) === false)
+                    cli_die("Cannot write $f.", 1);
+                @chmod($f, 0600);
+                $written[] = $f;
+            }
+            $v['exported'] = $written;
+        }
+        if ($json)
+            cli_result(result_ok('', $v), $opts);
+        if (!empty($opts['plain'])) {
+            foreach ($v['zones'] as $z)
+                echo $z['zone']."\n";
+            exit(0);
+        }
+        $pname = array('powerdns' => 'PowerDNS', 'cloudflare' => 'Cloudflare', 'cpanel' => 'cPanel', 'none' => 'none');
+        echo 'DNS provider: '.($pname[$v['provider']] ?? $v['provider']).($v['url'] !== '' ? ' ('.$v['url'].')' : '')."\n";
+        if ($v['error'] !== '')
+            echo 'The DNS provider did not answer: '.$v['error']."\n";
+        if (!$v['zones']) {
+            echo "No sites with a domain on this server.\n";
+            exit(0);
+        }
+        echo "\n";
+        $rows = array();
+        foreach ($v['zones'] as $z) {
+            $n = array_values(array_diff($z['names'], array($z['zone'])));
+            $rows[] = array('z' => $z['zone'], 't' => $z['there'] ? 'yes' : 'no',
+                            'a' => $z['accounts'] ? implode(', ', $z['accounts']) : '-',
+                            'n' => $n ? implode(', ', array_slice($n, 0, 3)).(count($n) > 3 ? ' +'.(count($n) - 3) : '') : '');
+        }
+        cli_table($rows, array('ZONE' => 'z', 'AT PROVIDER' => 't', 'ACCOUNTS' => 'a', 'ALSO HOLDS' => 'n'));
+        $missing = count(array_filter($v['zones'], function ($z) { return !$z['there']; }));
+        if ($missing && $v['error'] === '')
+            echo "\n$missing ".($missing === 1 ? 'zone is' : 'zones are')." not at this server's DNS provider. Add ".($missing === 1 ? 'it' : 'them')." on the DNS server (DNS Zones > Add a zone)"
+                ." before you give ".($missing === 1 ? 'it' : 'them')." to the key; a zone that is not there is left out with a warning.\n";
+        if ($written)
+            echo "\nZone files written: ".count($written).' in '.$dir."/ - import them on the new DNS server (DNS Zones > Import zone).\n";
+        echo "\nUse --plain to get the list only (for \"Zones already here\" on the DNS server).\n";
+        exit(0);
+
+    default:
+        usage_dns($prog);
+        exit(2);
+    }
+}
+
+function cmd_backup($prog, $sub, array $pos, array $opts) {
+    global $db, $ini;
+    cli_allow($opts, cli_opts('backup', $sub));
+    if ($sub === '__run') {
+        /* the runner of a restore, started by backup_restore_start() as unit reqad-restore-<account> */
+        cli_need($pos, 1, '<job>');
+        backup_restore_execute((int)$pos[0]);
+        exit(0);
+    }
+    if (!feature_enabled($ini, 'backup'))
+        cli_result(result_error('Backups are turned off on this server (backup in server-software.ini).'), $opts);
+    $acct = $pos[0] ?? '';
+    if (!valid_username($acct) || !account_get($db, $acct))
+        cli_result(result_error("No hosting account '$acct'."), $opts);
+    $size = function ($b) { return $b >= 1073741824 ? round($b / 1073741824, 1).' GB' : ($b >= 1048576 ? round($b / 1048576, 1).' MB' : round($b / 1024).' KB'); };
+    switch ($sub) {
+    case 'list':
+        cli_need($pos, 1, '<account>');
+        $r = backup_list($acct, !empty($opts['refresh']));
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        if ($r['data']['remote_error'] !== '')
+            fwrite(STDERR, $r['data']['remote_error']."\n");
+        if (!$r['data']['backups'])
+            cli_result(result_ok("$acct has no backups yet."), $opts);
+        printf("%-22s %-7s %-17s %10s  %s\n", 'BACKUP', 'WHERE', 'DATE', 'SIZE', 'STATUS');
+        foreach ($r['data']['backups'] as $b)
+            printf("%-22s %-7s %-17s %10s  %s\n", $b['id'], $b['source'], $b['date'].($b['time'] !== '' ? ' '.$b['time'] : ''), $size($b['bytes']), $b['status']);
+        exit(0);
+    case 'show':
+        cli_need($pos, 2, '<account> <backup>');
+        $r = backup_detail($acct, $pos[1]);
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        $d = $r['data'];
+        echo "Backup:    {$d['backup']['id']} ({$d['backup']['source']}, {$d['backup']['date']}".($d['backup']['time'] !== '' ? ' '.$d['backup']['time'] : '').', '.$size($d['backup']['bytes']).")\n";
+        echo 'Holds:     '.implode(', ', $d['parts'])."\n";
+        echo 'Databases: '.($d['databases'] ? implode(', ', array_column($d['databases'], 'name')) : '-')."\n";
+        echo 'Mailboxes: '.($d['mailboxes'] ? implode(', ', $d['mailboxes']) : '-')."\n";
+        if ($d['homes'])
+            echo 'Folders:   '.implode(', ', array_column($d['homes'], 'name'))."\n";
+        foreach ($d['excluded'] as $x)
+            echo "Left out:  {$x['path']} ({$x['kind']})\n";
+        exit(0);
+    case 'restore':
+        cli_need($pos, 2, '<account> <backup>');
+        $kinds = array_values(array_intersect(array('files', 'database', 'email'), array_keys($opts)));
+        if (count($kinds) !== 1)
+            cli_result(result_error('Say what to restore: --files=PATH, --database=NAME or --email=MAILBOX.'), $opts);
+        $k = $kinds[0];
+        $target = is_string($opts[$k]) ? $opts[$k] : '';
+        $mode = isset($opts['mode']) && is_string($opts['mode']) ? $opts['mode'] : array('files' => 'missing', 'database' => 'tables', 'email' => 'missing')[$k];
+        $r = backup_restore_start($acct, $pos[1], array('kind' => $k, 'target' => $target, 'mode' => $mode,
+                                  'name' => isset($opts['name']) && is_string($opts['name']) ? $opts['name'] : '',
+                                  'grant' => isset($opts['grant']) && is_string($opts['grant']) ? $opts['grant'] : ''), 'cli');
+        cli_result($r, $opts);
+    case 'restores':
+        cli_need($pos, 1, '<account>');
+        $rows = backup_restore_list($acct, 20);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        if (!$rows)
+            cli_result(result_ok("$acct has not restored anything yet."), $opts);
+        foreach ($rows as $j)
+            printf("#%-5d %s  %-8s %-8s %-9s %s\n   %s\n", $j['id'], date('Y-m-d H:i', $j['queued']), $j['kind'], $j['mode'], $j['status'],
+                   $j['kind'] === 'files' ? '~/'.$j['target'] : $j['target'], $j['message']);
+        exit(0);
+    }
+    usage_backup($prog);
+    exit(2);
+}
+
+/* ---- wordpress ----------------------------------------------------------- */
+
+function cmd_wordpress($prog, $sub, array $pos, array $opts) {
+    global $ini;
+    cli_allow($opts, cli_opts('wordpress', $sub));
+    if ($sub === '__run') {
+        /* the runner of a background update, started by wordpress_job_start() as unit reqad-wp-<site> */
+        cli_need($pos, 1, '<job>');
+        wordpress_job_execute((int)$pos[0]);
+        exit(0);
+    }
+    /* cache-refresh keeps existing cache blocks valid even with the toolkit off */
+    if ($sub !== 'cache-refresh' && !feature_enabled($ini, 'wptoolkit'))
+        cli_result(result_error('The WordPress Toolkit is turned off on this server (wptoolkit in server-software.ini).'), $opts);
+    $need_site = function () use ($pos, $opts) {
+        cli_need($pos, 1, '<site>');
+        $w = wordpress_find($pos[0]);
+        if (!$w) cli_result(result_error("No WordPress site '{$pos[0]}'. '".basename($GLOBALS['argv'][0])." wordpress list' shows them."), $opts);
+        return $w;
+    };
+    switch ($sub) {
+    case 'list':
+        cli_need($pos, 0, '');
+        $acct = cli_scope() ?? (isset($opts['account']) && is_string($opts['account']) ? $opts['account'] : '');
+        $rows = wordpress_sites($acct);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        foreach ($rows as &$r) {
+            $r['site'] = $r['domain'].($r['path'] !== '' ? '/'.$r['path'] : '');
+            $r['ver'] = ($r['version'] !== '' ? $r['version'] : '?').($r['core_status'] ? ' ('.$r['core_status'].')' : '');
+        }
+        unset($r);
+        cli_table($rows, array('ID' => 'id', 'SITE' => 'site', 'ACCOUNT' => 'account', 'WORDPRESS' => 'ver', 'TITLE' => 'title'));
+        exit(0);
+
+    case 'scan':
+        cli_need($pos, 1, '<account>');
+        $r = wordpress_scan($pos[0]);
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        echo $r['message']."\n";
+        foreach (array('added' => 'new', 'removed' => 'gone') as $k => $label)
+            foreach ($r['data'][$k] as $site)
+                echo "  $label: $site\n";
+        foreach ($r['warnings'] as $w) fwrite(STDERR, "warning: $w\n");
+        exit(0);
+
+    case 'show':
+        $w = $need_site();
+        $r = wordpress_info($w, !empty($opts['refresh']));
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        $d = $r['data'];
+        printf("%-12s %s\n", 'site:', $d['url']);
+        printf("%-12s %s\n", 'title:', $d['title']);
+        printf("%-12s %s%s%s\n", 'wordpress:', $d['version'], $d['core_status'] ? ' ('.$d['core_status'].')' : '',
+               ($d['core_updates'] ? ', update to '.implode(' / ', $d['core_updates']) : '')
+               .($d['core_blocked'] ? ' ('.$d['core_blocked']['version'].' needs PHP '.$d['core_blocked']['php'].')' : ''));
+        printf("%-12s %s\n", 'php:', $d['php_full'] ?: $d['php']);
+        printf("%-12s %s\n", 'checked:', $d['updates_checked'] ? date('Y-m-d H:i', $d['updates_checked']) : '-');
+        foreach (array('plugins', 'themes') as $k) {
+            echo "$k:\n";
+            foreach ($d[$k] as $p)
+                printf("  %-32s %-12s %-9s %s\n", $p['slug'], $p['version'], $p['active'] ? 'active' : '-', $p['update'] !== null ? 'update: '.$p['update'].($p['needs'] ? ' (needs '.($p['needs']['what'] === 'php' ? 'PHP' : 'WordPress').' '.$p['needs']['version'].')' : '') : '');
+        }
+        exit(0);
+
+    case 'auto-run':
+        foreach (wordpress_auto_run_due() as $l)
+            if (empty($opts['quiet'])) echo $l."\n";
+        exit(0);
+
+    case 'cache':
+        $w = $need_site();
+        if (isset($opts['pages']) || isset($opts['cookies'])) {
+            $now = wp_cache_rules_get($w['domain']);
+            $get = function ($k) use ($opts, $now) {
+                return isset($opts[$k]) ? (is_string($opts[$k]) ? $opts[$k] : '') : $now[$k];
+            };
+            cli_result(wordpress_cache_rules_set($w, $get('pages'), $get('cookies')), $opts);
+        }
+        $r = wp_cache_rules_get($w['domain']);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $r), $opts);
+        printf("%-10s %s\n", 'cache:', wp_nginx_cache_state($ini, $w['domain']));
+        printf("%-10s %s\n", 'pages:', $r['pages'] ? implode(' ', $r['pages']) : '-');
+        printf("%-10s %s\n", 'cookies:', $r['cookies'] ? implode(' ', $r['cookies']) : '-');
+        exit(0);
+
+    case 'cache-refresh':
+        cli_need($pos, 0, '');
+        if (!wp_is_nginx($ini))
+            exit(0);
+        $changed = 0;
+        $fail = 0;
+        foreach (glob('/etc/nginx/conf.d/*.conf') ?: array() as $f) {
+            if (!preg_match('/^# BEGIN reqad-nginx-cache[ \t]*$/m', (string)@file_get_contents($f)))
+                continue;
+            $domain = basename($f, '.conf');
+            $orig = (string)file_get_contents($f);
+            $new = wp_nginx_cache_rewrite($orig, $domain);
+            if ($new === null || $new === $orig)
+                continue;
+            if (!empty($opts['dry-run'])) {
+                echo "$domain: would be written again\n";
+                continue;
+            }
+            $bk = '/var/lib/reqad/vhost-backups/page-cache-'.date('Ymd');
+            @mkdir($bk, 0700, true);
+            @copy($f, $bk.'/'.basename($f));
+            list($err, $did) = wp_nginx_cache_refresh($domain, false);
+            if ($err !== '') {
+                $fail++;
+                fwrite(STDERR, "$domain: $err\n");
+            } elseif ($did) {
+                $changed++;
+                if (empty($opts['quiet'])) echo "$domain: page cache blocks written again\n";
+            }
+        }
+        if ($changed)
+            shell_exec('systemctl reload nginx 2>&1');
+        if (empty($opts['quiet']) || $changed || $fail)
+            echo "page cache: $changed site(s) updated".($fail ? ", $fail left as they were" : '')."\n";
+        exit($fail ? 1 : 0);
+
+    case 'auto':
+        $w = $need_site();
+        $o = array();
+        if (!empty($opts['off']))
+            $o = array('core' => 'off', 'plugins' => 'off', 'themes' => 'off');
+        if (isset($opts['core'])) $o['core'] = (string)$opts['core'];
+        foreach (array('plugins' => 'plugin_list', 'themes' => 'theme_list') as $k => $lk)
+            if (isset($opts[$k])) {
+                $v = is_string($opts[$k]) ? $opts[$k] : 'all';
+                if (in_array($v, array('off', 'all'), true)) $o[$k] = $v;
+                else { $o[$k] = 'some'; $o[$lk] = $v; }
+            }
+        if (isset($opts['when'])) {
+            $days = array('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat');
+            $d = strtolower(substr((string)$opts['when'], 0, 3));
+            if ($opts['when'] === 'daily') $o['weekday'] = -1;
+            elseif (($i = array_search($d, $days, true)) !== false) $o['weekday'] = $i;
+            else cli_result(result_error('--when: daily, or a day (sun, mon, ... sat).'), $opts);
+        }
+        if (isset($opts['hour'])) $o['hour'] = $opts['hour'];
+        if (isset($opts['wait'])) $o['delay'] = $opts['wait'];
+        if ($o) {
+            $r = wordpress_auto_set($w, $o);
+            cli_result($r, $opts);
+        }
+        $a = wordpress_auto_get($w['id']);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $a), $opts);
+        $days = array('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday');
+        printf("%-11s %s\n", 'wordpress:', $a['core'] === 'minor' ? 'security and fix releases' : $a['core']);
+        printf("%-11s %s\n", 'plugins:', $a['plugins'] === 'some' ? implode(', ', $a['plugin_list']) : $a['plugins']);
+        printf("%-11s %s\n", 'themes:', $a['themes'] === 'some' ? implode(', ', $a['theme_list']) : $a['themes']);
+        printf("%-11s %s at %02d:00 (%s)%s\n", 'when:', $a['weekday'] < 0 ? 'every day' : 'every '.$days[$a['weekday']], $a['hour'], system_timezone() ?: 'UTC',
+               $a['delay'] ? ', '.$a['delay'].' days after a release' : '');
+        printf("%-11s %s\n", 'next run:', $a['next_run'] ? wordpress_auto_when($a['next_run']) : '-');
+        printf("%-11s %s\n", 'last run:', $a['last_run'] ? date('Y-m-d H:i', $a['last_run']).' '.$a['last_status'].': '.$a['last_message'] : '-');
+        exit(0);
+
+    case 'update':
+        $w = $need_site();
+        $steps = array();
+        foreach (array('core', 'plugins', 'themes') as $k)
+            if (isset($opts[$k]))
+                $steps[] = array($k, is_string($opts[$k]) ? preg_split('/[\s,]+/', $opts[$k], -1, PREG_SPLIT_NO_EMPTY) : array());
+        if (!$steps)
+            cli_die("say what to update: --core, --plugins[=LIST], --themes[=LIST]");
+        $r = wordpress_update_steps($w, $steps);
+        if (!empty($opts['json']))
+            cli_result($r, $opts);
+        if (!empty($r['data']['output']))
+            echo $r['data']['output']."\n\n";
+        cli_result($r, $opts);
+
+    case 'login':
+        $w = $need_site();
+        $r = wordpress_login($w);
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        echo $r['data']['url']."\n";
+        fwrite(STDERR, "Opens the dashboard once, within 2 minutes.\n");
+        exit(0);
+    }
+    fwrite(STDERR, "reqad: unknown wordpress command '$sub'\n\n");
+    usage_wordpress($prog);
+    exit(2);
+}
+
 /* ---- account ------------------------------------------------------------- */
 
 function cmd_account($prog, $sub, array $pos, array $opts) {
@@ -547,6 +2104,8 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
         cli_allow($opts, cli_opts('account', 'list'));
         cli_need($pos, 0, '');
         $rows = account_list($db);
+        if (cli_scope() !== null)
+            $rows = array_values(array_filter($rows, function ($r) { return $r['user'] === cli_scope(); }));
         foreach ($rows as &$r)
             $r['email_flag'] = $r['has_email'] ? 'yes' : 'no';
         unset($r);
@@ -559,36 +2118,49 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
     case 'show':
         cli_allow($opts, cli_opts('account', 'show'));
         cli_need($pos, 1, '<user>');
-        $row = account_get($db, $pos[0]);
-        if (!$row)
+        $data = account_info($db, $pos[0]);
+        if (!$data)
             cli_result(result_error("Account {$pos[0]} not found."), $opts);
-        list($php, $handler) = account_php($row['domain']);
-        $data = array(
-            'uid' => $row['id'], 'user' => $row['user'], 'domain' => $row['domain'],
-            'status' => $row['status'], 'created_at' => $row['created_at'],
-            'email' => ($row['has_email'] == 1), 'disk_usage' => $row['disk_usage'], 'disk_quota' => $row['disk_quota'],
-            'php' => $php, 'php_handler' => $handler,
-            'mailboxes' => array_column(email_list($row['domain']), 'email'),
-            'databases' => array_column(database_list($row['user']), 'name'),
-        );
         if (!empty($opts['json']))
             cli_result(result_ok('', $data), $opts);
+        $sl = $data['session_limits'];
+        $data['session_limits'] = !$sl ? '-' : ($sl['mode'] === 'none' ? 'no limits'
+            : ($sl['mode'] === 'missing' ? 'not set'
+            : "CPU {$sl['cpu']}%, memory {$sl['memory_mb']} MB, {$sl['processes']} processes ({$sl['mode']})"));
+        $dc = $data['db_connections'];
+        $data['db_connections'] = ($dc['per_user'] ? $dc['per_user'].' per database user' : 'no limit')
+            .($dc['default'] ? ' (default)' : ' (custom)');
         foreach ($data as $k => $v) {
             if (is_bool($v)) $v = $v ? 'yes' : 'no';
-            if (is_array($v)) $v = $v ? implode(', ', $v) : '-';
-            printf("%-12s %s\n", $k.':', $v);
+            if ($v === null) $v = '-';
+            if (is_array($v)) {
+                /* a plugin's fields: "name value" pairs, nested values joined with "/" */
+                $flat = array();
+                foreach ($v as $vk => $vv) {
+                    if (is_array($vv))
+                        $vv = implode('/', array_map(function ($x) { return $x === null ? 'unlimited' : (is_array($x) ? '...' : $x); }, $vv));
+                    $flat[] = is_string($vk) ? str_replace('_', ' ', $vk).' '.$vv : $vv;
+                }
+                $v = $flat ? implode(', ', $flat) : '-';
+            }
+            printf("%-16s %s\n", str_replace('_', ' ', $k).':', $v);
         }
         exit(0);
 
     case 'create':
         cli_allow($opts, cli_opts('account', 'create'));
         cli_need($pos, 2, '<user> <domain>');
+        if (isset($opts['shell']) && !in_array($opts['shell'], array('full', 'jailed', 'none'), true))
+            cli_die("--shell must be full, jailed or none");
         list($pw, $gen) = cli_password($opts, 'account');
         $r = account_create($db, array(
             'user' => $pos[0], 'domain' => $pos[1], 'password' => $pw,
             'disk_quota' => isset($opts['quota']) ? (int)$opts['quota'] : 0,
             'dns' => !empty($opts['dns']), 'letsencrypt' => !empty($opts['letsencrypt']),
             'email' => !empty($opts['email']), 'www' => !empty($opts['www']),
+            'shell' => isset($opts['shell']) && is_string($opts['shell']) ? $opts['shell'] : '',
+            'php'   => isset($opts['php']) && is_string($opts['php']) ? $opts['php'] : '',
+            'package' => isset($opts['package']) && is_string($opts['package']) ? $opts['package'] : '',
         ));
         cli_result($r, $opts, $gen ? $pw : null);
 
@@ -607,6 +2179,10 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
             if (!in_array($opts['email'], array('on', 'off'), true)) cli_die("--email must be on or off");
             $o['email'] = ($opts['email'] === 'on');
         }
+        if (isset($opts['shell'])) {
+            if (!in_array($opts['shell'], array('full', 'jailed', 'none'), true)) cli_die("--shell must be full, jailed or none");
+            $o['shell'] = $opts['shell'];
+        }
         if (count($o) == 1)
             cli_die("nothing to change; see '$prog account --help'");
         cli_result(account_edit($db, $o), $opts, $gen ? $o['password'] : null);
@@ -618,6 +2194,127 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
             cli_result(result_error("Account {$pos[0]} not found."), $opts);
         cli_confirm($opts, $pos[0], 'account');
         cli_result(account_delete($db, $pos[0]), $opts);
+
+    case 'perms':
+        cli_allow($opts, cli_opts('account', 'perms'));
+        cli_need($pos, 1, '<user>');
+        if (!account_get($db, $pos[0]))
+            cli_die("no hosting account '{$pos[0]}'", 1);
+        $args = array($pos[0]);
+        foreach (array('fix', 'keep-root', 'quiet') as $o)
+            if (!empty($opts[$o])) $args[] = "--$o";
+        passthru('bash '.escapeshellarg(_PATH.'/scripts/fix_account_perms.sh').' '.implode(' ', array_map('escapeshellarg', $args)), $rc);
+        if (!empty($opts['fix']))
+            route_log("account permissions of {$pos[0]} fixed (cli)");
+        exit($rc);
+
+    case 'can-create':
+        cli_allow($opts, cli_opts('account', 'can-create'));
+        cli_need($pos, 2, '<user|-> <resource>');
+        $who = $pos[0] === '-' ? '' : $pos[0];
+        if ($who !== '' && !account_get($db, $who))
+            cli_result(result_error("Account $who not found."), $opts);
+        $ctx = isset($opts['domain']) && is_string($opts['domain']) ? array('domain' => strtolower($opts['domain'])) : array();
+        $e = limit_allows($who, $pos[1], $ctx);
+        if (!empty($opts['json']))
+            cli_result($e === '' ? result_ok('allowed') : result_error($e), $opts);
+        if ($e !== '')
+            cli_die($e, 1);
+        echo "yes\n";
+        exit(0);
+
+    case 'limits':
+        cli_allow($opts, cli_opts('account', 'limits'));
+        if (!empty($opts['sync-db'])) {
+            $r = database_conn_sync($pos ? $pos[0] : '');
+            if (!empty($opts['quiet']) && $r['ok'] && empty($opts['json'])) exit(0);
+            cli_result($r, $opts);
+        }
+        if (isset($opts['db-connections'])) {
+            cli_need($pos, 1, '<user>');
+            $v = $opts['db-connections'];
+            if ($v === 'default') $v = null;
+            else if (is_string($v) && ctype_digit($v)) $v = (int)$v;
+            else cli_die("--db-connections takes a number (0 = no limit) or 'default'");
+            cli_result(database_conn_limit_set($pos[0], $v), $opts);
+        }
+        if (!$pos) {
+            /* no account: the latest hits of all accounts */
+            $ev = trim((string)shell_exec('sudo '._PATH.'/scripts/session_limits.sh events 30 2>/dev/null'));
+            $rows = array();
+            foreach (array_filter(explode("\n", $ev), 'strlen') as $line) {
+                $f = explode("\t", $line);
+                if (count($f) >= 4)
+                    $rows[] = array('time' => $f[0], 'user' => $f[1], 'limit' => $f[2], 'detail' => $f[3]);
+            }
+            if (!$rows && empty($opts['json'])) {
+                echo "No session limit hits recorded.\n";
+                exit(0);
+            }
+            cli_list($rows, $opts, array('TIME' => 'time', 'USER' => 'user', 'LIMIT' => 'limit', 'WHAT HAPPENED' => 'detail'));
+        }
+        cli_need($pos, 1, '<user>');
+        if (!account_get($db, $pos[0]))
+            cli_result(result_error("Account {$pos[0]} not found."), $opts);
+        $cur = account_session_limits($pos[0], 10);
+        if (!$cur)
+            cli_result(result_error("Could not read the session limits of {$pos[0]}."), $opts);
+        $set = array_intersect_key($opts, array_flip(array('cpu', 'memory', 'processes')));
+        if (!empty($opts['default']) || !empty($opts['none'])) {
+            if ($set || (!empty($opts['default']) && !empty($opts['none'])))
+                cli_die("--default and --none go alone");
+            cli_result(account_session_limits_set($pos[0], !empty($opts['none']) ? 'none' : 'default'), $opts);
+        }
+        if ($set) {
+            $v = array(
+                'cpu'       => $cur['cpu'] ?? (int)$cur['default_cpu'],
+                'memory'    => $cur['memory_mb'] ?? (int)$cur['default_memory_mb'],
+                'processes' => $cur['tasks'] ?? (int)$cur['default_tasks'],
+            );
+            foreach ($set as $k => $val) {
+                $val = is_string($val) ? strtoupper(trim($val)) : '';
+                if ($k === 'memory' && preg_match('/^([0-9]+(?:\.[0-9]+)?)(G|GB|M|MB)?$/', $val, $m))
+                    $v[$k] = (int)round($m[1] * (isset($m[2]) && $m[2][0] === 'G' ? 1024 : 1));
+                else if ($k === 'cpu' && preg_match('/^([0-9]+)%?$/', $val, $m))
+                    $v[$k] = (int)$m[1];
+                else if ($k === 'processes' && preg_match('/^[0-9]+$/', $val))
+                    $v[$k] = (int)$val;
+                else
+                    cli_die("--$k: bad value '".(is_string($opts[$k]) ? $opts[$k] : '')."'");
+            }
+            cli_result(account_session_limits_set($pos[0], 'custom', $v['cpu'], $v['memory'], $v['processes']), $opts);
+        }
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $cur), $opts);
+        if ($cur['mode'] === 'none')
+            $lim = 'none (no limits)';
+        else if ($cur['mode'] === 'missing')
+            $lim = 'not set (run scripts/update/setup_session_limits.sh --apply)';
+        else
+            $lim = "CPU {$cur['cpu']}%, memory {$cur['memory_mb']} MB, {$cur['tasks']} processes ({$cur['mode']})";
+        if ($cur['active'])
+            $now = 'memory '.$cur['mem_now_mb'].' MB'.(isset($cur['mem_peak_mb']) ? ' (peak '.$cur['mem_peak_mb'].' MB)' : '')
+                 .', '.$cur['tasks_now'].' processes, CPU slowed down for '.$cur['cpu_throttled_s'].' s';
+        else
+            $now = 'no session running';
+        printf("%-13s %s\n", 'limits:', $lim);
+        printf("%-13s %s\n", 'in use now:', $now);
+        printf("%-13s %s\n", 'hits 30 days:', 'memory '.$cur['hits_memory_30d'].', processes '.$cur['hits_tasks_30d']);
+        $dbn = database_conn_limit($pos[0]); $open = database_conn_now();
+        $dbu = array();
+        foreach (database_account_users($pos[0]) as $u)
+            $dbu[] = $u['user'].(count(array_keys(array_column(database_account_users($pos[0]), 'user'), $u['user'])) > 1 ? '@'.$u['host'] : '')
+                   .' ('.($open[$u['user']] ?? 0).' open'.($u['limit'] !== $dbn ? ', set to '.($u['limit'] ?: 'none') : '').')';
+        printf("%-13s %s\n", 'databases:', ($dbn ? "$dbn connections per database user" : 'no connection limit')
+            .(database_conn_is_default($pos[0]) ? ' (default)' : ' (custom)'));
+        if ($dbu)
+            printf("%-13s %s\n", '', implode(', ', $dbu));
+        if ($cur['events']) {
+            echo "recent hits:\n";
+            foreach ($cur['events'] as $e)
+                printf("  %s  %-9s  %s\n", $e['time'], $e['limit'], $e['detail']);
+        }
+        exit(0);
 
     default:
         cli_die("unknown account command '$sub'; see '$prog account --help'");
@@ -631,7 +2328,7 @@ function cmd_db($prog, $sub, array $pos, array $opts) {
     case 'list':
         cli_allow($opts, cli_opts('db', 'list'));
         cli_need($pos, 0, '');
-        $rows = database_list(isset($opts['account']) && $opts['account'] !== true ? $opts['account'] : '');
+        $rows = database_list(cli_scope() !== null ? cli_scope() : (isset($opts['account']) && $opts['account'] !== true ? $opts['account'] : ''));
         if (empty($opts['json'])) {
             foreach ($rows as &$r) {
                 $r['users']   = $r['users'] ? implode(', ', $r['users']) : '-';
@@ -644,7 +2341,7 @@ function cmd_db($prog, $sub, array $pos, array $opts) {
     case 'create':
         cli_allow($opts, cli_opts('db', 'create'));
         cli_need($pos, 2, '<account> <name>');
-        $dbuser = isset($opts['user']) && $opts['user'] !== true ? $opts['user'] : $pos[1];
+        $dbuser = isset($opts['dbuser']) && $opts['dbuser'] !== true ? $opts['dbuser'] : $pos[1];
         list($pw, $gen) = cli_password($opts, 'database user');
         cli_result(database_create(array('account' => $pos[0], 'name' => $pos[1], 'dbuser' => $dbuser, 'password' => $pw)), $opts, $gen ? $pw : null);
 
@@ -672,6 +2369,42 @@ function cmd_db($prog, $sub, array $pos, array $opts) {
         cli_need($pos, 1, '<database>');
         cli_result(database_unassign($pos[0]), $opts);
 
+    case 'export':
+        cli_allow($opts, cli_opts('db', 'export'));
+        cli_need($pos, 1, '<database>');
+        if (!in_array($pos[0], array_column(database_list(cli_scope() !== null ? cli_scope() : ''), 'name'), true))
+            cli_result(result_error("Database {$pos[0]} does not exist."), $opts);
+        $gzip = empty($opts['no-gzip']);
+        $file = isset($opts['output']) && is_string($opts['output']) && $opts['output'] !== ''
+            ? $opts['output'] : preg_replace('/[^A-Za-z0-9._-]+/', '_', $pos[0]).'-'.date('Ymd-His').($gzip ? '.sql.gz' : '.sql');
+        if ($file === '-') {
+            if (function_exists('posix_isatty') && posix_isatty(STDOUT))
+                cli_die('not writing a database dump to the terminal: pipe it, or use --output=FILE');
+            $fh = STDOUT;
+        } else {
+            $old = umask(077);
+            $fh = @fopen($file, 'xb');
+            umask($old);
+            if (!$fh)
+                cli_die(file_exists($file) ? "$file already exists; pick another --output" : "cannot write $file", 1);
+        }
+        $r = database_export($pos[0], function ($d) use ($fh) { return fwrite($fh, $d) === strlen($d); }, $gzip);
+        if ($fh !== STDOUT) {
+            fclose($fh);
+            if (!$r['ok'])
+                @unlink($file);
+        }
+        if ($file === '-') {
+            if (!$r['ok'])
+                cli_die($r['error'], 1);
+            exit(0);
+        }
+        if ($r['ok']) {
+            $r['data']['file'] = realpath($file);
+            $r['message'] = "Saved {$pos[0]} to {$r['data']['file']} (".round($r['data']['bytes'] / 1048576, 1).' MB).';
+        }
+        cli_result($r, $opts);
+
     default:
         cli_die("unknown db command '$sub'; see '$prog db --help'");
     }
@@ -688,6 +2421,8 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
         cli_allow($opts, cli_opts('email', 'list'));
         cli_need($pos, 0, '');
         $rows = email_list(isset($opts['domain']) && $opts['domain'] !== true ? $opts['domain'] : '');
+        if (cli_scope() !== null)
+            $rows = array_values(array_filter($rows, function ($r) { return scope_owns(cli_scope(), 'mailbox', $r['email']); }));
         if (empty($opts['json'])) {
             foreach ($rows as &$r) $r['enabled'] = $r['enabled'] ? 'active' : 'disabled';
             unset($r);
@@ -698,7 +2433,10 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
         cli_allow($opts, cli_opts('email', 'create'));
         cli_need($pos, 1, '<address>');
         list($pw, $gen) = cli_password($opts, 'mailbox');
-        cli_result(email_create(array('email' => $pos[0], 'password' => $pw)), $opts, $gen ? $pw : null);
+        $o = array('email' => $pos[0], 'password' => $pw);
+        if (isset($opts['size']))
+            $o['size'] = is_string($opts['size']) ? $opts['size'] : cli_die('--size needs a value (--size=500M)');
+        cli_result(email_create($o), $opts, $gen ? $pw : null);
 
     case 'edit':
         cli_allow($opts, cli_opts('email', 'edit'));
@@ -709,6 +2447,8 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
             cli_die("--enable and --disable are mutually exclusive");
         if (!empty($opts['enable']))  $o['enabled'] = true;
         if (!empty($opts['disable'])) $o['enabled'] = false;
+        if (isset($opts['size']))
+            $o['size'] = is_string($opts['size']) && $opts['size'] !== '' ? $opts['size'] : cli_die('--size needs a value (--size=500M or --size=default)');
         if (isset($opts['password']) || isset($opts['password-stdin']) || isset($opts['generate-password']))
             list($o['password'], $gen) = cli_password($opts, 'mailbox');
         if (count($o) == 1)
@@ -723,9 +2463,1116 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
         cli_confirm($opts, strtolower($pos[0]), 'mailbox');
         cli_result(email_delete($db, $pos[0]), $opts);
 
+    case 'sites':
+        cli_allow($opts, cli_opts('email', 'sites'));
+        cli_need($pos, 1, '<account>');
+        if (!account_get($db, $pos[0]))
+            cli_result(result_error("Account {$pos[0]} not found."), $opts);
+        $rows = array();
+        foreach (domain_sites($pos[0], false) as $si)
+            $rows[] = array('domain' => $si['domain'], 'kind' => $si['kind'] === 'main' ? 'main' : ($si['subdomain_of'] !== '' ? 'subdomain' : 'addon'),
+                            'mail' => $si['mail_state'] !== '' ? $si['mail_state'] : 'off (account)');
+        cli_list($rows, $opts, array('SITE' => 'domain', 'KIND' => 'kind', 'EMAIL' => 'mail'));
+
+    case 'site':
+        cli_allow($opts, cli_opts('email', 'site'));
+        cli_need($pos, 2, '<domain> on|off');
+        $d = strtolower($pos[0]);
+        if (!in_array($pos[1], array('on', 'off'), true))
+            cli_die("'$prog email site <domain>' takes on or off");
+        $a = addon_domain_get($ini, $d);
+        if (!$a)
+            cli_result(result_error("$d is not an addon domain (the main domain follows the account: '$prog account edit <account> --email=on|off')."), $opts);
+        $r = $pos[1] === 'on' ? domain_mail_enable($a['user'], $d) : domain_mail_disable($a['user'], $d);
+        if ($r['ok'] && !empty($r['data']['reissue']) && empty($opts['no-cert'])) {
+            $c = ssl_site_issue($a['user'], $d);
+            $r['warnings'][] = $c['ok'] ? $c['message'] : 'The certificate was not issued again: '.$c['error'];
+        }
+        cli_result($r, $opts);
+
     default:
         cli_die("unknown email command '$sub'; see '$prog email --help'");
     }
+}
+
+/* ---- auth ---------------------------------------------------------------- */
+
+/* The admin principal named $name, or the only one when $name is ''. */
+function cli_admin($name, $create = false) {
+    auth_bootstrap();
+    if ($name === '') {
+        $all = auth_admins();
+        if (count($all) === 1)
+            return $all[0];
+        if (!$all && $create)
+            $name = 'reqad';
+        elseif (!$all)
+            cli_die('no panel admin exists yet; create one with: reqad auth passwd', 1);
+        else
+            cli_die('several admins exist; name one: '.implode(', ', array_column($all, 'username')));
+    }
+    $p = auth_principal($name);
+    if (!$p && $create) {
+        if (!preg_match('/^[A-Za-z0-9._-]{1,64}$/', $name))
+            cli_die("invalid user name '$name'");
+        auth_q("INSERT INTO auth_principals (type, username, email, created_at) VALUES ('admin', :u, :e, :ts)",
+               array('u' => $name, 'e' => auth_setting('email', ''), 'ts' => time()));
+        $p = auth_principal($name);
+    }
+    if (!$p)
+        cli_die("no panel admin '$name'", 1);
+    return $p;
+}
+
+function auth_mode_label($mode) {
+    if ($mode === 'web')
+        return 'web (login page, sessions, 2FA)';
+    if ($mode === 'basic')
+        return 'basic (nginx basic auth)';
+    return 'unknown';
+}
+
+function cmd_auth($prog, $sub, array $pos, array $opts) {
+    if (!auth_ready())
+        cli_die('the login tables are missing - apply db/1037.sql (Reqad update) first', 1);
+    $script = REQAD_ROOT.'/scripts/panel_auth_mode.sh';
+    switch ($sub) {
+    case 'status':
+        cli_allow($opts, cli_opts('auth', 'status'));
+        cli_need($pos, 0, '');
+        auth_bootstrap();
+        $mode = trim((string)shell_exec('bash '.escapeshellarg($script).' status 2>/dev/null'));
+        $rows = array();
+        foreach (auth_admins() as $a)
+            $rows[] = array('user' => $a['username'], 'twofa' => (int)$a['totp_enabled'] ? 'on' : 'off',
+                            'changed' => $a['pw_changed_at'] ? date('Y-m-d H:i', (int)$a['pw_changed_at']) : '-',
+                            'sessions' => count(auth_sessions_list($a['id'])), 'status' => $a['status']);
+        if (!empty($opts['json'])) {
+            echo json_encode(result_ok('', array('mode' => $mode, 'admins' => $rows, 'blocked' => auth_blocked_list())),
+                             JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."
+";
+            exit(0);
+        }
+        echo 'Login mode: '.cli_white(auth_mode_label($mode))."
+";
+        cli_table($rows, array('USER' => 'user', '2FA' => 'twofa', 'PASSWORD CHANGED' => 'changed', 'SESSIONS' => 'sessions', 'STATUS' => 'status'));
+        $b = auth_blocked_list();
+        if ($b) {
+            echo "Blocked addresses:
+";
+            foreach ($b as &$r) $r['until_s'] = $r['until'] ? date('Y-m-d H:i', $r['until']) : 'permanent';
+            unset($r);
+            cli_table($b, array('IP' => 'ip', 'BLOCKED IN' => 'kind', 'UNTIL' => 'until_s', 'REASON' => 'reason'));
+        }
+        exit(0);
+
+    case 'mode':
+        cli_allow($opts, cli_opts('auth', 'mode'));
+        if (count($pos) > 1) cli_need($pos, 1, 'status|web|basic');
+        if (!isset($pos[0]) || $pos[0] === 'status') {
+            $mode = trim((string)shell_exec('bash '.escapeshellarg($script).' status 2>/dev/null'));
+            if (!empty($opts['json'])) {
+                echo json_encode(result_ok('', array('mode' => $mode)), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n";
+                exit(0);
+            }
+            echo 'Login mode: '.cli_white(auth_mode_label($mode))."\n";
+            exit(0);
+        }
+        if (!in_array($pos[0], array('web', 'basic'), true))
+            cli_die("mode must be 'status', 'web' or 'basic'");
+        if ($pos[0] === 'web') {
+            if (($n = auth_bootstrap()) > 0)
+                fwrite(STDERR, "Imported $n login(s) from nginx_auth - the current password keeps working.\n");
+            $ok = false;
+            foreach (auth_admins() as $a)
+                if ($a['status'] === 'active' && $a['pw_hash'] !== '') $ok = true;
+            if (!$ok)
+                cli_die("no admin with a password yet; run 'reqad auth passwd' first", 1);
+        }
+        passthru('bash '.escapeshellarg($script).' '.escapeshellarg($pos[0]), $rc);
+        if ($rc === 0)
+            auth_log_event('auth_mode', 'panel login set to '.$pos[0].' from the command line', 0, auth_user());
+        exit($rc === 0 ? 0 : 1);
+
+    case 'passwd':
+        cli_allow($opts, cli_opts('auth', 'passwd'));
+        if (count($pos) > 1) cli_need($pos, 1, 'user');
+        $p = cli_admin(isset($pos[0]) ? $pos[0] : '', true);
+        list($pw, $gen) = cli_password($opts, 'panel');
+        if (($e = auth_password_policy($pw, $p['username'])) !== '')
+            cli_die($e, 1);
+        auth_password_set($p['id'], $pw);
+        auth_sessions_revoke_all($p['id']);
+        auth_log_event('password_changed', 'from the command line', (int)$p['id'], $p['username']);
+        cli_result(result_ok("Password set for panel admin '{$p['username']}'."), $opts, $gen ? $pw : null);
+
+    case '2fa-reset':
+        cli_allow($opts, cli_opts('auth', '2fa-reset'));
+        if (count($pos) > 1) cli_need($pos, 1, 'user');
+        $p = cli_admin(isset($pos[0]) ? $pos[0] : '');
+        auth_totp_disable($p['id']);
+        auth_log_event('2fa_disabled', 'reset from the command line', (int)$p['id'], $p['username']);
+        cli_result(result_ok("Two-factor authentication is off for '{$p['username']}'. Set it up again under Settings > Security."), $opts);
+
+    case 'sessions':
+        cli_allow($opts, cli_opts('auth', 'sessions'));
+        cli_need($pos, 0, '');
+        $rows = array();
+        foreach (auth_sessions_list() as $s)
+            $rows[] = array('user' => $s['username'], 'ip' => $s['ip'], 'browser' => auth_ua_label($s['ua']),
+                            'twofa' => (int)$s['mfa'] ? 'yes' : 'no',
+                            'login' => date('Y-m-d H:i', (int)$s['created_at']), 'seen' => date('Y-m-d H:i', (int)$s['last_seen']));
+        cli_list($rows, $opts, array('USER' => 'user', 'IP' => 'ip', 'BROWSER' => 'browser', '2FA' => 'twofa', 'LOGGED IN' => 'login', 'LAST SEEN' => 'seen'));
+
+    case 'logout':
+        cli_allow($opts, cli_opts('auth', 'logout'));
+        if (count($pos) > 1) cli_need($pos, 1, 'user');
+        if (isset($pos[0])) {
+            $p = cli_admin($pos[0]);
+            auth_sessions_revoke_all($p['id']);
+        } else {
+            auth_q('DELETE FROM auth_sessions');
+        }
+        auth_log_event('sessions_revoked', 'from the command line', 0, isset($pos[0]) ? $pos[0] : '*');
+        cli_result(result_ok('Logged out.'), $opts);
+
+    case 'unban':
+        cli_allow($opts, cli_opts('auth', 'unban'));
+        cli_need($pos, 1, 'ip');
+        if (!filter_var($pos[0], FILTER_VALIDATE_IP))
+            cli_die("not an IP address: {$pos[0]}");
+        auth_unban($pos[0]);
+        cli_result(result_ok("{$pos[0]} unblocked (login lockout cleared, csf entry removed)."), $opts);
+
+    case 'firewall':
+        cli_allow($opts, cli_opts('auth', 'firewall'));
+        if (count($pos) > 1) cli_need($pos, 1, 'status|off');
+        $op = isset($pos[0]) ? $pos[0] : 'status';
+        if ($op === 'off') {
+            if (($e = auth_fw_off()) !== '')
+                cli_die($e, 1);
+            cli_result(result_ok('Panel IP allowlist is off - port 2087 is open to every address. Turn it on again under Settings > Security.'), $opts);
+        }
+        if ($op !== 'status')
+            cli_die("firewall takes 'status' or 'off'");
+        $st = auth_fw_status();
+        if (!empty($opts['json'])) {
+            echo json_encode(result_ok('', array('firewall' => $st, 'saved' => auth_fw_list())), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n";
+            exit(0);
+        }
+        if (empty($st['csf'])) {
+            echo "csf is not installed.\n";
+            exit(0);
+        }
+        echo 'Panel IP allowlist: '.cli_white($st['on'] ? 'on' : 'off')
+            .($st['pending'] >= 0 ? " (unconfirmed - reverts in {$st['pending']} s)" : '')
+            .($st['on'] && $st['port_open'] ? ' - but port 2087 is still in TCP_IN/TCP6_IN' : '')."\n";
+        $rows = $st['on'] ? $st['rules'] : auth_fw_list();
+        if ($rows)
+            cli_table($rows, array($st['on'] ? 'ALLOWED' : 'SAVED (NOT ACTIVE)' => 'cidr', 'NOTE' => 'note'));
+        exit(0);
+
+    case 'email-code':
+        cli_allow($opts, cli_opts('auth', 'email-code'));
+        if (count($pos) > 1) cli_need($pos, 1, 'status|off|on');
+        $op = isset($pos[0]) ? $pos[0] : 'status';
+        if ($op === 'off') {
+            auth_setting_put('auth-email-code', '0');
+            auth_log_event('email_code_off', 'from the command line', 0, auth_user());
+            cli_result(result_ok('New devices no longer need an emailed code. Turn it back on with: reqad auth email-code on'), $opts);
+        }
+        if ($op === 'on') {
+            auth_q("DELETE FROM settings WHERE name = 'auth-email-code'");
+            auth_log_event('email_code_on', 'from the command line', 0, auth_user());
+            cli_result(result_ok('The email code is on again: asked from new devices when 2FA is off and the panel can send email.'), $opts);
+        }
+        if ($op !== 'status')
+            cli_die("email-code takes 'status', 'off' or 'on'");
+        $admins = auth_admins();
+        $state = $admins ? auth_email_code_state($admins[0]) : 'no-email';
+        $st = array('email_code' => auth_email_code_on(), 'state' => $state, 'login_alert' => auth_login_alert_on(),
+                    'verified_address' => auth_setting('auth-email-verified', ''));
+        if (!empty($opts['json'])) {
+            echo json_encode(result_ok('', $st), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n";
+            exit(0);
+        }
+        $why = array('active' => 'asked from new devices', '2fa' => 'not needed - 2FA is on', 'off' => 'turned off here',
+                     'no-smtp' => 'not asked - no sending method', 'no-email' => 'not asked - no email address');
+        echo 'Email code for new devices: '.cli_white($st['email_code'] ? 'on' : 'off').' ('.$why[$state].")\n"
+            .'Login alerts:               '.cli_white($st['login_alert'] ? 'on' : 'off')."\n"
+            .'Confirmed address:          '.($st['verified_address'] !== '' ? $st['verified_address'] : '-')."\n";
+        exit(0);
+
+    case 'passkeys':
+        cli_allow($opts, cli_opts('auth', 'passkeys'));
+        if (count($pos) > 1) cli_need($pos, 1, '<user>');
+        $p = cli_admin(isset($pos[0]) ? $pos[0] : '');
+        if (!empty($opts['remove-all'])) {
+            $n = count(auth_passkeys_list($p['id']));
+            auth_q('DELETE FROM auth_passkeys WHERE principal_id = :p', array('p' => (int)$p['id']));
+            auth_log_event('passkey_removed', "all $n, from the command line", (int)$p['id'], $p['username']);
+            cli_result(result_ok("Removed $n passkey(s) of '{$p['username']}'."), $opts);
+        }
+        $rows = array();
+        foreach (auth_passkeys_list($p['id']) as $k)
+            $rows[] = array('name' => $k['name'], 'added' => date('Y-m-d H:i', (int)$k['created_at']),
+                            'last_used' => $k['last_used'] ? date('Y-m-d H:i', (int)$k['last_used']).' from '.$k['last_ip'] : 'never');
+        cli_list($rows, $opts, array('NAME' => 'name', 'ADDED' => 'added', 'LAST USED' => 'last_used'));
+
+    case 'log':
+        cli_allow($opts, cli_opts('auth', 'log'));
+        cli_need($pos, 0, '');
+        $n = isset($opts['lines']) && ctype_digit((string)$opts['lines']) ? min(1000, (int)$opts['lines']) : 30;
+        $rows = array_reverse(auth_rows('SELECT * FROM auth_log ORDER BY id DESC LIMIT '.$n));
+        foreach ($rows as &$r) $r['time'] = date('Y-m-d H:i:s', (int)$r['ts']);
+        unset($r);
+        cli_list($rows, $opts, array('TIME' => 'time', 'EVENT' => 'event', 'USER' => 'username', 'IP' => 'ip', 'DETAIL' => 'detail'));
+
+    default:
+        cli_die("unknown auth command '$sub'; see '$prog auth --help'");
+    }
+}
+
+/* ---- --user=<account>: act with an account's permissions ------------------ */
+
+/* ---- health -------------------------------------------------------------- */
+
+function cmd_health($prog, $sub, array $pos, array $opts) {
+    global $db;
+    cli_allow($opts, cli_opts('health', $sub));
+    $sevc = function ($sev) {
+        if (!cli_colors()) return $sev;
+        $c = array('critical' => '91', 'warning' => '93', 'info' => '96');
+        return "\033[".($c[$sev] ?? '0')."m".$sev."\033[0m";
+    };
+    switch ($sub) {
+    case 'list':
+        cli_need($pos, 0, '');
+        $scope = cli_scope();
+        $acct  = isset($opts['account']) && is_string($opts['account']) ? $opts['account'] : null;
+        if ($acct === '-') $acct = '';
+        if ($scope !== null) {
+            if ($acct !== null && $acct !== $scope)
+                cli_die("--user=$scope: only its own problems", 1);
+            $acct = $scope;
+        }
+        $items = health_items($db, $acct, !empty($opts['all']));
+        $last  = (int)setting_get('health-last-run', '0');
+        if (!empty($opts['json'])) {
+            echo json_encode(result_ok('', array('last_run' => $last ?: null, 'counts' => health_counts($items), 'items' => $items)),
+                             JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n";
+            exit(0);
+        }
+        if (!$last) {
+            echo "The checks have not run yet: $prog health run\n";
+            exit(0);
+        }
+        echo 'Last checked '.date('Y-m-d H:i', $last).' (took '.setting_get('health-last-took', '?')." s)\n";
+        $rows = array();
+        foreach ($items as $it)
+            $rows[] = array('sev' => $sevc($it['severity']).($it['dismissed_until'] !== null ? ' (hidden)' : ''),
+                            'acct' => $it['account'] !== '' ? $it['account'] : '-', 'title' => $it['title'], 'id' => $it['id']);
+        if (!$rows) {
+            echo "Nothing needs attention.\n";
+            exit(0);
+        }
+        cli_table($rows, array('SEVERITY' => 'sev', 'ACCOUNT' => 'acct', 'PROBLEM' => 'title', 'ID' => 'id'));
+        exit(0);
+
+    case 'run':
+        cli_need($pos, 0, '');
+        $only = null;
+        if (isset($opts['check'])) {
+            $only = array_filter(array_map('trim', explode(',', (string)$opts['check'])));
+            $unknown = array_diff($only, array_keys(health_checks()));
+            if ($unknown)
+                cli_die('unknown check: '.implode(', ', $unknown)." (see '$prog health checks')", 2);
+        }
+        $r = health_run($db, $only);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $r), $opts);
+        if (empty($opts['quiet'])) {
+            $c = health_counts(health_items($db));
+            echo "Checked in {$r['took']} s: {$c['critical']} critical, {$c['warning']} warning, {$c['info']} info. "
+                ."'$prog health list' shows them.\n";
+        }
+        foreach ($r['errors'] as $id => $e)
+            fwrite(STDERR, "warning: check $id failed: $e\n");
+        exit(0);
+
+    case 'checks':
+        cli_need($pos, 0, '');
+        $rows = array();
+        foreach (health_checks() as $id => $c)
+            $rows[] = array('id' => $id, 'label' => $c['label'], 'scope' => $c['scope']);
+        cli_list($rows, $opts, array('ID' => 'id', 'CHECKS' => 'label', 'FOR' => 'scope'));
+
+    case 'dismiss':
+        cli_need($pos, 1, 'the problem id');
+        if (!empty($opts['forever']) && isset($opts['days']))
+            cli_die('--days and --forever do not go together', 2);
+        $days = !empty($opts['forever']) ? 0 : (isset($opts['days']) ? (int)$opts['days'] : 7);
+        if (empty($opts['forever']) && $days < 1)
+            cli_die('--days must be 1 or more (or --forever)', 2);
+        cli_result(health_dismiss($db, $pos[0], $days, cli_scope() ?? 'root'), $opts);
+
+    case 'restore':
+        cli_need($pos, 1, 'the problem id');
+        if (!health_item_get($db, $pos[0]))
+            cli_die("no health item '{$pos[0]}'", 1);
+        cli_result(health_restore($db, $pos[0]), $opts);
+    }
+    fwrite(STDERR, "reqad: unknown health command '$sub'\n\n");
+    usage_health($prog);
+    exit(2);
+}
+
+/* ---- api ---------------------------------------------------------------- */
+
+function cmd_api($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('api', $sub));
+    if (!api_available() && $sub !== 'status')
+        cli_die("the REST API is not available on this server: set api=1 in ".REQAD_ROOT."/etc/server-software.ini first", 1);
+    if (!api_ready() && $sub !== '')
+        cli_result(result_error('The API tables are missing: apply db/1042.sql (the Reqad update does it).'), $opts);
+    $date = function ($ts) { return (int)$ts ? date('Y-m-d H:i', (int)$ts) : '-'; };
+    switch ($sub) {
+    case 'status':
+        cli_need($pos, 0, '');
+        $tokens = api_tokens_list();
+        $active = count(array_filter($tokens, function ($t) { return $t['state'] === 'active'; }));
+        $vhost  = trim((string)shell_exec("grep -ls 'reqad-api BEGIN' /etc/reqad/conf.d/*.conf 2>/dev/null"));
+        $data = array('available' => api_available(), 'enabled' => api_enabled(), 'url' => api_url(), 'tokens_active' => $active,
+                      'nginx' => $vhost !== '');
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $data), $opts);
+        printf("%-9s %s\n", 'api:', !$data['available'] ? 'not available (api=0 in etc/server-software.ini)' : ($data['enabled'] ? 'on' : 'off'));
+        printf("%-9s %s\n", 'url:', $data['url']);
+        printf("%-9s %d active\n", 'tokens:', $active);
+        if (!$data['nginx'])
+            echo "warning: the panel vhost has no /api/ block - run scripts/update/setup_panel_api.sh\n";
+        exit(0);
+
+    case 'on':
+    case 'off':
+        cli_need($pos, 0, '');
+        cli_result(api_set_enabled($sub === 'on'), $opts);
+
+    case 'tokens':
+        cli_need($pos, 0, '');
+        $rows = api_tokens_list(!empty($opts['all']));
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        if (!$rows) {
+            echo "No tokens. Make one: $prog api new <name>\n";
+            exit(0);
+        }
+        foreach ($rows as &$r) {
+            $r['for']     = $r['account'] !== '' ? $r['account'] : 'server';
+            $r['perm']    = str_replace(',', '+', $r['scopes']);
+            $r['exp']     = (int)$r['expires'] ? $date($r['expires']) : 'never';
+            $r['used']    = (int)$r['last_used'] ? $date($r['last_used']).' '.$r['last_ip'] : 'never';
+            $r['st']      = $r['state'];
+        }
+        unset($r);
+        cli_table($rows, array('ID' => 'id', 'NAME' => 'name', 'PREFIX' => 'prefix', 'FOR' => 'for', 'PERMISSIONS' => 'perm',
+                               'EXPIRES' => 'exp', 'LAST USED' => 'used', 'STATE' => 'st'));
+        exit(0);
+
+    case 'new':
+        cli_need($pos, 1, '<name>');
+        $scopes = array('read');
+        if (!empty($opts['write']))  $scopes[] = 'write';
+        if (!empty($opts['delete'])) $scopes[] = 'delete';
+        $days = 90;
+        if (isset($opts['days'])) {
+            if (!is_string($opts['days']) || !ctype_digit($opts['days']))
+                cli_die('--days takes a number of days (0 = never expires)');
+            $days = (int)$opts['days'];
+        }
+        $acct = isset($opts['account']) && is_string($opts['account']) ? $opts['account'] : '';
+        $ips  = isset($opts['ip']) && is_string($opts['ip']) ? $opts['ip'] : '';
+        $r = api_token_create($pos[0], $acct, $scopes, $days, $ips, auth_user());
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        echo $r['message']."\n\n  ".$r['data']['token']."\n\n";
+        echo 'Use it as:  curl -H "Authorization: Bearer '.$r['data']['token'].'" '.api_url()."\n";
+        if (!api_enabled())
+            echo "The API is off: '$prog api on' turns it on.\n";
+        exit(0);
+
+    case 'revoke':
+        cli_need($pos, 1, '<id|name|prefix>');
+        cli_result(api_token_revoke($pos[0], auth_user()), $opts);
+
+    case 'log':
+        cli_need($pos, 0, '');
+        $n = isset($opts['lines']) && is_string($opts['lines']) && ctype_digit($opts['lines']) ? (int)$opts['lines'] : 30;
+        $tid = isset($opts['token']) && is_string($opts['token']) && ctype_digit($opts['token']) ? (int)$opts['token'] : 0;
+        $rows = api_log_rows($n, $tid);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        if (!$rows) {
+            echo "No API calls recorded.\n";
+            exit(0);
+        }
+        foreach ($rows as &$r) {
+            $r['time']  = date('Y-m-d H:i:s', (int)$r['ts']);
+            $r['tok']   = ($r['token_name'] ?? '?').' (#'.$r['token_id'].')';
+            $r['req']   = $r['method'].' '.$r['path'];
+            $r['ms']    = $r['ms'].' ms';
+        }
+        unset($r);
+        cli_table(array_reverse($rows), array('TIME' => 'time', 'TOKEN' => 'tok', 'FROM' => 'ip', 'REQUEST' => 'req', 'STATUS' => 'status', 'TOOK' => 'ms'));
+        exit(0);
+    }
+    fwrite(STDERR, "reqad: unknown api command '$sub'\n\n");
+    usage_api($prog);
+    exit(2);
+}
+
+/* ---- mcp ----------------------------------------------------------------- */
+
+function cli_mcp_token_file(array $opts) {
+    $f = isset($opts['token-file']) && is_string($opts['token-file']) ? $opts['token-file'] : '';
+    if ($f === '')
+        cli_die('--token-file=PATH is required (the file reqad mcp new made, /var/lib/reqad/mcp/<id>.token)');
+    $raw = @file_get_contents($f);
+    if ($raw === false)
+        cli_die("cannot read $f", 1);
+    return trim($raw);
+}
+
+/* Where the assistant connects from: the SSH client, else this machine. */
+function cli_mcp_ip() {
+    $c = trim((string)getenv('SSH_CLIENT'));
+    $ip = $c !== '' ? explode(' ', $c)[0] : '';
+    return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '127.0.0.1';
+}
+
+function cmd_mcp($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('mcp', $sub));
+    if (!mcp_available() && $sub !== 'status')
+        cli_die("AI access (MCP) is not available on this server: set mcp=1 in ".REQAD_ROOT."/etc/server-software.ini first", 1);
+    if (!mcp_ready() && $sub !== '')
+        cli_result(result_error('The AI access tables are missing: apply db/1045.sql (the Reqad update does it).'), $opts);
+    $date = function ($ts) { return (int)$ts ? date('Y-m-d H:i', (int)$ts) : '-'; };
+    switch ($sub) {
+    case 'serve':
+        cli_need($pos, 0, '');
+        $raw = cli_mcp_token_file($opts);
+        $_SERVER['REMOTE_ADDR'] = cli_mcp_ip();
+        exit(mcp_serve_stdio($raw, $_SERVER['REMOTE_ADDR']));
+
+    case 'status':
+        cli_need($pos, 0, '');
+        $active = count(array_filter(api_tokens_list(false, 'mcp'), function ($t) { return $t['state'] === 'active'; }));
+        $data = array('available' => mcp_available(), 'enabled' => mcp_enabled(), 'tokens_active' => $active, 'tools' => count(mcp_tool_routes()));
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $data), $opts);
+        printf("%-9s %s\n", 'mcp:', !$data['available'] ? 'not available (mcp=0 in etc/server-software.ini)' : ($data['enabled'] ? 'on' : 'off'));
+        printf("%-9s %d active\n", 'tokens:', $active);
+        printf("%-9s %d\n", 'tools:', $data['tools']);
+        exit(0);
+
+    case 'on':
+    case 'off':
+        cli_need($pos, 0, '');
+        cli_result(mcp_set_enabled($sub === 'on'), $opts);
+
+    case 'tokens':
+        cli_need($pos, 0, '');
+        $rows = api_tokens_list(!empty($opts['all']), 'mcp');
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        if (!$rows) {
+            echo "No tokens. Make one: $prog mcp new <name>\n";
+            exit(0);
+        }
+        foreach ($rows as &$r) {
+            $r['for']  = $r['account'] !== '' ? $r['account'] : 'server';
+            $r['perm'] = str_replace(',', '+', $r['scopes']);
+            $r['exp']  = $date($r['expires']);
+            $r['used'] = (int)$r['last_used'] ? $date($r['last_used']).' '.$r['last_ip'] : 'never';
+            $r['file'] = $r['state'] === 'active' ? mcp_token_file($r['id']) : '';
+        }
+        unset($r);
+        cli_table($rows, array('ID' => 'id', 'NAME' => 'name', 'FOR' => 'for', 'PERMISSIONS' => 'perm',
+                               'EXPIRES' => 'exp', 'LAST USED' => 'used', 'STATE' => 'state', 'TOKEN FILE' => 'file'));
+        exit(0);
+
+    case 'new':
+        cli_need($pos, 1, '<name>');
+        $scopes = array('read');
+        if (!empty($opts['write']))  $scopes[] = 'write';
+        if (!empty($opts['delete'])) $scopes[] = 'delete';
+        $days = 30;
+        if (isset($opts['days'])) {
+            if (!is_string($opts['days']) || !ctype_digit($opts['days']))
+                cli_die('--days takes a number of days (1 to 90)');
+            $days = (int)$opts['days'];
+        }
+        $acct = isset($opts['account']) && is_string($opts['account']) ? $opts['account'] : '';
+        $ips  = isset($opts['ip']) && is_string($opts['ip']) ? $opts['ip'] : '';
+        $r = mcp_token_create($pos[0], $acct, $scopes, $days, $ips, auth_user());
+        if ($r['ok'])
+            $r['data']['client'] = mcp_client_config($r['data']['token_file']);
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        $c = $r['data']['client'];
+        echo $r['message'].' It is saved in '.$r['data']['token_file']." (readable by root only).\n\n";
+        echo "Claude Code:\n\n  ".$c['claude_code']."\n\n";
+        echo "Claude Desktop, Cursor and other clients (mcpServers in their JSON settings):\n\n";
+        echo preg_replace('/^/m', '  ', $c['json'])."\n\n";
+        echo "Windows with the key in Pageant: use PuTTY's plink instead of ssh (accept the host key once with: ".$c['plink_test'].")\n\n  ".$c['plink_claude_code']."\n\n";
+        echo "The computer running the assistant needs an SSH key that logs in to root@".gethostname()." without a prompt.\n";
+        if (!mcp_enabled())
+            echo "AI access is off: '$prog mcp on' turns it on.\n";
+        exit(0);
+
+    case 'revoke':
+        cli_need($pos, 1, '<id|name|prefix>');
+        cli_result(mcp_token_revoke($pos[0], auth_user()), $opts);
+
+    case 'log':
+        cli_need($pos, 0, '');
+        $n = isset($opts['lines']) && is_string($opts['lines']) && ctype_digit($opts['lines']) ? (int)$opts['lines'] : 30;
+        $tid = isset($opts['token']) && is_string($opts['token']) && ctype_digit($opts['token']) ? (int)$opts['token'] : 0;
+        $rows = api_log_rows($n, $tid, 'mcp');
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        if (!$rows) {
+            echo "No tool calls recorded.\n";
+            exit(0);
+        }
+        foreach ($rows as &$r) {
+            $r['time'] = date('Y-m-d H:i:s', (int)$r['ts']);
+            $r['tok']  = ($r['token_name'] ?? '?').' (#'.$r['token_id'].')';
+            $r['ms']   = $r['ms'].' ms';
+        }
+        unset($r);
+        cli_table(array_reverse($rows), array('TIME' => 'time', 'TOKEN' => 'tok', 'FROM' => 'ip', 'TOOL' => 'path', 'STATUS' => 'status', 'TOOK' => 'ms'));
+        exit(0);
+
+    case 'tools':
+        cli_need($pos, 0, '');
+        $t = null;
+        if (isset($opts['token-file'])) {
+            list($t, $why) = mcp_token_check(cli_mcp_token_file($opts), cli_mcp_ip());
+            if (!$t)
+                cli_result(result_error($why), $opts);
+        }
+        $rows = array();
+        foreach (mcp_tool_routes($t) as $name => $r)
+            $rows[] = array('name' => $name, 'perm' => $r['perm'], 'server' => !empty($r['admin']) ? 'yes' : '',
+                            'summary' => $r['summary'] ?? '');
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $t ? mcp_tools_list($t) : $rows), $opts);
+        cli_table($rows, array('TOOL' => 'name', 'PERMISSION' => 'perm', 'SERVER ONLY' => 'server', 'WHAT IT DOES' => 'summary'));
+        exit(0);
+    }
+    fwrite(STDERR, "reqad: unknown mcp command '$sub'\n\n");
+    usage_mcp($prog);
+    exit(2);
+}
+
+/* ---- deploy -------------------------------------------------------------- */
+
+/* create/edit options -> deploy_create()/deploy_edit() fields */
+function cli_deploy_fields(array $opts) {
+    $map = array('repo' => 'repo_url', 'branch' => 'branch', 'dir' => 'public_dir', 'build' => 'build_cmd',
+                 'shared' => 'shared_paths', 'keep' => 'keep_releases', 'check' => 'health_path');
+    $o = array();
+    foreach ($map as $opt => $field)
+        if (isset($opts[$opt])) {
+            if ($opts[$opt] === true && !in_array($opt, array('dir', 'build', 'shared', 'check'), true))
+                cli_die("--$opt needs a value");
+            $o[$field] = $opts[$opt] === true ? '' : $opts[$opt];
+        }
+    if (isset($opts['auto'])) {
+        if (!in_array($opts['auto'], array('on', 'off'), true)) cli_die('--auto must be on or off');
+        $o['auto_deploy'] = $opts['auto'] === 'on';
+    }
+    return $o;
+}
+
+/* Print a run's output as it grows until the run ends; exit 0/1 by its result. */
+function cli_deploy_follow($run_id) {
+    $off = 0;
+    for (;;) {
+        list($text, $off) = deploy_run_log($run_id, $off);
+        if ($text !== '') echo $text;
+        $r = deploy_run_get($run_id);
+        if (!$r || in_array($r['status'], array('ok', 'failed', 'skipped'), true)) {
+            list($text) = deploy_run_log($run_id, $off);
+            echo $text;
+            if ($r && $r['status'] === 'skipped') echo "Run #$run_id was replaced by a newer one: {$r['message']}\n";
+            exit($r && $r['status'] === 'ok' ? 0 : 1);
+        }
+        usleep(700000);
+    }
+}
+
+function cli_deploy_gate(array $opts) {
+    if (!deploy_enabled())
+        cli_result(result_error('Deployments and apps are turned off on this server: set deployments=1 in '
+            .REQAD_ROOT.'/etc/server-software.ini.'), $opts);
+}
+
+function cmd_deploy($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('deploy', $sub));
+    if ($sub !== '__run')       // a run queued before the switch went off still finishes
+        cli_deploy_gate($opts);
+    if (!deploy_ready() && $sub !== '__run')
+        cli_result(result_error('The deployment tables are missing: apply db/1043.sql (the Reqad update does it).'), $opts);
+    $need_dep = function () use ($pos, $opts) {
+        cli_need($pos, 1, '<id|domain>');
+        $d = deploy_get($pos[0]);
+        if (!$d) cli_result(result_error("No deployment '{$pos[0]}'."), $opts);
+        return $d;
+    };
+    $date = function ($ts) { return (int)$ts ? date('Y-m-d H:i', (int)$ts) : '-'; };
+    switch ($sub) {
+    case 'list':
+        cli_need($pos, 0, '');
+        $acct = cli_scope() ?? (isset($opts['account']) && is_string($opts['account']) ? $opts['account'] : '');
+        $rows = deploy_list($acct);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', array_map(function ($d) { return deploy_public($d); }, $rows)), $opts);
+        if (!$rows) {
+            echo "No deployments. Make one: $prog deploy create <domain> --repo=URL\n";
+            exit(0);
+        }
+        foreach ($rows as &$r) {
+            $r['repo'] = deploy_url_safe($r['repo_url']).' '.$r['branch'];
+            $r['live'] = $r['current_release'] !== '' ? $r['current_release'].' '.substr($r['current_commit'], 0, 8) : '-';
+            $r['last'] = ($r['run_status'] ?? '-').((int)$r['run_queued'] ? ' '.$date($r['run_finished'] ?: $r['run_queued']) : '');
+        }
+        unset($r);
+        cli_table($rows, array('ID' => 'id', 'DOMAIN' => 'domain', 'ACCOUNT' => 'account', 'REPOSITORY' => 'repo', 'LIVE' => 'live', 'LAST RUN' => 'last'));
+        exit(0);
+
+    case 'show':
+        $d = $need_dep();
+        $data = deploy_public($d, !empty($opts['secret'])) + array('public_key' => deploy_public_key($d),
+            'releases' => deploy_releases($d), 'runs' => deploy_runs($d['id'], 5));
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $data), $opts);
+        foreach (array('id', 'domain', 'account', 'docroot', 'repo_url', 'branch', 'public_dir', 'build_cmd', 'shared_paths',
+                       'keep_releases', 'health_path', 'auto_deploy', 'current_release', 'current_commit', 'webhook_url', 'webhook_secret', 'public_key') as $k) {
+            if (!array_key_exists($k, $data)) continue;
+            $v = $data[$k];
+            if (is_bool($v)) $v = $v ? 'on' : 'off';
+            if (is_array($v)) $v = $v ? implode(', ', $v) : '-';
+            if ($v === '' || $v === null) $v = '-';
+            printf("%-16s %s\n", str_replace('_', ' ', $k).':', str_replace("\n", "\n".str_repeat(' ', 17), (string)$v));
+        }
+        if (empty($opts['secret']))
+            printf("%-16s %s\n", 'webhook secret:', "(--secret shows it)");
+        if ($data['releases']) {
+            echo "releases:\n";
+            foreach ($data['releases'] as $c)
+                printf("  %s  %-10s %s%s\n", $c['release'], substr($c['commit'], 0, 10), $c['message'], $c['release'] === $d['current_release'] ? '  (live)' : '');
+        }
+        if ($data['runs']) {
+            echo "latest runs:\n";
+            foreach ($data['runs'] as $r)
+                printf("  #%-5d %s  %-8s %-8s %s\n", $r['id'], $date($r['queued']), $r['source'], $r['status'], $r['message']);
+        }
+        exit(0);
+
+    case 'create':
+        cli_need($pos, 1, '<domain>');
+        if (empty($opts['repo']) || $opts['repo'] === true)
+            cli_die('--repo=URL is required');
+        $r = deploy_create(array('domain' => $pos[0]) + cli_deploy_fields($opts), auth_user());
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        echo $r['message']."\n\n";
+        echo "Deploy key (add it to the repository as a read-only deploy key):\n  ".$r['data']['public_key']."\n\n";
+        echo "Webhook for deploys on push (content type application/json):\n  URL:    ".$r['data']['webhook_url']
+            ."\n  Secret: ".$r['data']['webhook_secret']."\n\n";
+        echo "Then: $prog deploy run {$r['data']['domain']} --wait\n";
+        foreach ($r['warnings'] as $w) fwrite(STDERR, "warning: $w\n");
+        exit(0);
+
+    case 'edit':
+        $d = $need_dep();
+        $o = cli_deploy_fields($opts);
+        if (!empty($opts['new-secret'])) $o['new_secret'] = true;
+        if (!$o) cli_die("nothing to change; see '$prog deploy --help'");
+        cli_result(deploy_edit($d['id'], $o), $opts);
+
+    case 'run':
+    case 'rollback':
+        $d = $need_dep();
+        $r = $sub === 'run' ? deploy_trigger($d['id'], 'cli', auth_user())
+            : deploy_trigger($d['id'], 'rollback', auth_user(), isset($opts['release']) && is_string($opts['release']) ? $opts['release'] : '');
+        if (!$r['ok'] || empty($opts['wait']) || !empty($opts['json']))
+            cli_result($r, $opts);
+        echo $r['message']."\n";
+        cli_deploy_follow($r['data']['run']);
+
+    case 'log':
+        $d = $need_dep();
+        $run = isset($opts['run']) && is_string($opts['run']) && ctype_digit($opts['run']) ? deploy_run_get((int)$opts['run']) : deploy_run_get($d['last_run_id']);
+        if (!$run || (int)$run['deployment_id'] !== (int)$d['id'])
+            cli_die("no run to show for {$d['domain']}", 1);
+        if (in_array($run['status'], array('queued', 'running'), true) && empty($opts['json']))
+            cli_deploy_follow($run['id']);
+        list($text) = deploy_run_log($run['id']);
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $run + array('output' => $text)), $opts);
+        echo $text !== '' ? $text : "(no output)\n";
+        exit($run['status'] === 'ok' ? 0 : 1);
+
+    case 'delete':
+        $d = $need_dep();
+        cli_confirm($opts, $d['domain'], 'the deployment of');
+        cli_result(deploy_delete($d['id']), $opts);
+
+    case '__run':
+        /* the runner, started by deploy_trigger() as unit reqad-deploy-<id> */
+        cli_need($pos, 1, '<id>');
+        deploy_execute((int)$pos[0]);
+        exit(0);
+    }
+    fwrite(STDERR, "reqad: unknown deploy command '$sub'\n\n");
+    usage_deploy($prog);
+    exit(2);
+}
+
+/* ---- app ----------------------------------------------------------------- */
+
+function cli_app_fields(array $opts) {
+    $o = array();
+    if (isset($opts['runtime'])) {
+        if (!is_string($opts['runtime']) || !preg_match('/^(node|python):([0-9.]+)$/', $opts['runtime'], $m))
+            cli_die('--runtime is node:<major> or python:<3.x>, e.g. node:24');
+        $o['runtime'] = $m[1];
+        $o['version'] = $m[2];
+    }
+    if (isset($opts['start'])) {
+        if (!is_string($opts['start'])) cli_die('--start needs the command');
+        $o['start_cmd'] = $opts['start'];
+    }
+    if (isset($opts['dir']))
+        $o['app_dir'] = is_string($opts['dir']) ? $opts['dir'] : '';
+    if (isset($opts['static'])) {
+        if (!in_array($opts['static'], array('on', 'off'), true)) cli_die('--static must be on or off');
+        $o['serve_static'] = $opts['static'] === 'on';
+    }
+    if (isset($opts['memory'])) {
+        if (!is_string($opts['memory']) || !ctype_digit($opts['memory'])) cli_die('--memory is a number of MB');
+        $o['memory_mb'] = (int)$opts['memory'];
+    }
+    return $o;
+}
+
+function cmd_app($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('app', $sub));
+    if ($sub !== '__install')   // an install started before the switch went off still finishes
+        cli_deploy_gate($opts);
+    if (!apps_ready())
+        cli_result(result_error('The apps table is missing: apply db/1044.sql (the Reqad update does it).'), $opts);
+    $need_app = function () use ($pos, $opts) {
+        cli_need($pos, 1, '<id|domain>');
+        $a = app_get($pos[0]);
+        if (!$a) cli_result(result_error("No app '{$pos[0]}'."), $opts);
+        return $a;
+    };
+    switch ($sub) {
+    case 'list':
+        cli_need($pos, 0, '');
+        $acct = cli_scope() ?? (isset($opts['account']) && is_string($opts['account']) ? $opts['account'] : '');
+        $rows = array();
+        foreach (app_list($acct) as $a)
+            $rows[] = app_public($a) + array('status' => app_status($a));
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $rows), $opts);
+        if (!$rows) {
+            echo "No apps. Make one: $prog app create <domain> --runtime=node:24 --start=\"node server.js\"\n";
+            exit(0);
+        }
+        foreach ($rows as &$r) {
+            $st = $r['status'];
+            $r['rt'] = $r['runtime'].' '.$r['version'];
+            $r['st'] = $st['state'].($st['state'] === 'active' && !$st['listening'] ? ' (not listening)' : '')
+                .($st['memory_mb'] !== null && $st['state'] === 'active' ? ', '.$st['memory_mb'].' MB' : '');
+        }
+        unset($r);
+        cli_table($rows, array('ID' => 'id', 'DOMAIN' => 'domain', 'ACCOUNT' => 'account', 'RUNTIME' => 'rt', 'PORT' => 'port', 'START' => 'start_cmd', 'STATE' => 'st'));
+        exit(0);
+
+    case 'show':
+        $a = $need_app();
+        $data = app_public($a) + array('status' => app_status($a));
+        if (!empty($opts['json']))
+            cli_result(result_ok('', $data), $opts);
+        $st = $data['status'];
+        unset($data['status']);
+        $ins = $data['install'];
+        unset($data['install']);
+        foreach ($data as $k => $v) {
+            if (is_bool($v)) $v = $v ? 'yes' : 'no';
+            if ($v === '' || $v === null) $v = '-';
+            printf("%-14s %s\n", str_replace('_', ' ', $k).':', $v);
+        }
+        printf("%-14s %s\n", 'packages:', $ins ? $ins['status'].' '.date('Y-m-d H:i', (int)($ins['finished'] ?: $ins['started']))
+            .($ins['message'] !== '' ? ' - '.$ins['message'] : '') : '- (reqad app install)');
+        printf("%-14s %s\n", 'state:', $st['state'].' '.$st['sub'].($st['pid'] ? ', pid '.$st['pid'] : '')
+            .($st['memory_mb'] !== null ? ', '.$st['memory_mb'].' MB' : '').', '.$st['restarts'].' restarts'
+            .($st['state'] === 'active' ? ($st['listening'] ? ', answering on its port' : ', NOT listening on its port') : ''));
+        exit(0);
+
+    case 'create':
+        cli_need($pos, 1, '<domain>');
+        $o = cli_app_fields($opts);
+        if (!isset($o['runtime']))
+            cli_die('--runtime is required');
+        if (!empty($opts['no-start'])) $o['start'] = false;
+        cli_result(app_create(array('domain' => $pos[0]) + $o, auth_user()), $opts);
+
+    case 'edit':
+        $a = $need_app();
+        $o = cli_app_fields($opts);
+        if (!$o) cli_die("nothing to change; see '$prog app --help'");
+        cli_result(app_edit($a['id'], $o), $opts);
+
+    case 'start':
+    case 'stop':
+    case 'restart':
+        $a = $need_app();
+        cli_result(app_control($a['id'], $sub), $opts);
+
+    case 'logs':
+        $a = $need_app();
+        $n = isset($opts['lines']) && is_string($opts['lines']) && ctype_digit($opts['lines']) ? (int)$opts['lines'] : 100;
+        echo app_logs($a, $n);
+        exit(0);
+
+    case 'env':
+        $a = $need_app();
+        if (isset($opts['file'])) {
+            if (!is_string($opts['file']) || !is_readable($opts['file'])) cli_die('--file: cannot read it');
+            cli_result(app_env_write($a, (string)file_get_contents($opts['file'])), $opts);
+        }
+        echo app_env_read($a);
+        exit(0);
+
+    case 'install':
+        $a = $need_app();
+        if (cli_scope() !== null && ($why = deploy_account_error(cli_scope())) !== '')
+            cli_die($why, 1);
+        $r = app_pkg_start($a['id'], auth_user());
+        if (empty($opts['wait']) || !$r['ok'])
+            cli_result($r, $opts);
+        $off = 0;
+        for (;;) {
+            list($text, $off) = app_pkg_output($a, $off);
+            if ($text !== '') echo $text;
+            $s = app_pkg_state($a);
+            if (!$s || $s['status'] !== 'running') {
+                list($text) = app_pkg_output($a, $off);
+                echo $text;
+                exit($s && $s['status'] === 'ok' ? 0 : 1);
+            }
+            usleep(700000);
+        }
+
+    case 'detect':
+        cli_need($pos, 1, '<domain>');
+        if (cli_scope() !== null && ($why = deploy_account_error(cli_scope())) !== '')
+            cli_die($why, 1);
+        $kind = isset($opts['runtime']) && is_string($opts['runtime']) ? $opts['runtime'] : '';
+        if ($kind !== '' && !in_array($kind, array('node', 'python'), true))
+            cli_die('--runtime is node or python');
+        $r = app_detect_site($pos[0], isset($opts['dir']) && is_string($opts['dir']) ? $opts['dir'] : null, $kind);
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        $x = $r['data'];
+        echo "folder:  {$x['dir']}\n";
+        if (!$x['found']) {
+            echo $r['message'], "\n";
+            foreach ($x['notes'] as $n) echo "note:    $n\n";
+            exit(1);
+        }
+        echo "found:   {$x['label']} ({$x['why']})\n";
+        echo "start:   {$x['start_cmd']}\n";
+        if ($x['runtime']) echo "runtime: {$x['runtime']['kind']}:{$x['runtime']['version']}\n";
+        foreach (array_slice($x['candidates'], 1) as $c) echo "or:      {$c['cmd']}  ({$c['label']}, {$c['why']})\n";
+        foreach ($x['notes'] as $n) echo "note:    $n\n";
+        exit(0);
+
+    case '__install':
+        /* the installer, started by app_pkg_start() as unit reqad-appinst-<id> */
+        cli_need($pos, 1, '<id>');
+        app_pkg_execute((int)$pos[0]);
+        exit(0);
+
+    case 'delete':
+        $a = $need_app();
+        cli_confirm($opts, $a['domain'], 'the app of');
+        cli_result(app_delete($a['id']), $opts);
+
+    case 'runtimes':
+        cli_need($pos, 0, '');
+        if (!empty($opts['available'])) {
+            $rows = array();
+            foreach (explode("\n", trim((string)shell_exec(APP_RUNTIME.' available node 2>&1'))) as $l) {
+                $f = preg_split('/\s+/', trim($l));
+                if (count($f) >= 2 && ctype_digit($f[0]))
+                    $rows[] = array('major' => $f[0], 'latest' => $f[1], 'lts' => $f[2] ?? '');
+            }
+            cli_list($rows, $opts, array('NODE.JS' => 'major', 'LATEST' => 'latest', 'LTS' => 'lts'));
+        }
+        cli_list(app_runtimes(), $opts, array('RUNTIME' => 'kind', 'VERSION' => 'version', 'RELEASE' => 'full', 'PATH' => 'bin'));
+
+    case 'runtime':
+        cli_need($pos, 3, 'install|update|remove node <major> | python <3.x>');
+        cli_result(app_runtime_run($pos[0], $pos[1], $pos[2]), $opts);
+    }
+    fwrite(STDERR, "reqad: unknown app command '$sub'\n\n");
+    usage_app($prog);
+    exit(2);
+}
+
+function cli_scope() {
+    return isset($GLOBALS['cli_scope']) ? $GLOBALS['cli_scope'] : null;
+}
+
+/* Stop unless the scoped account owns what the command touches. The same
+   mapping (command -> resource type + name) is what the API and the account
+   panel will use; scope_check() in app/functions/scope.php is the rule. */
+function cli_scope_guard($cmd, $sub, array $pos, array $opts = array()) {
+    $scope = cli_scope();
+    if ($scope === null)
+        return;
+    $refuse = function ($what) use ($scope) { cli_die("--user=$scope: $what is for the server admin only", 1); };
+    $need = function ($type, $id) use ($scope) {
+        if (($e = scope_check($scope, $type, $id)) !== '')
+            cli_die($e, 1);
+    };
+    $p0 = isset($pos[0]) ? $pos[0] : '';
+    switch ("$cmd $sub") {
+    case 'account list':   return;
+    case 'account edit':
+        /* mail on/off and the shell type stay the admin's (the API refuses them too) */
+        if (isset($opts['email']) || isset($opts['shell']))
+            return $refuse('changing --email or --shell');
+        return $need('account', $p0);
+    case 'account limits':
+        if (array_intersect_key($opts, array_flip(array('cpu', 'memory', 'processes', 'default', 'none', 'db-connections', 'sync-db'))))
+            return $refuse('changing limits');
+        return $need('account', $p0);
+    case 'account show':
+    case 'account can-create': return $need('account', $p0);
+    case 'account create': return $refuse('creating accounts');
+    case 'account delete': return $refuse('deleting accounts');
+    case 'db list':        return;
+    case 'db create':      return $need('account', $p0);
+    case 'db delete':      return $need('db', $p0);
+    case 'db passwd':      return $need('dbuser', $p0);
+    case 'db assign':
+    case 'db unassign':    return $refuse('assigning databases');
+    case 'db export':      return $need('db', $p0);
+    case 'email list':     return;
+    case 'email create':   return $need('domain', email_split($p0)[1]);
+    case 'email edit':
+    case 'email delete':   return $need('mailbox', $p0);
+    case 'email sites':    return $need('account', $p0);
+    case 'email site':     return $need('addon', $p0);
+    case 'health list':    return;
+    case 'health checks':  return;
+    case 'health run':     return $refuse('running the checks');
+    case 'health dismiss':
+    case 'health restore': return $need('health_item', $p0);
+    case 'deploy list':    return;
+    case 'deploy create':  return $need('domain', $p0);
+    case 'deploy show':
+    case 'deploy edit':
+    case 'deploy run':
+    case 'deploy rollback':
+    case 'deploy log':
+    case 'deploy delete':  return $need('deployment', $p0);
+    case 'app list':       return;
+    case 'app runtimes':   return;
+    case 'app runtime':    return $refuse('installing runtimes');
+    case 'app create':
+    case 'app detect':     return $need('domain', $p0);
+    case 'app show':
+    case 'app edit':
+    case 'app start':
+    case 'app stop':
+    case 'app restart':
+    case 'app logs':
+    case 'app env':
+    case 'app install':
+    case 'app delete':     return $need('app', $p0);
+    case 'app __install':  return $refuse('running the installer');
+    case 'backup list':
+    case 'backup show':
+    case 'backup restore':
+    case 'backup restores': return $need('account', $p0);
+    case 'backup __run': return $refuse('__run');
+    case 'logs site':
+    case 'logs days':      return $need('domain', $p0);
+    case 'stats show':
+        if ($p0 === 'all') return isset($opts['account']) && $opts['account'] !== $scope ? $refuse('another account\'s stats') : null;
+        return $need('domain', $p0);
+    case 'stats usage':    return;
+    case 'stats collect':
+    case 'stats geoip':
+    case 'stats on':
+    case 'stats off':      return $refuse("'stats $sub'");
+    case 'resources usage': return;
+    case 'resources show':
+    case 'resources processes':
+    case 'resources stop': return $need('account', $p0);
+    case 'resources collect': return $refuse("'resources collect'");
+    case 'wordpress list': return;
+    case 'wordpress scan': return $need('account', $p0);
+    case 'wordpress auto-run': return $refuse('auto-run');
+    case 'wordpress show':
+    case 'wordpress update':
+    case 'wordpress login':
+    case 'wordpress auto':
+        $w = wordpress_find($p0);
+        if (!$w)
+            cli_die("No WordPress site '$p0'.", 1);
+        return $need('account', $w['user']);
+    }
+    $refuse("'$cmd".($sub !== '' ? " $sub" : '')."'");
+}
+
+/* An add-on's command, from its manifest:
+     'cli' => array('<command>' => array(
+         'summary' => '...',
+         'usage'   => function ($prog) { ...prints the help... },
+         'spec'    => array('<sub>' => array('opts' => array('name', ...), 'arg' => '')),
+         'run'     => function ($prog, $sub, $pos, $opts) { ...exits... })),
+   Options are checked against spec like the core commands (--json, --help,
+   --user always allowed); --user (acting as an account) is refused, add-on
+   commands are the admin's. */
+function cli_plugin_command($prog, $cmd, $sub, array $pos, array $opts) {
+    $c = null;
+    foreach ((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl)
+        if (isset($pl['cli'][$cmd]))
+            $c = $pl['cli'][$cmd];
+    if (!$c || empty($c['run']) || !is_callable($c['run']))
+        cli_die("'$cmd' belongs to an add-on that is not installed or not turned on", 2);
+    if ($sub === '' || !empty($opts['help'])) {
+        if (!empty($c['usage']) && is_callable($c['usage']))
+            call_user_func($c['usage'], $prog);
+        exit($sub === '' && empty($opts['help']) ? 2 : 0);
+    }
+    if (!isset($c['spec'][$sub]))
+        cli_die("unknown command '$cmd $sub' (see '$prog $cmd --help')");
+    if (isset($GLOBALS['cli_scope']))
+        cli_die("'$cmd' is not available with --user: it is for the server's admin", 1);
+    cli_allow($opts, $c['spec'][$sub]['opts'] ?? array());
+    call_user_func($c['run'], $prog, $sub, $pos, $opts);
+    exit(0);
 }
 
 /* ---- dispatch ------------------------------------------------------------ */
@@ -756,9 +3603,27 @@ switch ($arg) {
     case 'account':
     case 'db':
     case 'email':
+    case 'auth':
+    case 'health':
+    case 'api':
+    case 'deploy':
+    case 'app':
+    case 'mcp':
+    case 'wordpress':
+    case 'backup':
+    case 'stats':
+    case 'logs':
+    case 'resources':
+    case 'shelllog':
+    case 'dns':
         break;
 
     default:
+        /* an add-on's command: its help and code come with the plugin */
+        if (isset(cli_plugin_list()[$arg])) {
+            $plugin_cmd = true;
+            break;
+        }
         fwrite(STDERR, "reqad: unknown option '{$arg}'\n\n");
         usage($prog);
         exit(2);
@@ -767,10 +3632,11 @@ switch ($arg) {
 $sub = (isset($argv[2]) && $argv[2] !== '' && $argv[2][0] !== '-') ? $argv[2] : '';
 list($pos, $opts) = cli_parse(array_slice($argv, $sub === '' ? 2 : 3));
 
-// Help needs neither root nor the panel config.
-if ($sub === '' || !empty($opts['help'])) {
+// Help needs neither root nor the panel config (an add-on's does: it is in the plugin).
+if (empty($plugin_cmd) && ($sub === '' || !empty($opts['help']))) {
     $fn = 'usage_'.$arg;
     $fn($prog);
+    usage_plugin_subs($prog, $arg);
     exit($sub === '' && empty($opts['help']) ? 2 : 0);
 }
 
@@ -784,9 +3650,39 @@ if (posix_geteuid() !== 0)
    require would turn into locals. */
 require_once REQAD_ROOT.'/public_html/defines.php';
 require_once REQAD_ROOT.'/public_html/modules/functions.php';
+$db->busyTimeout(5000);   // functions.php may have been loaded earlier, inside a function
 foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
     require_once $app_functions_file;
+require_once _PATH.'/app/auth/auth.php';
+require_once _PATH.'/app/api/api.php';
+require_once _PATH.'/app/api/routes.php';
+require_once _PATH.'/app/mcp/mcp.php';
 date_default_timezone_set(system_timezone());
+/* plugins too: their event hooks and limits apply to the command line as well */
+plugins_load();
+
+if (isset($opts['user'])) {
+    $as = is_string($opts['user']) ? $opts['user'] : '';
+    if (!valid_username($as) || !account_get($db, $as)) {
+        /* --user used to name the database user of 'db create'; that is --dbuser now */
+        $hint = ($arg === 'db' && $sub === 'create') ? " (the database user name is --dbuser=NAME)" : '';
+        cli_die("--user: no hosting account '$as'$hint", 1);
+    }
+    $GLOBALS['cli_scope'] = $as;
+}
+if (!empty($plugin_cmd))
+    cli_plugin_command($prog, $arg, $sub, $pos, $opts);
+/* a subcommand an add-on adds to a core command (e.g. account suspend) */
+if (!isset(cli_spec()[$arg][$sub]))
+    foreach ((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl)
+        if (isset($pl['cli_subs'][$arg][$sub]['run']) && is_callable($pl['cli_subs'][$arg][$sub]['run'])) {
+            if (isset($GLOBALS['cli_scope']))
+                cli_die("'$arg $sub' is not available with --user: it is for the server's admin", 1);
+            cli_allow($opts, $pl['cli_subs'][$arg][$sub]['opts'] ?? array());
+            call_user_func($pl['cli_subs'][$arg][$sub]['run'], $prog, $sub, $pos, $opts);
+            exit(0);
+        }
+cli_scope_guard($arg, $sub, $pos, $opts);
 
 $fn = 'cmd_'.$arg;
 $fn($prog, $sub, $pos, $opts);

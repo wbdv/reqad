@@ -26,10 +26,17 @@ if($nb_accounts == 0) {
 		$i++;
         $file = '/etc/httpd/conf.d/'.$row["domain"].'.conf';
         if(!is_file($file) || (isset($argv[1]) && $argv[1]=='--force')) {
+            /* domain + aliases (+ mail), as account_server_names() */
+            $names = $row["domain"];
+            $al = $db->query('SELECT alias FROM aliases WHERE account_id='.(int)$row["id"]);
+            while ($al && ($a = $al->fetchArray(SQLITE3_ASSOC))) $names .= ' '.$a['alias'];
+            if (!empty($row["has_email"])) $names .= ' mail.'.$row["domain"];
+            $template_ssl_n = str_replace('%NAMES%', $names, $template_ssl);
+            $template_n     = str_replace('%NAMES%', $names, $template);
             if(is_file('/etc/letsencrypt/live/'.$row["domain"].'/cert.pem')) {
-                $file_contents = str_replace('%DOMAIN%', $row["domain"], str_replace('%USER%', $row["user"], $template_ssl));
+                $file_contents = str_replace('%DOMAIN%', $row["domain"], str_replace("%USER%", $row["user"], $template_ssl_n));
             } else {
-                $file_contents = str_replace('%DOMAIN%', $row["domain"], str_replace('%USER%', $row["user"], $template));
+                $file_contents = str_replace('%DOMAIN%', $row["domain"], str_replace("%USER%", $row["user"], $template_n));
             }
             file_put_contents($file, $file_contents);
             echo $file."\n";

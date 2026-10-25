@@ -356,9 +356,12 @@ elif [ "${NEED_LE}" -eq 0 ]; then
 elif ! command -v certbot >/dev/null 2>&1; then
     echo "    certbot is not installed, skipping — ${NEW} stays on the self-signed cert"
 else
-    case "$TEMPLATE" in
-        apache_modphp) PLUGIN="apache" ;;
-        *)             PLUGIN="nginx"  ;;
+    # the front web server answers the challenge
+    . /usr/local/reqad/scripts/web_caps.sh
+    web_caps "$INI"
+    case "$WEB_FRONT" in
+        httpd) PLUGIN="apache" ;;
+        *)     PLUGIN="nginx"  ;;
     esac
     echo "    requesting a certificate for ${NEW} with the ${PLUGIN} plugin..."
     if [ $DRY -eq 1 ]; then

@@ -360,19 +360,19 @@ pool_content() {   # same pool the nginx_php-fpm template writes
     cat <<EOF
 [${domain}]
 user = ${user}
-group = nginx
+group = ${user}
 listen = ${socket}
 listen.owner = ${user}
 listen.group = nginx
 listen.allowed_clients = 127.0.0.1
 
-pm = dynamic
-pm.max_children = 200
-pm.start_servers = 10
-pm.min_spare_servers = 5
-pm.max_spare_servers = 50
-pm.process_idle_timeout = 1s;
-pm.max_requests = 1000
+; workers start with the first request and stop after 10 s idle, so a quiet
+; site holds no memory; 20 at once per site, a stuck script is killed at 300 s
+pm = ondemand
+pm.max_children = 20
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+request_terminate_timeout = 300s
 
 ping.path = /ping
 slowlog = /var/log/php-fpm/${domain}-slow.log
@@ -977,6 +977,13 @@ for r in "${RENEWALS[@]}"; do
     install_file "$staged" "$target" 0644
     echo "  $(basename "$target"): authenticator/installer -> nginx"
 done
+
+# The docroots were <user>:apache 0750 - give nginx the same access, and the
+# pools their account's own group (scripts/update/harden_account_perms.sh)
+if [ -x "${PATH_REQAD:-/usr/local/reqad}/scripts/update/harden_account_perms.sh" ]; then
+    bash "${PATH_REQAD:-/usr/local/reqad}/scripts/update/harden_account_perms.sh" --apply --quiet \
+        && echo "  account directories: web server group -> nginx"
+fi
 
 # ================================================================= report
 echo

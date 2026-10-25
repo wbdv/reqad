@@ -87,6 +87,8 @@ DUP=$(${SQLITE} "${DB_FILE}" "SELECT count(*) FROM accounts WHERE user='${USER}'
 echo -e "\n${WHITE}── system user ──${NC}"
 [ -z "${EXIST_GID}" ] && sudo groupadd -g "${PGID}" "${USER}"
 sudo useradd -u "${PUID}" -g "${PGID}" -d "${PHOME}" -s "${PSHELL}" -M "${USER}" || die "useradd failed."
+# default limits for its SSH, cron and terminal sessions (not in the archive)
+sudo /usr/local/reqad/scripts/session_limits.sh set "${USER}" default >/dev/null 2>&1
 # restore the exact password (hash field 2 of /etc/shadow)
 if [ -s "${R}/meta/shadow" ]; then
 	SHASH=$(cut -d: -f2 "${R}/meta/shadow")
@@ -101,7 +103,12 @@ sudo mkdir -p "${PHOME}"
 sudo tar xzf "${ARCHIVE}" -C /home \
 	--transform "s,^${ROOTDIR}/homedir,${USER}," \
 	"${ROOTDIR}/homedir" 2>/dev/null
-sudo chown -R "${PUID}:${PGID}" "${PHOME}"
+# owner only: the archive keeps each file's group, and the docroots
+# (public_html, addon sites) must stay <user>:<web server> or the sites answer
+# 404 - a chown -R user:user took that away from every restored site
+sudo chown -R "${PUID}" "${PHOME}"
+# a group this server does not have came back as a bare number: the account's then
+sudo find "${PHOME}" -xdev -nogroup -exec chgrp -h "${PGID}" {} + 2>/dev/null
 sudo restorecon -R "${PHOME}" 2>/dev/null
 echo "restored ${PHOME}"
 
@@ -161,6 +168,21 @@ echo -e "${WHITE}── web/php config ──${NC}"
 [ -f "${R}/config/nginx-${DOMAIN}.conf" ]   && sudo cp -p "${R}/config/nginx-${DOMAIN}.conf"   "/etc/nginx/conf.d/${DOMAIN}.conf"   && echo "nginx vhost"
 [ -f "${R}/config/httpd-${DOMAIN}.conf" ]   && sudo cp -p "${R}/config/httpd-${DOMAIN}.conf"   "/etc/httpd/conf.d/${DOMAIN}.conf"   && echo "apache vhost"
 [ -f "${R}/config/php-fpm-${DOMAIN}.conf" ] && sudo cp -p "${R}/config/php-fpm-${DOMAIN}.conf" "/etc/php-fpm.d/${DOMAIN}.conf"       && echo "php-fpm pool"
+# a pool of another PHP version goes back to where it came from, when that version is installed here
+restore_pool() {   # $1 = pool file  $2 = file holding its original path  $3 = site
+	local PP
+	PP=$(head -n1 "$2")
+	case "${PP}" in
+		/etc/php-fpm.d/*.conf|/etc/opt/remi/php[0-9][0-9]/php-fpm.d/*.conf) ;;
+		*) echo "WARNING: $3: odd PHP pool path '${PP}' - pool not restored"; return ;;
+	esac
+	if [ -d "$(dirname "${PP}")" ]; then
+		sudo cp -p "$1" "${PP}" && echo "php-fpm pool of $3 (${PP})"
+	else
+		echo "WARNING: $3 used a PHP version this server does not have ($(dirname "${PP}")) - its pool was not restored; pick a PHP version for it in the panel."
+	fi
+}
+[ -f "${R}/config/php-pool-${DOMAIN}.conf" ] && [ -s "${R}/config/php-pool-${DOMAIN}.path" ] && restore_pool "${R}/config/php-pool-${DOMAIN}.conf" "${R}/config/php-pool-${DOMAIN}.path" "${DOMAIN}"
 
 # ===========================================================================
 # 5. SSL (verbatim — see LE renewal re-setup near the end)
@@ -179,49 +201,93 @@ if [ -d "${R}/ssl/letsencrypt-${DOMAIN}" ]; then
 fi
 
 # ===========================================================================
+# 5b. addon domains and subdomains (vhost, PHP pool, certificate; their files
+#     came back with the homedir). One that exists here already is skipped.
+# ===========================================================================
+LE_ADDONS=''
+ADDONS_DONE=''
+ADDONS_SKIPPED=''
+if [ -d "${R}/addons" ]; then
+	echo -e "${WHITE}── addon domains ──${NC}"
+	for AO in "${R}"/addons/*/; do
+		[ -d "${AO}" ] || continue
+		AD=$(basename "${AO}")
+		echo "${AD}" | grep -qE '^[a-z0-9.-]+$' || continue
+		INUSE=$(${SQLITE} "${DB_FILE}" "SELECT count(*) FROM accounts WHERE domain='${AD}'" 2>/dev/null)
+		if [ -e "/etc/nginx/conf.d/${AD}.conf" ] || [ -e "/etc/httpd/conf.d/${AD}.conf" ] || [ "${INUSE:-0}" != "0" ]; then
+			echo "WARNING: ${AD} is already on this server - skipped (its files are in the home folder)."
+			ADDONS_SKIPPED="${ADDONS_SKIPPED} ${AD}"
+			continue
+		fi
+		[ -f "${AO}nginx.conf" ] && sudo cp -p "${AO}nginx.conf" "/etc/nginx/conf.d/${AD}.conf"
+		[ -f "${AO}httpd.conf" ] && sudo cp -p "${AO}httpd.conf" "/etc/httpd/conf.d/${AD}.conf"
+		[ -f "${AO}pool.conf" ] && [ -s "${AO}pool.path" ] && restore_pool "${AO}pool.conf" "${AO}pool.path" "${AD}"
+		[ -f "${AO}ssl.crt" ] && sudo cp -p "${AO}ssl.crt" "/etc/ssl/certs/${AD}.crt"
+		[ -f "${AO}ssl.key" ] && sudo cp -p "${AO}ssl.key" "/etc/ssl/certs/${AD}.key"
+		if [ -d "${AO}letsencrypt" ]; then
+			sudo mkdir -p "/etc/letsencrypt/live/${AD}"
+			sudo cp -rp "${AO}letsencrypt/." "/etc/letsencrypt/live/${AD}/"
+			LE_ADDONS="${LE_ADDONS} ${AD}"
+		fi
+		sudo restorecon -F "/etc/nginx/conf.d/${AD}.conf" "/etc/httpd/conf.d/${AD}.conf" "/etc/ssl/certs/${AD}.crt" "/etc/ssl/certs/${AD}.key" 2>/dev/null
+		ADDONS_DONE="${ADDONS_DONE} ${AD}"
+		echo "${AD}"
+	done
+fi
+
+# docroots <user>:<web server of THIS server> (the backup may come from a server with another one)
+[ -x "${REQAD}/scripts/update/harden_account_perms.sh" ] && sudo "${REQAD}/scripts/update/harden_account_perms.sh" --apply --user="${USER}" --quiet >/dev/null 2>&1
+
+# ===========================================================================
 # 6. email (exim + dovecot auth + panel rows)
 # ===========================================================================
-if [ -d "${R}/email" ]; then
-	echo -e "${WHITE}── email ──${NC}"
-	if [ -f "${R}/email/exim-domain" ]; then
-		sudo cp -p "${R}/email/exim-domain" "/etc/exim/domains/${DOMAIN}"
-		sudo chown exim:exim "/etc/exim/domains/${DOMAIN}" 2>/dev/null
+# One mail domain's settings from $2 (email/ for the main domain,
+# email/domains/<domain>/ for the account's other mail domains).
+restore_mail_domain() {   # $1 = domain  $2 = folder
+	local D="$1" IN="$2"
+	if [ -f "${IN}/exim-domain" ]; then
+		sudo cp -p "${IN}/exim-domain" "/etc/exim/domains/${D}"
+		sudo chown exim:exim "/etc/exim/domains/${D}" 2>/dev/null
 	fi
-	if [ -f "${R}/email/exim-forwards" ]; then
-		sudo cp -p "${R}/email/exim-forwards" "/etc/exim/forwards/${DOMAIN}"
-		sudo chown exim:exim "/etc/exim/forwards/${DOMAIN}" 2>/dev/null
+	if [ -f "${IN}/exim-forwards" ]; then
+		sudo cp -p "${IN}/exim-forwards" "/etc/exim/forwards/${D}"
+		sudo chown exim:exim "/etc/exim/forwards/${D}" 2>/dev/null
 	fi
-	if [ -d "${R}/email/dkim" ]; then
-		sudo cp -p "${R}/email/dkim/." /etc/exim/keys/ 2>/dev/null
-		sudo chown exim:mail /etc/exim/keys/${DOMAIN}.private.key /etc/exim/keys/${DOMAIN}.public.key 2>/dev/null
+	if [ -d "${IN}/dkim" ]; then
+		sudo cp -p "${IN}"/dkim/*.key /etc/exim/keys/ 2>/dev/null
+		sudo chown exim:mail /etc/exim/keys/${D}.private.key /etc/exim/keys/${D}.public.key 2>/dev/null
 	fi
 	# userdomains: add the line if absent
-	if [ -s "${R}/email/userdomains-entry" ]; then
-		UDLINE=$(cat "${R}/email/userdomains-entry")
+	if [ -s "${IN}/userdomains-entry" ]; then
+		UDLINE=$(cat "${IN}/userdomains-entry")
 		sudo grep -qxF "${UDLINE}" /etc/exim/userdomains 2>/dev/null || echo "${UDLINE}" | sudo tee -a /etc/exim/userdomains >/dev/null
 	fi
+	# its mail handled by another provider: back on /etc/exim/remotedomains
+	if [ -s "${IN}/remote-mail" ] && [ -f /etc/exim/remotedomains ]; then
+		sudo grep -qxF "${D}" /etc/exim/remotedomains 2>/dev/null || echo "${D}" | sudo tee -a /etc/exim/remotedomains >/dev/null
+	fi
 	# dovecot users: append each mailbox line whose email isn't already present
-	if [ -s "${R}/email/dovecot-users" ]; then
+	if [ -s "${IN}/dovecot-users" ]; then
 		while IFS= read -r line; do
 			[ -z "${line}" ] && continue
 			mail=${line%%:*}
 			sudo grep -q "^${mail}:" /etc/dovecot/users 2>/dev/null || echo "${line}" | sudo tee -a /etc/dovecot/users >/dev/null
-		done < "${R}/email/dovecot-users"
+		done < "${IN}/dovecot-users"
 		echo "restored dovecot mailbox auth lines"
 	fi
 
 	# ---- email filters: domain tier ---------------------------------------
 	# Per-account Sieve scripts need nothing here — ~/sieve and ~/.dovecot.sieve
 	# live inside the maildir and came back with homedir/mail/ above.
-	if [ -s "${R}/email/email_filters.sql" ]; then
-		${SQLITE} "${DB_FILE}" < "${R}/email/email_filters.sql" 2>/dev/null
+	if [ -s "${IN}/email_filters.sql" ]; then
+		${SQLITE} "${DB_FILE}" < "${IN}/email_filters.sql" 2>/dev/null
 		echo "restored domain email filter rows"
 	fi
 	# Install the rendered script through ef-helper rather than copying it: the
 	# helper writes it dovecot-owned and recompiles it AT ITS FINAL PATH, which a
 	# .svbin records and a copied binary would get wrong.
-	if [ -s "${R}/email/sieve-domain.sieve" ]; then
-		if sudo "${REQAD}/scripts/email-filters/ef-helper.sh" system-put domain "${DOMAIN}" < "${R}/email/sieve-domain.sieve" >/dev/null 2>&1; then
+	if [ -s "${IN}/sieve-domain.sieve" ]; then
+		if sudo "${REQAD}/scripts/email-filters/ef-helper.sh" system-put domain "${D}" < "${IN}/sieve-domain.sieve" >/dev/null 2>&1; then
 			echo "restored domain Sieve filter script"
 		else
 			echo "WARNING: domain Sieve script failed to compile — the filter rows were"
@@ -230,8 +296,8 @@ if [ -d "${R}/email" ]; then
 	fi
 
 	# ---- autoresponders ---------------------------------------------------
-	if [ -s "${R}/email/autoresponders.sql" ]; then
-		${SQLITE} "${DB_FILE}" < "${R}/email/autoresponders.sql" 2>/dev/null
+	if [ -s "${IN}/autoresponders.sql" ]; then
+		${SQLITE} "${DB_FILE}" < "${IN}/autoresponders.sql" 2>/dev/null
 		# Re-render the live artefact from the rows just restored. This is the same
 		# reconciliation cron runs every 5 minutes, so the autoresponder works
 		# immediately instead of up to 5 minutes later — and it renders for THIS
@@ -240,6 +306,23 @@ if [ -d "${R}/email" ]; then
 		sudo "${REQAD}/scripts/manage_autoresponders.php" >/dev/null 2>&1
 		echo "restored autoresponders"
 	fi
+}
+
+if [ -d "${R}/email" ]; then
+	echo -e "${WHITE}── email ──${NC}"
+	restore_mail_domain "${DOMAIN}" "${R}/email"
+	for MI in "${R}"/email/domains/*/; do
+		[ -d "${MI}" ] || continue
+		MD=$(basename "${MI}")
+		echo "${MD}" | grep -qE '^[a-z0-9.-]+$' || continue
+		case " ${ADDONS_SKIPPED} " in *" ${MD} "*) echo "WARNING: mail of ${MD} skipped (the domain is on this server already)"; continue ;; esac
+		if sudo grep -qE "^${MD//./\\.}:" /etc/exim/userdomains 2>/dev/null; then
+			echo "WARNING: mail of ${MD} skipped (another account receives its mail here)"
+			continue
+		fi
+		echo "mail domain ${MD}:"
+		restore_mail_domain "${MD}" "${MI%/}"
+	done
 	# The panel's `emails` table is deliberately NOT restored. Since db/1032.sql it
 	# is only a du -skm cache keyed by address, rebuilt on demand from
 	# /etc/dovecot/users — the mailbox auth lines restored just above are the real
@@ -271,6 +354,10 @@ if [ -f "${R}/cron/crontab" ]; then
 	sudo chown "${USER}" "/var/spool/cron/${USER}"
 	sudo chmod 600 "/var/spool/cron/${USER}"
 	sudo restorecon "/var/spool/cron/${USER}" 2>/dev/null
+	# jobs made in the account panel run through /usr/local/bin/reqad-cron
+	grep -qF '/usr/local/bin/reqad-cron ' "${R}/cron/crontab" && sudo /usr/local/reqad/scripts/cron/cron_helper.sh install
+	# jailed accounts: SHELL= kept in step with the restored shell
+	sudo /usr/local/reqad/scripts/account_shell.sh cron-sync "${USER}" >/dev/null 2>&1
 fi
 
 # ===========================================================================
@@ -298,7 +385,7 @@ sudo restorecon -F "/etc/nginx/conf.d/${DOMAIN}.conf" "/etc/httpd/conf.d/${DOMAI
 echo -e "\n${WHITE}── restart services ──${NC}"
 # Only reload services that are ALREADY running, so a restore never starts a
 # dormant unit (e.g. httpd on an nginx box would grab port 80 from nginx).
-for svc in php-fpm nginx httpd exim dovecot; do
+for svc in php-fpm $(systemctl list-units --type=service --state=active --no-legend 'php[0-9][0-9]-php-fpm.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//') nginx httpd exim dovecot; do
 	if sudo systemctl is-active --quiet "${svc}"; then
 		sudo systemctl reload-or-restart "${svc}" 2>/dev/null && echo "reloaded ${svc}"
 	fi
@@ -314,6 +401,19 @@ if [ "${LE_RESTORED}" -eq 1 ] && sudo systemctl is-active --quiet nginx; then
 	echo -e "${WHITE}── ssl: re-issuing Let's Encrypt cert in background to restore auto-renewal ──${NC}"
 	( cd "${REQAD}/scripts" && ./obtain_letsencrypt_cert.sh "${DOMAIN},www.${DOMAIN}" >/dev/null 2>&1 & )
 fi
+
+for AD in ${LE_ADDONS}; do
+	sudo systemctl is-active --quiet nginx || sudo systemctl is-active --quiet httpd || break
+	# the names the restored site answers to (server_name / ServerAlias), as certbot's -d list
+	NAMES=$( (sudo grep -m1 -E '^[[:space:]]*server_name[[:space:]]' "/etc/nginx/conf.d/${AD}.conf" 2>/dev/null | sed 's/^[[:space:]]*server_name[[:space:]]*//; s/;.*//') \
+		|| true)
+	[ -z "${NAMES}" ] && NAMES="${AD}"
+	LIST=$(echo "${NAMES}" | tr -s ' ' '\n' | grep -E '^[a-z0-9.-]+$' | paste -sd, -)
+	( cd "${REQAD}/scripts" && ./obtain_letsencrypt_cert.sh "${LIST}" >/dev/null 2>&1 & )
+done
+
+# mail TLS names for the restored mail domains
+[ -d "${R}/email" ] && sudo "${REQAD}/scripts/update_email_sni" >/dev/null 2>&1 &
 
 # recompute disk usage in the background (best effort)
 [ -x "${REQAD}/scripts/update_disk_usage" ] && sudo "${REQAD}/scripts/update_disk_usage" >/dev/null 2>&1 &
@@ -346,5 +446,9 @@ fi
 sudo rm -rf "${STAGE}"
 echo -e "\n${GREEN}Done. Account '${USER}' (${DOMAIN}) restored from $(basename ${ARCHIVE}).${NC}"
 [ "${LE_RESTORED}" -eq 1 ] && echo "Let's Encrypt auto-renewal re-issue was launched in the background (check log/debug_log)."
-post_msg success "Account '${USER}' (${DOMAIN}) restored from $(basename ${ARCHIVE}).${EXCL_NOTE}"
+[ -n "${ADDONS_DONE}" ] && echo "Addon domains restored:${ADDONS_DONE}"
+[ -n "${ADDONS_SKIPPED}" ] && echo "Addon domains skipped (already on this server):${ADDONS_SKIPPED}"
+ADDON_NOTE=''
+[ -n "${ADDONS_SKIPPED}" ] && ADDON_NOTE=" Skipped (already on this server):${ADDONS_SKIPPED}."
+post_msg success "Account '${USER}' (${DOMAIN}) restored from $(basename ${ARCHIVE}).${EXCL_NOTE}${ADDON_NOTE}"
 exit 0

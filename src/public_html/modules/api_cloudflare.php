@@ -572,3 +572,179 @@ function change_proxied($domain, $name, $type, $proxied) {
 #get_zone_record('buzzword.ro', 'test', 'A'); exit;
 
 #echo '<pre>#get_zone_records#'."\n\n"; print_r(get_zone_records('test-domain7.dom')); exit;
+
+/* ---- record sets (dns_rrset_get / dns_rrset_set, see functions.php) -------
+   Cloudflare keeps each value as its own record. Changed values are PATCHed
+   onto the records they replace, so a proxied name stays proxied. */
+function cloudflare_rrset_records($name, $type, &$zone_id = null) {
+	$name  = strtolower(rtrim(trim($name), '.'));
+	$zones = get_zones();
+	$zone  = dns_zone_for($name, $zones);
+	if ($zone === '')
+		return null;
+	$zone_id = $zones[$zone]['zone_id'];
+	$json = cloudflare_api('https://api.cloudflare.com/client/v4/zones/'.$zone_id.'/dns_records?per_page=100&type='.rawurlencode($type).'&name='.rawurlencode($name), true, 'GET');
+	if (empty($json['success']) || !is_array($json['result'] ?? null))
+		return null;
+	$out = array();
+	foreach ($json['result'] as $rec)
+		$out[] = array('id' => $rec['id'], 'value' => $type === 'TXT' ? dns_txt_decode($rec['content']) : strtolower((string)$rec['content']), 'proxied' => !empty($rec['proxied']));
+	return $out;
+}
+
+function dns_rrset_get($name, $type) {
+	$recs = cloudflare_rrset_records($name, $type);
+	return $recs === null ? null : array_column($recs, 'value');
+}
+
+function dns_rrset_set($name, $type, $values) {
+	$name = strtolower(rtrim(trim($name), '.'));
+	$recs = cloudflare_rrset_records($name, $type, $zone_id);
+	if ($recs === null)
+		return 'Error: DNS API: no managed zone holds '.$name.'.';
+	$values = array_values(array_unique(array_map('strval', $values)));
+	$gone = array_values(array_filter($recs, function ($r) use ($values) { return !in_array($r['value'], $values, true); }));
+	$new  = array_values(array_diff($values, array_column($recs, 'value')));
+	/* a new A/AAAA follows the name's proxy setting */
+	$proxied = false;
+	if ($type === 'A' || $type === 'AAAA')
+		foreach (array('A', 'AAAA') as $t)
+			foreach ((array)cloudflare_rrset_records($name, $t) as $r)
+				$proxied = $proxied || $r['proxied'];
+	$base = 'https://api.cloudflare.com/client/v4/zones/'.$zone_id.'/dns_records';
+	foreach ($new as $i => $v) {
+		$content = $type === 'TXT' ? dns_txt_encode($v) : $v;
+		if (isset($gone[$i]))
+			$json = cloudflare_api($base.'/'.$gone[$i]['id'], true, 'PATCH', json_encode(array('content' => $content)));
+		else
+			$json = cloudflare_api($base, true, 'POST', json_encode(array('type' => $type, 'name' => $name, 'content' => $content, 'ttl' => 1,
+				'proxied' => $type === 'TXT' ? false : $proxied)));
+		if (empty($json['success']))
+			return 'Error: DNS API: '.($json['errors'][0]['message'] ?? "$type $name failed").'.';
+	}
+	for ($i = count($new); $i < count($gone); $i++) {
+		$json = cloudflare_api($base.'/'.$gone[$i]['id'], true, 'DELETE');
+		if (empty($json['success']))
+			return 'Error: DNS API: '.($json['errors'][0]['message'] ?? "$type $name failed").'.';
+	}
+	return '';
+}
+
+/* ---- whole zones (dns_zone_rrsets / dns_zone_put, see functions.php) ------
+   Cloudflare keeps each value as its own record (MX priority, SRV and CAA
+   fields apart); the zone's own name servers are not records there, so they
+   come from the zone. A record set's TTL is its first record's (1 = auto). */
+function cloudflare_zone_records($zone, &$zone_id = null, &$ns = null) {
+	$zone  = strtolower(rtrim(trim($zone), '.'));
+	$zones = get_zones();
+	if (!is_array($zones) || !isset($zones[$zone]))
+		return null;
+	$zone_id = $zones[$zone]['zone_id'];
+	$ns = array_filter(array_map('trim', explode(',', (string)$zones[$zone]['nameservers'])), 'strlen');
+	$out = array();
+	for ($page = 1; $page <= 20; $page++) {
+		$json = cloudflare_api('https://api.cloudflare.com/client/v4/zones/'.$zone_id.'/dns_records?per_page=1000&page='.$page, true, 'GET');
+		if (empty($json['success']) || !is_array($json['result'] ?? null))
+			return null;
+		foreach ($json['result'] as $rec)
+			$out[] = $rec;
+		if ($page >= (int)($json['result_info']['total_pages'] ?? 1))
+			break;
+	}
+	return $out;
+}
+
+function cloudflare_record_value($rec) {
+	$d = isset($rec['data']) && is_array($rec['data']) ? $rec['data'] : array();
+	switch ($rec['type']) {
+	case 'MX':
+		return (int)($rec['priority'] ?? 0).' '.dns_host_canon($rec['content']);
+	case 'SRV':
+		if (isset($d['target']))
+			return (int)($d['priority'] ?? 0).' '.(int)($d['weight'] ?? 0).' '.(int)($d['port'] ?? 0).' '.dns_host_canon($d['target']);
+		return dns_value_from_zone('SRV', (isset($rec['priority']) ? (int)$rec['priority'].' ' : '').$rec['content']);
+	case 'CAA':
+		if (isset($d['tag']))
+			return dns_value_join('CAA', array((int)($d['flags'] ?? 0), strtolower($d['tag']), (string)($d['value'] ?? '')));
+	}
+	return dns_value_from_zone($rec['type'], $rec['content']);
+}
+
+/* A record's body for POST/PATCH. */
+function cloudflare_record_body($type, $name, $ttl, $value, $proxied) {
+	$b = array('type' => $type, 'name' => $name, 'ttl' => $proxied ? 1 : (int)$ttl);
+	$p = dns_value_parts($type, $value);
+	switch ($type) {
+	case 'MX':  $b['priority'] = (int)$p[0]; $b['content'] = $p[1]; break;
+	case 'SRV': $b['data'] = array('priority' => (int)$p[0], 'weight' => (int)$p[1], 'port' => (int)$p[2], 'target' => $p[3]); break;
+	case 'CAA': $b['data'] = array('flags' => (int)$p[0], 'tag' => $p[1], 'value' => (string)$p[2]); break;
+	case 'TXT': $b['content'] = dns_txt_encode($value); break;
+	default:    $b['content'] = $value;
+	}
+	if ($type === 'A' || $type === 'AAAA' || $type === 'CNAME')
+		$b['proxied'] = (bool)$proxied;
+	return $b;
+}
+
+function dns_zone_rrsets($zone) {
+	$zone = strtolower(rtrim(trim($zone), '.'));
+	$recs = cloudflare_zone_records($zone, $zone_id, $ns);
+	if ($recs === null)
+		return null;
+	$sets = array();
+	if ($ns)
+		$sets['NS '.$zone] = array('name' => $zone, 'type' => 'NS', 'ttl' => 86400, 'values' => array_map('dns_host_canon', array_values($ns)), 'proxied' => null);
+	foreach ($recs as $rec) {
+		$k = $rec['type'].' '.strtolower($rec['name']);
+		if (!isset($sets[$k]))
+			$sets[$k] = array('name' => strtolower($rec['name']), 'type' => $rec['type'], 'ttl' => (int)$rec['ttl'], 'values' => array(), 'proxied' => false);
+		$sets[$k]['values'][] = cloudflare_record_value($rec);
+		$sets[$k]['proxied'] = $sets[$k]['proxied'] || !empty($rec['proxied']);
+	}
+	return array_values($sets);
+}
+
+function dns_zone_put($zone, $name, $type, $ttl, $values) {
+	$zone = strtolower(rtrim(trim($zone), '.'));
+	$name = strtolower(rtrim(trim($name), '.'));
+	$all = cloudflare_zone_records($zone, $zone_id);
+	if ($all === null)
+		return 'Error: DNS API: no managed zone '.$zone.'.';
+	$values = array_values(array_unique(array_map('strval', $values)));
+	$recs = array();
+	$proxied = false;      // a new A/AAAA/CNAME follows the name's proxy setting
+	foreach ($all as $rec) {
+		if (strtolower($rec['name']) !== $name)
+			continue;
+		if (in_array($rec['type'], array('A', 'AAAA', 'CNAME'), true))
+			$proxied = $proxied || !empty($rec['proxied']);
+		if ($rec['type'] === $type)
+			$recs[] = $rec + array('value' => cloudflare_record_value($rec));
+	}
+	$gone = array_values(array_filter($recs, function ($r) use ($values) { return !in_array($r['value'], $values, true); }));
+	$kept = array_values(array_filter($recs, function ($r) use ($values) { return in_array($r['value'], $values, true); }));
+	$new  = array_values(array_diff($values, array_column($recs, 'value')));
+	$base = 'https://api.cloudflare.com/client/v4/zones/'.$zone_id.'/dns_records';
+	$fail = function ($json) use ($type, $name) { return 'Error: DNS API: '.($json['errors'][0]['message'] ?? "$type $name failed").'.'; };
+	/* a changed value is written onto a record it replaces (one CNAME at a name) */
+	foreach ($new as $i => $v) {
+		if (isset($gone[$i]))
+			$json = cloudflare_api($base.'/'.$gone[$i]['id'], true, 'PATCH', json_encode(cloudflare_record_body($type, $name, $ttl, $v, !empty($gone[$i]['proxied']))));
+		else
+			$json = cloudflare_api($base, true, 'POST', json_encode(cloudflare_record_body($type, $name, $ttl, $v, $type === 'TXT' ? false : $proxied)));
+		if (empty($json['success']))
+			return $fail($json);
+	}
+	for ($i = count($new); $i < count($gone); $i++) {
+		$json = cloudflare_api($base.'/'.$gone[$i]['id'], true, 'DELETE');
+		if (empty($json['success']))
+			return $fail($json);
+	}
+	foreach ($kept as $r)
+		if (empty($r['proxied']) && (int)$r['ttl'] !== (int)$ttl) {
+			$json = cloudflare_api($base.'/'.$r['id'], true, 'PATCH', json_encode(array('ttl' => (int)$ttl)));
+			if (empty($json['success']))
+				return $fail($json);
+		}
+	return '';
+}

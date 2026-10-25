@@ -73,7 +73,9 @@ if ($errmsg == '') {
         $errmsg = $out != '' ? $out : "Error: Cron job could not be updated.";
     } else {
         $successmsg = "Cron job successfully updated.";
-        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " edit cron ($cron_type, user=$cron_user): $orig_line -> $new_line\n", 3, '../log/route_log');
+        if ($cron_type !== 'global')
+            account_shell_cron_sync($cron_user);
+        error_log(date("Y-m-d H:i:s") . substr((string)microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user() . " edit cron ($cron_type, user=$cron_user): $orig_line -> $new_line\n", 3, '../log/route_log');
     }
 }
 ?>

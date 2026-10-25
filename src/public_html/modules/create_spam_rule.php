@@ -48,7 +48,7 @@ if ($errmsg === '') {
 	}
 }
 
-error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER']
+error_log(date("Y-m-d H:i:s") . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user()
         . " add spam rule [$account/$list] " . ($errmsg === '' ? 'ok' : 'FAILED') . "\n", 3, '../log/route_log');
 
 msg_redirect(sa_redirect_base($account),

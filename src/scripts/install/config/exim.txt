@@ -93,8 +93,8 @@ smtp_enforce_sync = false
 # +local_domains, +relay_to_domains, and +relay_from_hosts, respectively. They
 # are all colon-separated lists:
 
-domainlist local_domains = @ : localhost : localhost.localdomain : dsearch;/etc/exim/domains
-domainlist relay_to_domains =
+domainlist local_domains = @ : localhost : localhost.localdomain : ! lsearch;/etc/exim/remotedomains : dsearch;/etc/exim/domains
+domainlist relay_to_domains = lsearch;/etc/exim/remotedomains
 hostlist   relay_from_hosts = localhost
 # (We rely upon hostname resolution working for localhost, because the default
 # uncommented configuration needs to work in IPv4-only environments.)
@@ -987,6 +987,7 @@ DKIM_PRIVATE_KEY = /etc/exim/keys/${lookup{$sender_address_domain}dsearch{/etc/e
 dnslookup:
   driver = dnslookup
   domains = ! +local_domains
+  self = defer
   ignore_target_hosts = 0.0.0.0 : 127.0.0.0/8
 # if ipv6-enabled then instead use:
 # ignore_target_hosts = <; 0.0.0.0 ; 127.0.0.0/8 ; ::1

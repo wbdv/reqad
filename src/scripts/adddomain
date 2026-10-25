@@ -6,9 +6,11 @@
 # document root (/home/<user>/<domain>), its own vhost file and, when it runs a
 # different PHP version than the account's main domain, its own php-fpm pool.
 #
-# Both web server templates are supported:
-#   apache_*        vhost in /etc/httpd/conf.d/, PHP via mod_php (default) or fpm
-#   nginx_php-fpm   vhost in /etc/nginx/conf.d/, PHP always via fpm
+# Every web server template is supported:
+#   apache_*              vhost in /etc/httpd/conf.d/, PHP via mod_php (default) or fpm
+#   nginx_php-fpm         vhost in /etc/nginx/conf.d/, PHP always via fpm
+#   nginx_apache_php-fpm  nginx vhost in front (static files, certificate), Apache
+#                         vhost behind it on loopback (.htaccess, PHP via fpm)
 #
 # Nothing is written to db/reqad.db: the accounts table has a unique index on
 # both `user` and `domain`, so an addon domain cannot live there. The vhost file
@@ -29,6 +31,7 @@ WWW=1
 SSL=1
 LETSENCRYPT=0
 DRYRUN=0
+DOCROOT_READY=0
 
 usage() {
     cat <<EOF
@@ -40,6 +43,10 @@ Options:
   --user=USERNAME      existing Reqad account (must exist in accounts table)
   --domain=DOMAIN      the additional domain to add
   --docroot=PATH       document root (default: /home/<user>/<domain>)
+  --docroot-ready      the document root was made by the caller AS the account
+                       (the account panel, the API): nothing is created or
+                       written inside the home folder by root; a folder right
+                       under the home only gets the web server's group
   --php=VERSION        PHP version to use (default: system default)
   --handler=HANDLER    mod_php or fpm (apache default: mod_php; nginx: fpm only)
   --no-www             do not add "www.<domain>" to the vhost
@@ -49,8 +56,8 @@ Options:
   -h, --help           this help
 
 Examples:
-  $0 --user=clubservice --domain=test.club-service.ro --php=7.4 --handler=mod_php
-  $0 --user=clubservice --domain=shop.club-service.ro --php=8.3
+  $0 --user=example --domain=test.example.com --php=7.4 --handler=mod_php
+  $0 --user=example --domain=shop.example.com --php=8.3
 EOF
 }
 
@@ -59,6 +66,7 @@ for arg in "$@"; do
         --user=*)     USER="${arg#*=}" ;;
         --domain=*)   DOMAIN="${arg#*=}" ;;
         --docroot=*)  DOCROOT="${arg#*=}" ;;
+        --docroot-ready) DOCROOT_READY=1 ;;
         --php=*)      PHPVER="${arg#*=}" ;;
         --handler=*)  HANDLER="${arg#*=}" ;;
         --no-www)     WWW=0 ;;
@@ -93,30 +101,39 @@ sq() { sqlite3 -batch -noheader -list "$DB" "$1"; }
 [ "$(sq "SELECT count(*) FROM accounts WHERE user='${USER//\'/\'\'}'")" = "1" ] \
     || die "Account '$USER' does not exist in Reqad."
 id "$USER" >/dev/null 2>&1 || die "System user '$USER' does not exist."
+# plan limits (hosting packages): core allows everything, a plugin may not
+LIMIT_MSG=$(/usr/local/reqad/bin/reqad account can-create "$USER" addon --domain="$DOMAIN" 2>&1) || die "${LIMIT_MSG#reqad: }"
 
 OWNER_OF_DOMAIN="$(sq "SELECT user FROM accounts WHERE domain='${DOMAIN//\'/\'\'}'")"
 [ -z "$OWNER_OF_DOMAIN" ] \
     || die "'$DOMAIN' is already the main domain of account '$OWNER_OF_DOMAIN'."
 
 # --------------------------------------------------------------- web server
-TEMPLATE="$(grep -E '^[[:space:]]*template[[:space:]]*=' "$INI" | head -n1 | cut -d= -f2 | tr -d '[:space:]')"
-case "$TEMPLATE" in
-    apache_*)
+. "${PATH_REQAD}/scripts/web_caps.sh"
+WEB_CAPS_ROOT="$PATH_REQAD" web_caps "$INI"
+[ -n "$WEB_FRONT" ] || die "Unknown web server template '$TEMPLATE' in $INI."
+# Apache behind nginx: a second vhost on loopback (web_backend_addr() in app/functions)
+BACKEND_VHOST=''
+if [ "$WEB_BACKEND" != none ]; then
+    command -v httpd >/dev/null 2>&1 || die "httpd (the backend web server) is not installed."
+    BACKEND_VHOST="$(web_vhost_dir "$WEB_BACKEND")/${DOMAIN}.conf"
+    [ -e "$BACKEND_VHOST" ] && die "Backend vhost file $BACKEND_VHOST already exists."
+fi
+case "$WEB_FRONT" in
+    httpd)
         WEBSERVER='apache'
-        VHOST="/etc/httpd/conf.d/${DOMAIN}.conf"
-        FPM_GROUP='apache'
         WEB_SERVICE='httpd'
         command -v httpd >/dev/null 2>&1 || die "httpd is not installed."
         ;;
-    nginx_*)
+    nginx)
         WEBSERVER='nginx'
-        VHOST="/etc/nginx/conf.d/${DOMAIN}.conf"
-        FPM_GROUP='nginx'
         WEB_SERVICE='nginx'
         command -v nginx >/dev/null 2>&1 || die "nginx is not installed."
         ;;
-    *)  die "Unknown web server template '$TEMPLATE' in $INI." ;;
 esac
+VHOST="$(web_vhost_dir "$WEB_FRONT")/${DOMAIN}.conf"
+# docroot + socket group: the front server's (a backend server is a member)
+FPM_GROUP="$(web_user "$WEB_FRONT")"
 [ -e "$VHOST" ] && die "Vhost file $VHOST already exists."
 
 # ---------------------------------------------------------------- php setup
@@ -132,16 +149,16 @@ PHP_SHORT="${PHPVER//./}"
 IS_DEFAULT_PHP=0
 [ "$PHPVER" = "$PHP_DEFAULT" ] && IS_DEFAULT_PHP=1
 
-# nginx has no mod_php, apache defaults to it (that is what the account templates use)
+# mod_php templates default to it (that is what the account templates use), the rest are fpm only
 if [ -z "$HANDLER" ]; then
-    [ "$WEBSERVER" = 'apache' ] && HANDLER='mod_php' || HANDLER='fpm'
+    [ "$PHP_MODE" = 'modphp' ] && HANDLER='mod_php' || HANDLER='fpm'
 fi
 case "$HANDLER" in
     mod_php|fpm) ;;
     *) die "--handler must be 'mod_php' or 'fpm'." ;;
 esac
-[ "$WEBSERVER" = 'nginx' ] && [ "$HANDLER" = 'mod_php' ] \
-    && die "nginx cannot run mod_php. Use --handler=fpm (the default on nginx)."
+[ "$PHP_MODE" = 'fpm' ] && [ "$HANDLER" = 'mod_php' ] \
+    && die "This server's template ($TEMPLATE) has no mod_php. Use --handler=fpm (the default here)."
 
 # mod_php only exists for the distro/default PHP; the remi SCL builds are fpm only.
 if [ "$HANDLER" = "mod_php" ] && [ "$IS_DEFAULT_PHP" -eq 0 ]; then
@@ -165,6 +182,11 @@ fi
 case "$DOCROOT" in
     /home/${USER}/*) ;;
     *) die "Document root must live under /home/${USER}/ (open_basedir is /home/${USER})." ;;
+esac
+# not inside a site deployed from Git: its document root is a symlink into
+# ~/apps/<domain>/current, replaced on every deploy (app/functions/deploy.php)
+case "$(readlink -m "$DOCROOT")" in
+    /home/${USER}/apps/*) die "$DOCROOT is inside a site deployed from Git (Accounts > Deployments); the next deploy would remove it. Choose a document root outside it." ;;
 esac
 
 if [ "$HANDLER" = "fpm" ]; then
@@ -201,23 +223,35 @@ echo "Document root .... ${DOCROOT}"
 echo "PHP .............. ${PHPVER} (${HANDLER})"
 [ -n "$POOL" ] && echo "PHP-FPM pool ..... ${POOL} → ${SOCKET}"
 echo "Vhost ............ ${VHOST}"
+[ -n "$BACKEND_VHOST" ] && echo "Backend vhost .... ${BACKEND_VHOST}"
 echo
 
 # ------------------------------------------------------------- document root
-if [ ! -d "$DOCROOT" ]; then
+if [ "$DOCROOT_READY" -eq 1 ]; then
+    # made as the account: root writes nothing inside the home (a symlink
+    # swapped in could lead it anywhere). chgrp -h follows no link, and a
+    # folder right under the home has no path part the account could swap.
+    [ -d "$DOCROOT" ] && [ ! -L "$DOCROOT" ] || die "Document root $DOCROOT is not a folder."
+    [ "$(stat -c %U "$DOCROOT")" = "$USER" ] || die "Document root $DOCROOT does not belong to ${USER}."
+    if [ "$(dirname "$DOCROOT")" = "/home/${USER}" ]; then
+        run chgrp -h "$FPM_GROUP" "$DOCROOT"
+    fi
+elif [ ! -d "$DOCROOT" ]; then
     run mkdir -p "$DOCROOT"
-    run chown "${USER}:${USER}" "$DOCROOT"
-    run chmod 0755 "$DOCROOT"
+    # only the account and the web server reach it (harden_account_perms.sh)
+    run chown "${USER}:${FPM_GROUP}" "$DOCROOT"
+    run chmod 0750 "$DOCROOT"
 fi
 for d in "/home/${USER}/logs" "/home/${USER}/tmp"; do
-    if [ ! -d "$d" ]; then
+    if [ "$DOCROOT_READY" -eq 0 ] && [ ! -d "$d" ]; then
         run mkdir -p "$d"
         run chown "${USER}:${USER}" "$d"
+        run chmod 0770 "$d"
     fi
 done
 run chmod a+x "/home/${USER}"
 
-if [ ! -e "${DOCROOT}/index.php" ] && [ ! -e "${DOCROOT}/index.html" ]; then
+if [ "$DOCROOT_READY" -eq 0 ] && [ ! -e "${DOCROOT}/index.php" ] && [ ! -e "${DOCROOT}/index.html" ]; then
     if [ "$DRYRUN" -eq 1 ]; then
         echo "+ install default index.php in ${DOCROOT}"
     else
@@ -253,6 +287,16 @@ if [ "$SSL" -eq 1 ]; then
 fi
 
 # ------------------------------------------------------------ apache vhost
+# Apache reading the files as apache (php-fpm templates): links only to files
+# of the same owner, and .htaccess cannot turn FollowSymLinks back on
+# (apache_override_options() in app/functions/accounts.php). With mod_php,
+# mod_ruid2 runs the request as the account already.
+SYMLINK_OPTS='Options=Indexes,MultiViews,SymLinksIfOwnerMatch,IncludesNOEXEC'
+if [ "$PHP_MODE" = fpm ]; then
+    APACHE_OVERRIDE=" ${SYMLINK_OPTS}"; APACHE_FOLLOW=''
+else
+    APACHE_OVERRIDE=''; APACHE_FOLLOW=' FollowSymLinks'
+fi
 apache_php_block() {
     if [ "$HANDLER" = "fpm" ]; then
         cat <<EOF
@@ -280,8 +324,8 @@ EOF
 apache_vhost_body() {
     cat <<EOF
 <Directory "${DOCROOT}">
-    AllowOverride All
-    Options MultiViews SymLinksIfOwnerMatch IncludesNoExec FollowSymLinks
+    AllowOverride All${APACHE_OVERRIDE}
+    Options MultiViews SymLinksIfOwnerMatch IncludesNoExec${APACHE_FOLLOW}
     Require all granted
 </Directory>
 
@@ -345,7 +389,7 @@ nginx_server_body() {
     root        ${DOCROOT};
     autoindex   off;
     index       index.php index.html index.htm;
-    include /etc/nginx/reqad-error-pages.conf;
+$([ -f /etc/nginx/reqad-error-pages.conf ] && echo "    include /etc/nginx/reqad-error-pages.conf;" || echo "#SKIP")
 
     # Allow OPTIONS for Wordpress
     allow_methods "^(GET|POST|HEAD|OPTIONS)\$";
@@ -379,7 +423,8 @@ nginx_server_body() {
 
             include         /etc/nginx/fastcgi_params;
             fastcgi_index   index.php;
-            fastcgi_param   SCRIPT_FILENAME     \$document_root\$fastcgi_script_name;
+            fastcgi_param   SCRIPT_FILENAME     \$realpath_root\$fastcgi_script_name;
+            fastcgi_param   DOCUMENT_ROOT       \$realpath_root;
             fastcgi_pass    ${UPSTREAM};
         }
 
@@ -401,13 +446,115 @@ nginx_server_body() {
 EOF
 }
 
-nginx_vhost() {
+# Apache behind nginx: nginx serves the static files and passes the rest to
+# Apache. Keep in step with nginx_backend_root() / nginx_backend_named() in
+# app/functions/accounts.php.
+nginx_backend_body() {
     cat <<EOF
+    error_log  /var/log/nginx/${DOMAIN}_log;
+    access_log /var/log/nginx/${DOMAIN}_log;
+
+    root        ${DOCROOT};
+    autoindex   off;
+    index       index.php index.html index.htm;
+$([ -f /etc/nginx/reqad-error-pages.conf ] && echo "    include /etc/nginx/reqad-error-pages.conf;" || echo "#SKIP")
+
+    # Allow OPTIONS for Wordpress
+    allow_methods "^(GET|POST|HEAD|OPTIONS)\$";
+
+    location / {
+        # everything that is not a static file: Apache behind nginx (.htaccess, PHP)
+        include /etc/nginx/reqad-backend.conf;
+
+        # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
+        location ~ /\\. {
+            deny all;
+        }
+
+        # Deny access to any files with a .php extension in the uploads directory
+        # Must stay ABOVE the PHP location (nested regex locations match in file order).
+        location ~* /(?:uploads|files)/.*\\.php\$ {
+            deny all;
+        }
+
+        location ~ \\.php\$ {
+            include /etc/nginx/reqad-backend.conf;
+        }
+
+        location ~* \\.(js|css|png|jpg|jpeg|gif|ico|woff2|woff|webp|avif|svg)\$ {
+            try_files \$uri @reqad_backend;
+            expires max;
+            log_not_found off;
+        }
+        location ~* \\.(map|bmp|tif|tiff|ttf|otf|eot|mp4|webm|ogg|ogv|mp3|m4a|wav|flac|pdf|txt|xml|csv|zip|gz|tgz|rar|7z|doc|docx|xls|xlsx|ppt|pptx|odt|ods)\$ {
+            try_files \$uri @reqad_backend;
+        }
+        location = /favicon.ico {
+            try_files \$uri @reqad_backend;
+            log_not_found off;
+            access_log off;
+        }
+        location = /robots.txt {
+            try_files \$uri @reqad_backend;
+            allow all;
+            log_not_found off;
+            access_log off;
+        }
+    }
+
+    location @reqad_backend {
+        include /etc/nginx/reqad-backend.conf;
+    }
+EOF
+}
+
+# The domain's vhost on the backend Apache (backend_vhost() in app/functions/accounts.php).
+backend_vhost() {
+    local addr=127.0.0.1:8080 port=80
+    [ "$SSL" -eq 1 ] && { addr=127.0.0.1:8443; port=443; }
+    cat <<EOF
+# Backend of additional domain ${DOMAIN} (account ${USER}) — generated by reqad adddomain on $(date '+%Y-%m-%d %H:%M:%S')
+# Apache behind nginx: nginx serves the static files and passes the rest here.
+<VirtualHost ${addr}>
+    ServerName     ${DOMAIN}:${port}
+    ServerAlias    ${NAMES}
+    DocumentRoot   ${DOCROOT}
+    UseCanonicalName Off
+    <Directory "${DOCROOT}">
+        AllowOverride All ${SYMLINK_OPTS}
+        Options MultiViews SymLinksIfOwnerMatch IncludesNoExec
+        Require all granted
+    </Directory>
+    Options -ExecCGI -Includes
+EOF
+    if [ "$SSL" -eq 1 ]; then
+        cat <<EOF
+    SSLEngine on
+    SSLCertificateFile /etc/httpd/reqad-backend/backend.crt
+    SSLCertificateKeyFile /etc/httpd/reqad-backend/backend.key
+EOF
+    fi
+    cat <<EOF
+
+    <FilesMatch \.php\$>
+        SetHandler "proxy:unix:${SOCKET}|fcgi://localhost"
+    </FilesMatch>
+</VirtualHost>
+EOF
+}
+
+nginx_vhost() {
+    local body=nginx_server_body
+    if [ -n "$BACKEND_VHOST" ]; then
+        body=nginx_backend_body
+    else
+        cat <<EOF
 upstream ${UPSTREAM} {
     server   unix:${SOCKET};
 }
 
 EOF
+    fi
     if [ "$SSL" -eq 1 ]; then
         cat <<EOF
 server {
@@ -426,7 +573,7 @@ server {
     ssl_certificate ${CERT_CRT};
     ssl_certificate_key ${CERT_KEY};
 
-$(nginx_server_body)
+$($body)
 }
 EOF
     else
@@ -435,7 +582,7 @@ server {
     listen 80;
     server_name ${NAMES};
 
-$(nginx_server_body)
+$($body)
 }
 EOF
     fi
@@ -456,6 +603,7 @@ if [ "$DRYRUN" -eq 1 ]; then
     echo "----- ${VHOST} -----"
     cat "$TMP"
     rm -f "$TMP"
+    [ -n "$BACKEND_VHOST" ] && { echo "----- ${BACKEND_VHOST} -----"; backend_vhost; }
     [ -n "$POOL" ] && echo "----- ${POOL} would be created -----"
     exit 0
 fi
@@ -463,25 +611,32 @@ fi
 install -m 0644 -o root -g root "$TMP" "$VHOST"
 rm -f "$TMP"
 echo "Wrote ${VHOST}"
+if [ -n "$BACKEND_VHOST" ]; then
+    TMP="$(mktemp /tmp/reqad-vhost.XXXXXX)"
+    backend_vhost > "$TMP"
+    install -m 0644 -o root -g root "$TMP" "$BACKEND_VHOST"
+    rm -f "$TMP"
+    echo "Wrote ${BACKEND_VHOST}"
+fi
 
 # --------------------------------------------------------------- fpm pool
 if [ -n "$POOL" ]; then
     cat > "$POOL" <<EOF
 [${DOMAIN}]
 user = ${USER}
-group = ${FPM_GROUP}
+group = ${USER}
 listen = ${SOCKET}
 listen.owner = ${USER}
 listen.group = ${FPM_GROUP}
 listen.allowed_clients = 127.0.0.1
 
-pm = dynamic
-pm.max_children = 200
-pm.start_servers = 10
-pm.min_spare_servers = 5
-pm.max_spare_servers = 50
-pm.process_idle_timeout = 1s;
-pm.max_requests = 1000
+; workers start with the first request and stop after 10 s idle, so a quiet
+; site holds no memory; 20 at once per site, a stuck script is killed at 300 s
+pm = ondemand
+pm.max_children = 20
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+request_terminate_timeout = 300s
 
 ping.path = /ping
 slowlog = /var/log/php-fpm/${DOMAIN}-slow.log
@@ -505,6 +660,7 @@ fi
 # ----------------------------------------------------------------- activate
 rollback() {
     rm -f "$VHOST"
+    [ -n "$BACKEND_VHOST" ] && rm -f "$BACKEND_VHOST"
     [ -n "$POOL" ] && rm -f "$POOL"
 }
 
@@ -519,6 +675,12 @@ if ! $CONFTEST >/dev/null 2>&1; then
     rollback
     exit 1
 fi
+if [ -n "$BACKEND_VHOST" ] && ! httpd -t >/dev/null 2>&1; then
+    echo "Error: httpd configuration test failed, rolling back:" >&2
+    httpd -t 2>&1 | sed 's/^/    /' >&2
+    rollback
+    exit 1
+fi
 
 if [ -n "$FPM_SERVICE" ]; then
     if ! systemctl restart "$FPM_SERVICE"; then
@@ -528,6 +690,10 @@ if [ -n "$FPM_SERVICE" ]; then
         exit 1
     fi
     echo "Restarted ${FPM_SERVICE}"
+fi
+if [ -n "$BACKEND_VHOST" ]; then
+    systemctl reload httpd 2>/dev/null || systemctl restart httpd || die "Failed to reload httpd."
+    echo "Reloaded httpd"
 fi
 systemctl reload "$WEB_SERVICE" 2>/dev/null || systemctl restart "$WEB_SERVICE" || die "Failed to reload ${WEB_SERVICE}."
 echo "Reloaded ${WEB_SERVICE}"
@@ -543,6 +709,8 @@ if [ "$LETSENCRYPT" -eq 1 ]; then
         if [ "$(dig +short a "$DOMAIN" | tail -n1)" = "$IP" ]; then
             certbot --non-interactive --"${WEB_SERVICE/httpd/apache}" -d "$LE_DOMAINS" \
                 && echo "Let's Encrypt certificate installed."
+            # an https vhost certbot wrote to <domain>-le-ssl.conf goes into <domain>.conf
+            [ "$WEB_SERVICE" = httpd ] && "${PATH_REQAD}/scripts/update/merge_le_ssl_vhosts.sh" --domain="$DOMAIN"
         else
             echo "Warning: ${DOMAIN} does not resolve to ${IP}, skipping Let's Encrypt."
         fi

@@ -17,6 +17,9 @@ if [ -n "$SAFEUSER" ]; then
     rm -rf "/usr/local/reqad/backup/config/$SAFEUSER" 2>/dev/null
 fi
 
+# its session limits (systemd slice drop-in, keyed by uid)
+/usr/local/reqad/scripts/session_limits.sh remove "$1" 2>/dev/null
+
 output=$(userdel "$1" 2>&1)
 if id "$1" >/dev/null 2>&1; then
     echo "[delete_user.sh] userdel failed: $output" >> /usr/local/reqad/log/debug_log

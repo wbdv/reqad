@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.1.1 - Sep 6, 2026'
+VERSION='0.1.2 - Oct 17, 2026'
 
 # Merged from install-el8.sh (0.0.27) + install-el9.sh (0.0.30). One script for
 # every Enterprise Linux release; EL-specific bits are switched on ${EL} below.
@@ -97,6 +97,8 @@ echo -e "│ All ok, proceed to instalation.                                    
 echo -e "└──────────────────────────────────────────────────────────────────────────────┘\n"
 echo -ne "${NC}"
 
+VIRT=$(systemd-detect-virt 2>/dev/null || echo none)
+
 if [ "$1" == "--skip-update" ]; then
     echo -e "  ~~~ skip dnf update and packages install ~~~\n";
 else
@@ -104,19 +106,14 @@ else
 	# exotic NICs). A guest (KVM, Xen, VMware, LXC, ...) never loads any of it, so
 	# exclude it from dnf on a VPS: it is the single slowest part of the first update.
 	#
-	# On KVM we go further and delete it outright (see below). It cannot be removed
-	# *before* the update though: kernel-core carries "Requires(pre): linux-firmware",
-	# so with the package gone and still excluded dnf refuses to install any kernel
-	# ("nothing provides linux-firmware needed by kernel-core"). Erasing it is safe
-	# (rpm ignores Requires(pre) on removal - nothing cascades), so the working order
-	# is: exclude -> update (the installed copy keeps the kernel dependency satisfied,
-	# and nothing is re-downloaded) -> remove the packages -> drop the exclude again.
-	VIRT=$(systemd-detect-virt 2>/dev/null || echo none)
-	case "${VIRT}" in
-	    kvm|qemu) PRUNE_FIRMWARE=1 ;;
-	    *)        PRUNE_FIRMWARE=0 ;;
-	esac
-	if [ "${VIRT}" != "none" ] && ! grep -q '^exclude=.*linux-firmware' /etc/dnf/dnf.conf; then
+	# On KVM we go further and replace it with reqad-firmware-stub once the reqad
+	# repo is set up (see "firmware" below). Only while it is installed: EL8's
+	# kernel-core carries "Requires(pre): linux-firmware", so with the package gone
+	# and excluded dnf refuses to install any kernel ("nothing provides
+	# linux-firmware needed by kernel-core"). The installed copy keeps that
+	# dependency satisfied during this update, and nothing is re-downloaded.
+	if [ "${VIRT}" != "none" ] && rpm -q --quiet linux-firmware \
+	   && ! grep -q '^exclude=.*linux-firmware' /etc/dnf/dnf.conf; then
 	    echo -n "Virtual machine (${VIRT}), exclude linux-firmware ";
 	    if grep -q '^exclude=' /etc/dnf/dnf.conf; then
 	        sed -i 's/^exclude=.*/&,linux-firmware/' /etc/dnf/dnf.conf
@@ -130,34 +127,6 @@ else
 	(dnf clean all) >> ./install_reqad.log 2>&1
 	(dnf --refresh makecache && dnf -y update) >> ./install_reqad.log 2>&1
 	echo -e "[ ${GREEN}DONE${NC} ]"
-
-	# Nothing in a KVM guest requests firmware - it only ever binds virtio and
-	# emulated devices - so drop the blobs now that the update (and any kernel it
-	# pulled in) is done. EL8 ships one big linux-firmware plus the iwl* sets;
-	# EL9 splits it into per-vendor subpackages. Globs that match nothing are
-	# simply skipped, and microcode_ctl is deliberately left alone.
-	if [ "${PRUNE_FIRMWARE}" == "1" ] && rpm -q --quiet linux-firmware; then
-	    echo -n "Remove firmware blobs (${VIRT} guest)        " | cut -b 1-36 | echo -n "$(</dev/stdin)"
-	    set -f   # ${FW} holds rpm globs - keep the shell from expanding them as paths
-	    FW="linux-firmware linux-firmware-* iwl*-firmware alsa-sof-firmware"
-	    FW="${FW} libertas-*-firmware atheros-firmware brcmfmac-firmware"
-	    FW="${FW} mt7xxx-firmware realtek-firmware tiwilink-firmware"
-	    FW="${FW} nxpwireless-firmware qcom-firmware amd-gpu-firmware"
-	    FW="${FW} nvidia-gpu-firmware intel-gpu-firmware liquidio-firmware"
-	    FW="${FW} netronome-firmware mrvlprestera-firmware"
-	    (dnf -y remove ${FW}) >> ./install_reqad.log 2>&1
-	    set +f
-	    # The exclude has to go with it, otherwise the next kernel update fails to
-	    # resolve. linux-firmware comes back if a kernel is ever updated; that is
-	    # the price of keeping dnf working.
-	    sed -i -e '/^exclude=linux-firmware$/d' \
-	           -e 's/^\(exclude=.*\),linux-firmware\b/\1/' /etc/dnf/dnf.conf
-	    if rpm -q --quiet linux-firmware; then
-	        echo -e "[ ${RED}ERROR${NC} ]"
-	    else
-	        echo -e "[ ${GREEN}DONE${NC} ]"
-	    fi
-	fi
 	if [ ! -f "/etc/yum.repos.d/epel.repo" ]; then
 	    echo -n "Install epel                        ";
 	    (dnf install -y epel-release) >> ./install_reqad.log 2>&1
@@ -465,6 +434,29 @@ else
     echo -n `rpm -qi reqad | grep 'Version' | awk {'print $3'}`
 fi
 echo
+
+#==[ firmware ]===============================================
+# kernel-core asks for linux-firmware, so every kernel update would bring the
+# blobs back. On a KVM guest reqad-firmware-stub (reqad repo, hence only now)
+# stands in for it: its Obsoletes remove linux-firmware and the other firmware
+# packages (iwl*, alsa-sof, ...) in the same transaction, and keep them out.
+# Then the exclude added before the update can go. If the stub can't be
+# installed the exclude stays, and the installed linux-firmware keeps kernel
+# updates working.
+case "${VIRT}" in
+    kvm|qemu)
+	if ! rpm -q --quiet reqad-firmware-stub; then
+	    echo -n "Firmware stub (${VIRT} guest)        " | cut -b 1-36 | echo -n "$(</dev/stdin)"
+	    (dnf -y install reqad-firmware-stub) >> ./install_reqad.log 2>&1
+	    if rpm -q --quiet reqad-firmware-stub; then
+	        sed -i -e '/^exclude=linux-firmware$/d' \
+	               -e 's/^\(exclude=.*\),linux-firmware\b/\1/' /etc/dnf/dnf.conf
+	        echo -e "[ ${GREEN}DONE${NC} ]"
+	    else
+	        echo -e "[ ${RED}ERROR${NC} ]"
+	    fi
+	fi ;;
+esac
 
 install_email() {
 	if [ "${WITH_EMAIL}" == "1" ]; then

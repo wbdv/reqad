@@ -46,8 +46,9 @@ elif [ "127.0.0.1.25" == "${EXIM_LOCAL}" ]; then
 fi
 
 (
-	mkdir -p /etc/exim/domains /etc/exim/forwards /etc/exim/keys
+	mkdir -p /etc/exim/domains /etc/exim/forwards /etc/exim/keys /etc/exim/virtual
 	touch /etc/exim/userdomains
+	touch /etc/exim/remotedomains
 	echo "if not first_delivery
 then
   finish
@@ -424,6 +425,8 @@ LOCALEOF
 		fi
 
 		touch /etc/dovecot/users
+		# mailbox password hashes: dovecot (auth runs as user dovecot) and root only
+		chown root:dovecot /etc/dovecot/users && chmod 0640 /etc/dovecot/users
 		touch /etc/dovecot/sni.conf
 		usermod -G dovecot,mail,exim,mysyslog dovecot
 		/usr/local/reqad/scripts/update_email_sni
@@ -503,7 +506,8 @@ else
 
 		# IMAP: use IMAPS (port 993); disable peer verification for local self-signed cert.
 		# Usernames are full email addresses — Dovecot verifies password against /etc/dovecot/users.
-		# SMTP: submit via exim on port 25 from localhost — no auth required.
+		# SMTP: submit via exim on port 25 from localhost, signed in as the mailbox
+		# (SMTP AUTH '%u'/'%p') so Exim's sending limits apply to webmail too.
 		sed -i \
 		    "s|'imap_host'.*|'imap_host'] = 'ssl://localhost';|" \
 		    "${ROUNDCUBE_INSTALL_DIR}/config/config.inc.php"
@@ -518,9 +522,9 @@ else
     'ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true],
 ];
 
-// SMTP: no auth (exim accepts local submissions without credentials)
-\$config['smtp_user'] = '';
-\$config['smtp_pass'] = '';
+// SMTP: AUTH as the mailbox, so Exim's sending limits apply (auto-login binds the master user)
+\$config['smtp_user'] = '%u';
+\$config['smtp_pass'] = '%p';
 \$config['smtp_conn_options'] = [
     'ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true],
 ];

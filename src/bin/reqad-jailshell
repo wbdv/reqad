@@ -1,0 +1,120 @@
+#!/bin/bash
+# Login shell for hosting accounts whose shell access is "jailed" or "none"
+# (Accounts > Manage > Shell access, `reqad account edit <user> --shell=`).
+#
+#   /usr/local/bin/reqad-jailshell   jailed: bash in a sandbox
+#   /usr/local/bin/reqad-sftponly    none:   SFTP only over SSH (a
+#                                          symlink to this file); cron jobs
+#                                          still run, in the same sandbox
+#
+# The sandbox (bubblewrap, unprivileged user namespace) shows the account:
+#   - its own home, read-write; /tmp is ~/tmp (or a private tmpfs)
+#   - /usr and /opt/remi read-only, so the usual tools work: bash, git, php,
+#     wp, composer, mysql, rsync, sftp-server
+#   - a short list of /etc files (DNS, CA certificates, PHP and MySQL client
+#     config); /etc/passwd and /etc/group without the other hosting accounts
+#   - its own processes only (own PID namespace), the MySQL socket, the network
+# Nothing else: no other homes, no /var/log, no /etc/nginx, no panel. setuid
+# programs (sudo, su, crontab, sendmail) do not work inside. Cron jobs use it
+# through SHELL= at the top of the account's crontab (set by the panel).
+#
+# The source is /usr/local/reqad/bin/reqad-jailshell; scripts/account_shell.sh
+# installs a root-owned copy in /usr/local/bin (the panel tree is 0750, an
+# account cannot run anything from it).
+
+if [ "$(id -u)" -lt 1000 ]; then
+    echo "reqad-jailshell: not for system users" >&2
+    exit 1
+fi
+
+ME=$(id -un)
+HOME_DIR=$(getent passwd "$ME" | cut -d: -f6)
+[ -d "$HOME_DIR" ] || { echo "reqad-jailshell: no home directory" >&2; exit 1; }
+
+NAME=${0##*/}; NAME=${NAME#-}
+# A login shell is started with argv0 "-reqad-jailshell", but a script never
+# sees its argv0 (the kernel puts the script's path in $0). sshd, su - and the
+# account panel's terminal start a login session with no arguments; commands
+# (ssh host cmd, scp, cron, su -c) come with -c. So: no arguments = login, and
+# bash reads /etc/profile and ~/.bash_profile.
+LOGIN=0; [ $# -eq 0 ] && LOGIN=1
+
+# SFTP only: over SSH nothing but the SFTP server. sshd always sets
+# SSH_CONNECTION itself, so a client cannot hide it. Cron and the panel's
+# own commands (no SSH_CONNECTION) still run, jailed.
+if [ "$NAME" = reqad-sftponly ] && [ -n "$SSH_CONNECTION" ]; then
+    case "$1 $2" in
+        "-c /usr/libexec/openssh/sftp-server"|"-c /usr/libexec/openssh/sftp-server "*|"-c internal-sftp") ;;
+        *) echo "This account has SFTP access only, no shell."; exit 1 ;;
+    esac
+fi
+
+if ! command -v bwrap >/dev/null 2>&1; then
+    echo "reqad-jailshell: bubblewrap is not installed - ask the server admin" >&2
+    exit 1
+fi
+
+A=(--unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try --hostname "$(hostname -s)")
+
+# system files, read-only
+A+=(--ro-bind /usr /usr
+    --symlink usr/bin /bin --symlink usr/sbin /sbin
+    --symlink usr/lib /lib --symlink usr/lib64 /lib64
+    --ro-bind-try /opt/remi /opt/remi)
+A+=(--dir /etc)
+for f in hosts host.conf resolv.conf nsswitch.conf gai.conf localtime hostname services protocols \
+         ld.so.cache ld.so.conf ld.so.conf.d alternatives \
+         profile profile.d bashrc inputrc environment locale.conf DIR_COLORS DIR_COLORS.256color \
+         shells terminfo vimrc virc nanorc wgetrc gitconfig mime.types man_db.conf \
+         os-release redhat-release rocky-release almalinux-release system-release centos-release \
+         ssl pki crypto-policies \
+         php.ini php.d php-zts.d my.cnf my.cnf.d \
+         ssh/ssh_config ssh/ssh_config.d ssh/ssh_known_hosts \
+         fonts ImageMagick-6 ImageMagick-7 npmrc environment-modules modulefiles scl; do
+    [ -e "/etc/$f" ] && A+=(--ro-bind "/etc/$f" "/etc/$f")
+done
+# remi PHP: only php.ini and php.d - the php-fpm.d next to them lists the other sites
+for d in /etc/opt/remi/php*; do
+    [ -d "$d" ] || continue
+    [ -e "$d/php.ini" ] && A+=(--ro-bind "$d/php.ini" "$d/php.ini")
+    [ -d "$d/php.d" ]   && A+=(--ro-bind "$d/php.d" "$d/php.d")
+done
+
+# passwd / group: system entries and this account only
+exec 7< <(awk -F: -v me="$ME" '$3 < 1000 || $1 == me' /etc/passwd)
+exec 8< <(awk -F: -v me="$ME" -v g="$(id -g)" 'BEGIN {OFS=":"}
+    $3 == g { print; next }
+    $3 < 1000 { n = split($4, m, ","); keep = ""; for (i = 1; i <= n; i++) if (m[i] == me) keep = me; $4 = keep; print }' /etc/group)
+A+=(--ro-bind-data 7 /etc/passwd --ro-bind-data 8 /etc/group)
+
+# kernel views, devices, scratch space
+A+=(--proc /proc --dev /dev --tmpfs /run --tmpfs /var --dir /var/lib --dir /var/cache)
+# (the SSH terminal stays usable through the inherited file descriptors; the
+# sandbox has its own /dev/pts, so tmux and screen work inside)
+if [ -d "$HOME_DIR/tmp" ] && [ -O "$HOME_DIR/tmp" ]; then
+    A+=(--bind "$HOME_DIR/tmp" /tmp)
+else
+    A+=(--tmpfs /tmp)
+fi
+A+=(--symlink ../tmp /var/tmp)
+[ -S /var/lib/mysql/mysql.sock ] && A+=(--dir /var/lib/mysql --bind /var/lib/mysql/mysql.sock /var/lib/mysql/mysql.sock)
+# forwarded ssh agent (git push with the user's own key)
+if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ] && [ -O "$SSH_AUTH_SOCK" ]; then
+    A+=(--bind "$(dirname "$SSH_AUTH_SOCK")" "$(dirname "$SSH_AUTH_SOCK")")
+fi
+
+# the account's own home - the only writable place
+A+=(--tmpfs /home --bind "$HOME_DIR" "$HOME_DIR")
+case "$PWD/" in
+    "$HOME_DIR"/*) A+=(--chdir "$PWD") ;;
+    *)             A+=(--chdir "$HOME_DIR") ;;
+esac
+A+=(--setenv HOME "$HOME_DIR" --setenv SHELL /bin/bash --setenv USER "$ME" --setenv LOGNAME "$ME")
+# no terminal (cron, scp, git over ssh): a new session, so nothing inside can
+# push keystrokes into a terminal outside
+[ -t 0 ] || A+=(--new-session)
+
+if [ "$LOGIN" = 1 ]; then
+    exec bwrap "${A[@]}" -- /bin/bash -l "$@"
+fi
+exec bwrap "${A[@]}" -- /bin/bash "$@"

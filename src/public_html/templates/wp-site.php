@@ -583,9 +583,10 @@ jQuery(document).ready(function () {
 		  .html(html).show();
 	}
 	var siteBase = <?=json_encode(rtrim($site_url, '/'), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT);?>;
-	function loginCard(slug) {
+	// url: the probe's login_url (/?slug when the site has plain permalinks)
+	function loginCard(slug, url) {
 		if(!slug) { $('#st-login-wrap').hide(); return; }
-		var url = siteBase + '/' + slug;
+		url = url || siteBase + '/' + slug;
 		$('#st-login-url').attr('href', url).text(url);
 		$('#st-login-wrap').show();
 	}
@@ -595,7 +596,7 @@ jQuery(document).ready(function () {
 		if(navigator.clipboard) navigator.clipboard.writeText(url).then(done);
 		else { var $t = $('<textarea>').val(url).appendTo('body').select(); document.execCommand('copy'); $t.remove(); done(); }
 	});
-	function secRender(st, slug) {
+	function secRender(st, slug, url) {
 		secState = st;
 		$('.wp-sec-row').each(function () {
 			var k = $(this).data('option'), s = st[k] || 'na';
@@ -612,7 +613,7 @@ jQuery(document).ready(function () {
 		$('#sec-regen-keys').toggle(st.security_keys === 'on');
 		if(st.hide_login === 'on' && slug) $('#sec-login-slug').val(slug);
 		$('#sec-login-note').toggle(st.hide_login === 'on');
-		loginCard(st.hide_login === 'on' ? slug : '');
+		loginCard(st.hide_login === 'on' ? slug : '', url);
 		$('#sec-apply').prop('disabled', false);
 	}
 	function ipList() {
@@ -643,7 +644,7 @@ jQuery(document).ready(function () {
 		$.post('./ajax-wp-security-apply/', { action: 'ajax-wp-security-apply', user: wpUser, on: on,
 			login_slug: $('#sec-login-slug').val(), regen_keys: regen ? '1' : '0', allow_ips: ipList().join('\n') }, null, 'json')
 		.done(function (r) {
-			if(r && r.security) secRender(r.security, r.login_slug);
+			if(r && r.security) secRender(r.security, r.login_slug, r.login_url);
 			if(r && r.allow_ips) ipRender(r.allow_ips);
 			if(r && r.ok) secAlert('success', 'Security settings applied.');
 			else secAlert('error', esc(r && r.error ? r.error : 'Operation failed.').replace(/\n/g, '<br>'));
@@ -705,7 +706,7 @@ jQuery(document).ready(function () {
 		renderInfo(r.info || {});
 		// never overwrite a switch or checkbox while its own request is running
 		if(r.performance && !perfBusy) wpManageRender(r.performance);
-		if(r.security && !secBusy) secRender(r.security, r.info ? r.info.login_slug : '');
+		if(r.security && !secBusy) secRender(r.security, r.info ? r.info.login_slug : '', r.info ? r.info.login_url : '');
 		if(!first) return;
 
 		ipRender(r.allow_ips || []);

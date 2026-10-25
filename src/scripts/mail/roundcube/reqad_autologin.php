@@ -25,6 +25,12 @@
  * authcid is the master user. That is why the session username stays the plain
  * address, rather than the `user*master` form a separator-based login produces.
  *
+ * The webmail session lives only as long as the panel session that opened it.
+ * The ticket names that panel session (auth_sessions.id, db/1046.sql); it is
+ * kept in the Roundcube session and checked on every request, and once the
+ * panel session is gone -- logout, revoked, expired, idle -- the mailbox is
+ * logged out too. Basic-auth panels have no sessions and leave it empty.
+ *
  * NOTE: this plugin deliberately declares no $task. It must be initialized on
  * every request of an auto-logged-in session, not just on 'login' — storage_init
  * has to re-apply the proxy credentials each time Roundcube reconnects to IMAP,
@@ -39,12 +45,19 @@ class reqad_autologin extends rcube_plugin
     /** @var string|null address to log in as, set once a ticket is redeemed */
     private $target = null;
 
+    /** @var string panel session (auth_sessions.id) the ticket was minted by */
+    private $panel_sid = '';
+
+    /** Roundcube's background polls: they must not count as panel activity. */
+    private $background_actions = ['refresh', 'keep-alive'];
+
     public function init()
     {
         $this->add_hook('startup', [$this, 'startup']);
         $this->add_hook('authenticate', [$this, 'authenticate']);
         $this->add_hook('storage_init', [$this, 'storage_init']);
         $this->add_hook('managesieve_connect', [$this, 'managesieve_connect']);
+        $this->add_hook('smtp_connect', [$this, 'smtp_connect']);
         $this->add_hook('login_after', [$this, 'login_after']);
     }
 
@@ -66,7 +79,7 @@ class reqad_autologin extends rcube_plugin
     {
         // POST only -- see the note at the top of this file.
         if ($_SERVER['REQUEST_METHOD'] !== 'POST' || empty($_POST['_reqad_login'])) {
-            return $args;
+            return $this->check_panel_session($args);
         }
 
         $target = $this->consume_ticket((string) $_POST['_reqad_login']);
@@ -120,9 +133,117 @@ class reqad_autologin extends rcube_plugin
     {
         if ($this->target !== null) {
             $_SESSION['reqad_autologin'] = true;
+            $_SESSION['reqad_panel_sid'] = $this->panel_sid;
         }
 
         return $args;
+    }
+
+    /**
+     * End an auto-logged-in session whose panel session has ended.
+     *
+     * Runs from startup(), before index.php looks at the session: once it is
+     * killed here, Roundcube shows its login page with "session invalid or
+     * expired" (or, for an AJAX call, sends the browser there).
+     *
+     * A session with no reqad_panel_sid at all predates the binding and cannot
+     * be checked, so it is ended as well -- opening Webmail again from the
+     * panel starts a bound one.
+     */
+    private function check_panel_session($args)
+    {
+        if (empty($_SESSION['reqad_autologin']) || empty($_SESSION['user_id'])) {
+            return $args;
+        }
+
+        if (!isset($_SESSION['reqad_panel_sid'])) {
+            $alive = false;
+        } elseif ($_SESSION['reqad_panel_sid'] === '') {
+            $alive = true;                      // basic-auth panel: nothing to follow
+        } else {
+            $touch = !in_array((string) $args['action'], $this->background_actions, true);
+            $alive = $this->panel_session_alive((string) $_SESSION['reqad_panel_sid'], $touch);
+        }
+
+        if (!$alive) {
+            rcmail::get_instance()->kill_session();
+        }
+
+        return $args;
+    }
+
+    /**
+     * Is the panel session still logged in, by the panel's own rules
+     * (app/auth/auth.php auth_session_lookup)? Active state, principal active,
+     * not past its hard expiry, not idle longer than auth-idle-minutes.
+     *
+     * Using the webmail is using the panel, so a real webmail request counts as
+     * activity for the idle timeout ($touch, at most once a minute like the
+     * panel itself). Roundcube's background polls do not, or a webmail tab left
+     * open would keep the panel logged in for the full auth-max-hours.
+     *
+     * A database error counts as "not alive": failing closed only costs a
+     * click on Webmail in the panel.
+     */
+    private function panel_session_alive($sid, $touch)
+    {
+        if (!preg_match('/^[0-9a-f]{64}$/', $sid)) {
+            return false;
+        }
+
+        $db = $this->open_db();
+        if (!$db) {
+            return false;
+        }
+
+        $stmt = $db->prepare("SELECT s.last_seen, s.expires_at
+                              FROM auth_sessions s JOIN auth_principals p ON p.id = s.principal_id
+                              WHERE s.id = :id AND s.state = 'active' AND p.status = 'active'");
+        if (!$stmt) {
+            return false;
+        }
+        $stmt->bindValue(':id', $sid, SQLITE3_TEXT);
+        $res = $stmt->execute();
+        $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+        if (!is_array($row)) {
+            return false;
+        }
+
+        $now  = time();
+        $idle = 60 * $this->setting_int('auth-idle-minutes', 30);
+        if ($now >= (int) $row['expires_at'] || $now - (int) $row['last_seen'] > $idle) {
+            return false;
+        }
+
+        if ($touch && $now - (int) $row['last_seen'] >= 60) {
+            $up = $db->prepare('UPDATE auth_sessions SET last_seen = :ts WHERE id = :id');
+            if ($up) {
+                $up->bindValue(':ts', $now, SQLITE3_INTEGER);
+                $up->bindValue(':id', $sid, SQLITE3_TEXT);
+                $up->execute();
+            }
+        }
+
+        return true;
+    }
+
+    /** A numeric panel setting, with the panel's default (auth_cfg()). */
+    private function setting_int($name, $default)
+    {
+        $db = $this->open_db();
+        if (!$db) {
+            return $default;
+        }
+        $stmt = $db->prepare('SELECT value FROM settings WHERE name = :n');
+        if (!$stmt) {
+            return $default;
+        }
+        $stmt->bindValue(':n', $name, SQLITE3_TEXT);
+        $res = $stmt->execute();
+        $row = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+        $v   = is_array($row) && isset($row['value']) ? (string) $row['value'] : '';
+
+        return ($v !== '' && ctype_digit($v)) ? (int) $v : $default;
     }
 
     /**
@@ -186,6 +307,38 @@ class reqad_autologin extends rcube_plugin
     }
 
     /**
+     * Bind as the master user for sending too.
+     *
+     * With smtp_user '%u' / smtp_pass '%p' Roundcube signs in to Exim as the
+     * mailbox with the session password -- in an auto-logged-in session the
+     * MASTER password, which dovecot rejects as the mailbox's own (535). Same
+     * PLAIN proxy bind as storage_init(): rcube_smtp turns smtp_auth_cid into
+     * the authcid and makes the mailbox the authzid, and Exim's dovecot
+     * authenticator then sets $authenticated_id to the mailbox, so the sending
+     * limits still count it against the mailbox's domain.
+     *
+     * An empty smtp_user means no SMTP AUTH at all; binding the master user
+     * then would sign in as reqad-master itself and fail, so it is left alone.
+     */
+    public function smtp_connect($args)
+    {
+        if (empty($_SESSION['reqad_autologin']) || (string) $args['smtp_user'] === '') {
+            return $args;
+        }
+
+        $pass = $this->master_password();
+        if ($pass === '') {
+            return $args;
+        }
+
+        $args['smtp_auth_type'] = 'PLAIN';
+        $args['smtp_auth_cid']  = 'reqad-master';
+        $args['smtp_auth_pw']   = $pass;
+
+        return $args;
+    }
+
+    /**
      * Look a token up, delete it, and return the address it stood for.
      * Returns '' for anything unknown, malformed or expired.
      */
@@ -200,7 +353,7 @@ class reqad_autologin extends rcube_plugin
             return '';
         }
 
-        $stmt = $db->prepare('SELECT email, created FROM webmail_tickets WHERE token = :t');
+        $stmt = $db->prepare('SELECT email, created, session_id FROM webmail_tickets WHERE token = :t');
         if (!$stmt) {
             return '';
         }
@@ -221,6 +374,8 @@ class reqad_autologin extends rcube_plugin
         if ((time() - (int) $row['created']) > 30) {
             return '';
         }
+
+        $this->panel_sid = (string) $row['session_id'];
 
         return (string) $row['email'];
     }

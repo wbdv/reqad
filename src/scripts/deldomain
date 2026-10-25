@@ -55,12 +55,17 @@ DOMAIN="${DOMAIN,,}"
 [[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] \
     || die "Domain name '$DOMAIN' is not valid."
 
-TEMPLATE="$(grep -E '^[[:space:]]*template[[:space:]]*=' "$INI" | head -n1 | cut -d= -f2 | tr -d '[:space:]')"
-case "$TEMPLATE" in
-    apache_*) VHOST="/etc/httpd/conf.d/${DOMAIN}.conf"; WEB_SERVICE='httpd'; CONFTEST='httpd -t' ;;
-    nginx_*)  VHOST="/etc/nginx/conf.d/${DOMAIN}.conf"; WEB_SERVICE='nginx';  CONFTEST='nginx -t' ;;
+. "${PATH_REQAD}/scripts/web_caps.sh"
+WEB_CAPS_ROOT="$PATH_REQAD" web_caps "$INI"
+case "$WEB_FRONT" in
+    httpd) WEB_SERVICE='httpd'; CONFTEST='httpd -t' ;;
+    nginx) WEB_SERVICE='nginx'; CONFTEST='nginx -t' ;;
     *) die "Unknown web server template '$TEMPLATE' in $INI." ;;
 esac
+VHOST="$(web_vhost_dir "$WEB_FRONT")/${DOMAIN}.conf"
+# Apache behind nginx: the domain's vhost there goes too
+BACKEND_VHOST=''
+[ "$WEB_BACKEND" = none ] || BACKEND_VHOST="$(web_vhost_dir "$WEB_BACKEND")/${DOMAIN}.conf"
 
 [ -f "$VHOST" ] || die "No vhost file $VHOST — '$DOMAIN' is not configured on this server."
 # The marker is what makes this an addon domain; a main account vhost has none.
@@ -83,11 +88,16 @@ done
 
 echo "Addon domain ..... ${DOMAIN} (account ${USER})"
 echo "Vhost ............ ${VHOST}"
+[ -n "$BACKEND_VHOST" ] && echo "Backend vhost .... ${BACKEND_VHOST}"
 [ "${#POOLS[@]}" -gt 0 ] && echo "PHP-FPM pool ..... ${POOLS[*]}"
 echo "Document root .... ${DOCROOT} ($([ "$DEL_DOCROOT" -eq 1 ] && echo 'will be DELETED' || echo 'kept'))"
 echo
 
 run rm -f "$VHOST"
+# certbot's Apache plugin may have put the site's https vhost in a file of its
+# own; left behind, it would go on serving the removed site
+[ -f "${VHOST%.conf}-le-ssl.conf" ] && run rm -f "${VHOST%.conf}-le-ssl.conf"
+[ -n "$BACKEND_VHOST" ] && run rm -f "$BACKEND_VHOST"
 for p in "${POOLS[@]:-}"; do
     [ -n "$p" ] && run rm -f "$p"
 done
@@ -127,6 +137,14 @@ else
     echo "Warning: ${WEB_SERVICE} configuration test failed after the removal — not reloading:" >&2
     $CONFTEST 2>&1 | sed 's/^/    /' >&2
     exit 1
+fi
+
+if [ -n "$BACKEND_VHOST" ]; then
+    if httpd -t >/dev/null 2>&1; then
+        systemctl reload httpd 2>/dev/null && echo "Reloaded httpd"
+    else
+        echo "Warning: httpd configuration test failed after the removal — not reloading." >&2
+    fi
 fi
 
 echo

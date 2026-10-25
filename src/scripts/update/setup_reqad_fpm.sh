@@ -156,7 +156,7 @@ for d in /etc/opt/remi/php*/php-fpm.d; do
 done
 
 # --- private session dir (isolated from other pools; not under public_html) ---
-# The reqad pool (panel + phpMyAdmin + roundcube + sqadmin) keeps its sessions here, 0700/reqad,
+# The reqad pool (panel + phpMyAdmin + roundcube) keeps its sessions here, 0700/reqad,
 # instead of the world-readable shared /var/lib/php/session. PHP self-GC (gc_probability) cleans it.
 mkdir -p "$SESSION_DIR"
 chown reqad:reqad /usr/local/reqad/tmp "$SESSION_DIR" 2>/dev/null

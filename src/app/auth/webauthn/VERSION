@@ -1,0 +1,3 @@
+lbuchs/WebAuthn v2.2.0 (MIT) - https://github.com/lbuchs/WebAuthn
+src/ only, unmodified. Used by app/auth/auth.php for passkeys.
+sha256 of the release tarball: 33eb82b72a1c22034a8e7bf0faf0b7c30eb125705e2ce1095121b0440329d38a

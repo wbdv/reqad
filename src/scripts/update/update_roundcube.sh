@@ -199,6 +199,12 @@ PYEOF
 update_nginx_webmail
 enable_managesieve
 
+# --- Webmail auto-login plugin + SMTP AUTH as the mailbox --------------------
+# Same script post_reqad_install.sh runs: (re)places plugins/reqad_autologin,
+# registers it, and switches an empty smtp_user/smtp_pass to '%u'/'%p' (see
+# its comments). Run here too so a Roundcube update never leaves either behind.
+/bin/bash /usr/local/reqad/scripts/update/install-webmail-autologin.sh || true
+
 set -e
 
 # --- Get installed version ---

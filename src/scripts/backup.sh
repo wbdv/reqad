@@ -231,6 +231,12 @@ if [ ${INCLUDE_WEB} -eq 1 ]; then
 	[ -f "/etc/nginx/conf.d/${DOMAIN}.conf" ] && sudo cp -p "/etc/nginx/conf.d/${DOMAIN}.conf" "${ROOT}/config/nginx-${DOMAIN}.conf"
 	[ -f "/etc/httpd/conf.d/${DOMAIN}.conf" ] && sudo cp -p "/etc/httpd/conf.d/${DOMAIN}.conf" "${ROOT}/config/httpd-${DOMAIN}.conf"
 	[ -f "/etc/php-fpm.d/${DOMAIN}.conf" ]    && sudo cp -p "/etc/php-fpm.d/${DOMAIN}.conf"    "${ROOT}/config/php-fpm-${DOMAIN}.conf"
+	# a site on another PHP version has its pool under that version's folder
+	for P in /etc/opt/remi/php[0-9][0-9]/php-fpm.d/"${DOMAIN}".conf; do
+		[ -f "${P}" ] || continue
+		sudo cp -p "${P}" "${ROOT}/config/php-pool-${DOMAIN}.conf" && echo "${P}" > "${ROOT}/config/php-pool-${DOMAIN}.path"
+		break
+	done
 
 	# ---- SSL certificates -------------------------------------------------
 	mkdir -p "${ROOT}/ssl"
@@ -242,6 +248,31 @@ if [ ${INCLUDE_WEB} -eq 1 ]; then
 	fi
 	[ -f "/etc/ssl/certs/${DOMAIN}.crt" ] && sudo cp -p "/etc/ssl/certs/${DOMAIN}.crt" "${ROOT}/ssl/${DOMAIN}.crt"
 	[ -f "/etc/ssl/certs/${DOMAIN}.key" ] && sudo cp -p "/etc/ssl/certs/${DOMAIN}.key" "${ROOT}/ssl/${DOMAIN}.key"
+
+	# ---- addon domains and subdomains -------------------------------------
+	# Their files are in the home folder; their own settings go to
+	# addons/<domain>/: the vhost (front and backend), the PHP pool with the
+	# path it came from (which says its PHP version) and the certificate.
+	ADDONS=$(sudo grep -lE "^#[[:space:]]*Additional domain of account ${USER}[[:space:]].*adddomain" /etc/nginx/conf.d/*.conf /etc/httpd/conf.d/*.conf 2>/dev/null \
+		| xargs -r -n1 basename | sed 's/\.conf$//' | sort -u)
+	for AD in ${ADDONS}; do
+		echo "${AD}" | grep -qE '^[a-z0-9.-]+$' || continue
+		[ "${AD}" = "${DOMAIN}" ] && continue
+		AO="${ROOT}/addons/${AD}"
+		mkdir -p "${AO}"
+		[ -f "/etc/nginx/conf.d/${AD}.conf" ] && sudo cp -p "/etc/nginx/conf.d/${AD}.conf" "${AO}/nginx.conf"
+		[ -f "/etc/httpd/conf.d/${AD}.conf" ] && sudo cp -p "/etc/httpd/conf.d/${AD}.conf" "${AO}/httpd.conf"
+		for P in /etc/php-fpm.d/"${AD}".conf /etc/opt/remi/php[0-9][0-9]/php-fpm.d/"${AD}".conf; do
+			[ -f "${P}" ] || continue
+			sudo cp -p "${P}" "${AO}/pool.conf" && echo "${P}" > "${AO}/pool.path"
+			break
+		done
+		if [ -d "/etc/letsencrypt/live/${AD}" ]; then
+			sudo cp -rL "/etc/letsencrypt/live/${AD}" "${AO}/letsencrypt"
+		fi
+		[ -f "/etc/ssl/certs/${AD}.crt" ] && sudo cp -p "/etc/ssl/certs/${AD}.crt" "${AO}/ssl.crt"
+		[ -f "/etc/ssl/certs/${AD}.key" ] && sudo cp -p "/etc/ssl/certs/${AD}.key" "${AO}/ssl.key"
+	done
 
 	# ---- cron -------------------------------------------------------------
 	# /var/spool/cron is 0700 root, so the test must run via sudo (reqad can't stat it)
@@ -270,23 +301,30 @@ fi
 # ===========================================================================
 # Email  (-m): mail folder (in homedir/), exim/dovecot settings, email DNS
 # ===========================================================================
-if [ ${INCLUDE_MAIL} -eq 1 ]; then
-	mkdir -p "${ROOT}/email"
-	[ -f "/etc/exim/domains/${DOMAIN}" ]  && sudo cp -p "/etc/exim/domains/${DOMAIN}"  "${ROOT}/email/exim-domain"
-	[ -f "/etc/exim/forwards/${DOMAIN}" ] && sudo cp -p "/etc/exim/forwards/${DOMAIN}" "${ROOT}/email/exim-forwards"
-	if [ -f "/etc/exim/keys/${DOMAIN}.private.key" ] || [ -f "/etc/exim/keys/${DOMAIN}.public.key" ]; then
-		mkdir -p "${ROOT}/email/dkim"
-		sudo cp -p /etc/exim/keys/${DOMAIN}.private.key "${ROOT}/email/dkim/" 2>/dev/null
-		sudo cp -p /etc/exim/keys/${DOMAIN}.public.key  "${ROOT}/email/dkim/" 2>/dev/null
+# One mail domain's settings into $2: exim files, DKIM keys, its userdomains
+# line, its mailboxes' dovecot lines, domain filters, autoresponders. The main
+# domain goes to email/, the account's other mail domains (addon sites with
+# mail) to email/domains/<domain>/.
+backup_mail_domain() {   # $1 = domain  $2 = output folder
+	local D="$1" OUT="$2"
+	mkdir -p "${OUT}"
+	[ -f "/etc/exim/domains/${D}" ]  && sudo cp -p "/etc/exim/domains/${D}"  "${OUT}/exim-domain"
+	[ -f "/etc/exim/forwards/${D}" ] && sudo cp -p "/etc/exim/forwards/${D}" "${OUT}/exim-forwards"
+	if [ -f "/etc/exim/keys/${D}.private.key" ] || [ -f "/etc/exim/keys/${D}.public.key" ]; then
+		mkdir -p "${OUT}/dkim"
+		sudo cp -p /etc/exim/keys/${D}.private.key "${OUT}/dkim/" 2>/dev/null
+		sudo cp -p /etc/exim/keys/${D}.public.key  "${OUT}/dkim/" 2>/dev/null
 	fi
-	sudo grep "^${DOMAIN}:" /etc/exim/userdomains > "${ROOT}/email/userdomains-entry" 2>/dev/null
+	sudo grep "^${D}:" /etc/exim/userdomains > "${OUT}/userdomains-entry" 2>/dev/null
+	# its mail handled by another provider (Mail provider on 2083)
+	sudo grep -qxF "${D}" /etc/exim/remotedomains 2>/dev/null && echo "${D}" > "${OUT}/remote-mail"
 	# NOTE: the panel's `emails` table is NOT backed up. Since db/1032.sql it is
 	# only a du -skm cache keyed by address (the mailbox inventory is
 	# /etc/dovecot/users, captured below as email/dovecot-users), and restoring a
 	# cache is meaningless — it re-measures itself on first use.
 	# dovecot mailbox auth lines (passwd-style, hashed) for this domain — needed to
 	# restore working mailboxes (maildirs themselves ride along in homedir/mail/)
-	sudo grep "@${DOMAIN}:" /etc/dovecot/users > "${ROOT}/email/dovecot-users" 2>/dev/null
+	sudo grep "@${D}:" /etc/dovecot/users > "${OUT}/dovecot-users" 2>/dev/null
 
 	# ---- email filters: domain tier ---------------------------------------
 	# Per-account Sieve needs no code here. Home IS the maildir root, so a
@@ -296,13 +334,13 @@ if [ ${INCLUDE_MAIL} -eq 1 ]; then
 	# Only the .sieve source is taken. The .svbin beside it records the path it
 	# was compiled from, so a copied binary would be permanently stale — restore
 	# recompiles instead.
-	if sudo test -f "/var/lib/reqad/sieve/domains/${DOMAIN}.sieve"; then
-		sudo cp -p "/var/lib/reqad/sieve/domains/${DOMAIN}.sieve" "${ROOT}/email/sieve-domain.sieve"
+	if sudo test -f "/var/lib/reqad/sieve/domains/${D}.sieve"; then
+		sudo cp -p "/var/lib/reqad/sieve/domains/${D}.sieve" "${OUT}/sieve-domain.sieve"
 	fi
 	# The rows that script was rendered from. Dumped as ready-to-run INSERTs via
 	# quote() so the JSON in conditions/actions survives verbatim, quotes and all.
-	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO email_filters (scope,target,name,enabled,priority,match_type,conditions,actions,stop) VALUES ('||quote(scope)||','||quote(target)||','||quote(name)||','||enabled||','||priority||','||quote(match_type)||','||quote(conditions)||','||quote(actions)||','||stop||');' FROM email_filters WHERE scope='domain' AND target='${DOMAIN}'" > "${ROOT}/email/email_filters.sql" 2>/dev/null
-	[ -s "${ROOT}/email/email_filters.sql" ] || rm -f "${ROOT}/email/email_filters.sql"
+	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO email_filters (scope,target,name,enabled,priority,match_type,conditions,actions,stop) VALUES ('||quote(scope)||','||quote(target)||','||quote(name)||','||enabled||','||priority||','||quote(match_type)||','||quote(conditions)||','||quote(actions)||','||stop||');' FROM email_filters WHERE scope='domain' AND target='${D}'" > "${OUT}/email_filters.sql" 2>/dev/null
+	[ -s "${OUT}/email_filters.sql" ] || rm -f "${OUT}/email_filters.sql"
 
 	# ---- autoresponders ---------------------------------------------------
 	# The `autoresponders` table is the truth; the live artefact (a Pigeonhole
@@ -310,8 +348,16 @@ if [ ${INCLUDE_MAIL} -eq 1 ]; then
 	# /etc/exim/autoreply file) is rendered FROM it. Backing up the rows rather
 	# than the artefact lets restore pick whichever backend the target machine
 	# actually runs — see autoresponder_backend() in modules/functions.php.
-	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO autoresponders (user,domain,subject,message,date_from,date_to,created_at) VALUES ('||quote(user)||','||quote(domain)||','||quote(subject)||','||quote(message)||','||quote(date_from)||','||quote(date_to)||','||quote(created_at)||');' FROM autoresponders WHERE domain='${DOMAIN}'" > "${ROOT}/email/autoresponders.sql" 2>/dev/null
-	[ -s "${ROOT}/email/autoresponders.sql" ] || rm -f "${ROOT}/email/autoresponders.sql"
+	${SQLITE} "${DB_FILE}" "SELECT 'INSERT OR IGNORE INTO autoresponders (user,domain,subject,message,date_from,date_to,created_at) VALUES ('||quote(user)||','||quote(domain)||','||quote(subject)||','||quote(message)||','||quote(date_from)||','||quote(date_to)||','||quote(created_at)||');' FROM autoresponders WHERE domain='${D}'" > "${OUT}/autoresponders.sql" 2>/dev/null
+	[ -s "${OUT}/autoresponders.sql" ] || rm -f "${OUT}/autoresponders.sql"
+}
+
+if [ ${INCLUDE_MAIL} -eq 1 ]; then
+	backup_mail_domain "${DOMAIN}" "${ROOT}/email"
+	for MD in $(sudo grep -E ":[[:space:]]*${USER}[[:space:]]*$" /etc/exim/userdomains 2>/dev/null | cut -d: -f1 | tr -d ' ' | grep -vxF "${DOMAIN}"); do
+		echo "${MD}" | grep -qE '^[a-z0-9.-]+$' || continue
+		backup_mail_domain "${MD}" "${ROOT}/email/domains/${MD}"
+	done
 
 	# ---- email DNS records (MX / SPF / DKIM / DMARC) ----------------------
 	dump_dns "${ROOT}/dns/dns-email.json" --email-only
@@ -356,7 +402,7 @@ fi
 	if [ -f "/etc/nginx/conf.d/${DOMAIN}.conf" ]; then
 		echo "Web stack: nginx + php-fpm"
 	elif [ -f "/etc/httpd/conf.d/${DOMAIN}.conf" ]; then
-		echo "Web stack: apache (mod_php)"
+		grep -q 'proxy:unix:' "/etc/httpd/conf.d/${DOMAIN}.conf" && echo "Web stack: apache + php-fpm" || echo "Web stack: apache (mod_php)"
 	else
 		echo "Web stack: unknown (no vhost found for ${DOMAIN})"
 	fi

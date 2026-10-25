@@ -10,6 +10,13 @@
     // Account / database / email operations, shared with bin/reqad (and the API).
     foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
         require_once($app_functions_file);
+    // Web login (sessions, 2FA, brute-force protection). See app/auth/auth.php.
+    require_once(_PATH.'/app/auth/auth.php');
+    // REST API tokens and endpoint table (served by app/api/index.php, not here).
+    require_once(_PATH.'/app/api/api.php');
+    require_once(_PATH.'/app/api/routes.php');
+    // AI assistants over MCP (Settings > AI access; the server is `reqad mcp serve`).
+    require_once(_PATH.'/app/mcp/mcp.php');
 
     // Render every date() in the panel in the server's own timezone. php.ini
     // often has no date.timezone (PHP then assumes UTC), which made scheduled
@@ -19,6 +26,11 @@
     // Discover add-on modules (public_html/plugins/*/plugin.php). Must run before
     // ajax.php so plugin ajax handlers are registered when its dispatch tail runs.
     plugins_load();
+
+    // Web-login mode: serve /login/, handle /logout/, and refuse anything
+    // without an active session (nginx's auth_request already did the same
+    // for the request as a whole; this covers PHP). No-op on basic auth.
+    auth_gate();
 
     // CSRF: every state change goes over POST, so a single guard here protects
     // both form submits and AJAX (which posts to ajax.php, included next). GET
@@ -50,8 +62,8 @@
 
 	$allowed_actions = array(
 		'accounts'			=> array('create-account', 'edit-account', 'delete-account'),
-		'addon-domains'		=> array('edit-addon-domain', 'delete-addon-domain'),
-		'account'			=> array('alias-add', 'alias-delete', 'reissue-ssl', 'config-save', 'config-restore'),
+		'addon-domains'		=> array('add-addon-domain', 'edit-addon-domain', 'delete-addon-domain', 'addon-domain-mail'),
+		'account'			=> array('alias-add', 'alias-delete', 'reissue-ssl', 'config-save', 'config-restore', 'account-limits', 'pool-pm', 'account-db-limit'),
 		'databases' 		=> array('create-database', 'delete-database', 'change-db-password', 'assign-database'),
 		'email-accounts' 	=> array('create-email', 'edit-email', 'delete-email'),
 		'email'				=> array('clamav-exim'),
@@ -62,7 +74,17 @@
 		'spam-filters'		=> array('create-spam-rule', 'delete-spam-rule', 'save-spam-rules'),
 		'ssl'				=> array('update-ssl'),
 		'settings'			=> array('settings', 'settings-smtp', 'auto-update-cron'),
+		'security'			=> array('security-password', 'security-2fa-start', 'security-2fa-enable',
+							       'security-2fa-disable', 'security-2fa-codes', 'security-session-revoke',
+							       'security-sessions-revoke-all', 'security-unban', 'security-fw', 'security-device-forget', 'security-email', 'security-passkey', 'security-shell-default', 'security-shell-log'),
+		'deployments'		=> array('deploy-site-save', 'deploy-site-remove'),
+		'bandwidth'			=> array('stats-settings', 'stats-geoip-update'),
+		'api-access'		=> array('api-access-toggle', 'api-access-token-create', 'api-access-token-revoke'),
+		'ai-access'			=> array('ai-access-toggle', 'ai-access-token-create', 'ai-access-token-revoke'),
 		'dns-settings'		=> array('dns-settings'),
+		'dns-cluster'		=> array('dns-cluster-add', 'dns-cluster-remove', 'dns-cluster-sync', 'dns-cluster-drop-kept'),
+		'dns-keys'			=> array('dns-keys-toggle', 'dns-key-create', 'dns-key-revoke', 'dns-key-zones-add',
+							       'dns-key-zone-release', 'dns-key-zones-move', 'dns-key-limit'),
 		'php-settings'		=> array('php-settings'),
 		'wp-toolkit'		=> array('wp-install', 'wp-clone', 'wp-scan', 'wp-auto-login'),
 		'reboot'			=> array('reboot-server'),
@@ -121,9 +143,9 @@
 		}
     }
 
-    $user = clean($_SERVER['USER']);
+    $user = clean(auth_user());
     
-    error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." ".$route."\n", 3, '../log/route_log');
+    error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." ".$route."\n", 3, '../log/route_log');
 
     // Block direct access to disabled-feature sections
     $blocked_feature = route_blocked_feature($ini, $route);
@@ -145,6 +167,16 @@
             break;
         case 'addon-domains':
             include('templates/addon-domains.php');
+            break;
+        case 'bandwidth':
+            include('templates/bandwidth.php');
+            break;
+        case 'resources':
+            include('templates/resources.php');
+            break;
+        case 'shell-activity':
+            // Accounts & Domains > Shell Activity: /shell-activity/[<user>/]
+            include('templates/shell-activity.php');
             break;
         case 'ssh-keys':
             include('templates/ssh-keys.php');
@@ -212,9 +244,34 @@
         case 'settings':
             include('templates/settings.php');
             break;
+        case 'security':
+            include('templates/security.php');
+            break;
+        case 'api-access':
+            include('templates/api-access.php');
+            break;
+        case 'ai-access':
+            include('templates/ai-access.php');
+            break;
+        case 'deployments':
+            include('templates/deployments.php');
+            break;
+        case 'apps':        // merged into Deployments
+            header('Location: /deployments/', true, 301);
+            exit;
         case 'dns-settings':
             include('templates/dns-settings.php');
             break;
+        case 'dns-keys':        // tabs of DNS Settings now
+        case 'dns-cluster':
+            // an action that draws the page itself (a new API key, shown once)
+            if($_SERVER['REQUEST_METHOD'] === 'POST') {
+                $dns_tab = $route === 'dns-keys' ? 'keys' : 'cluster';
+                include('templates/dns-settings.php');
+                break;
+            }
+            header('Location: /dns-settings/'.($route === 'dns-keys' ? 'keys' : 'cluster').'/', true, 301);
+            exit;
         case 'php-settings':
             include('templates/php-settings.php');
             break;

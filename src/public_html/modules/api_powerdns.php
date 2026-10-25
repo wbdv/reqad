@@ -219,6 +219,11 @@ function powerdns_api($api_query, $parse_to_array = false, $method = 'GET', $dat
 	    curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'DELETE');
 	}
 
+	if($method=='PUT') {
+	    curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'PUT');
+		curl_setopt($curl, CURLOPT_POSTFIELDS, $data);
+	}
+
 	if($method=='PATCH') {
 	    curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'PATCH');
 		if($data!='')
@@ -265,11 +270,15 @@ function get_zones() {
 			foreach($json as $k => $v) {
 				if(!isset($v["name"]))
 					continue;
+				/* the DNS cluster's test zone is its own, not a zone of names */
+				if(function_exists('dns_cluster_probe_zone') && strtolower($v["name"]) === dns_cluster_probe_zone().'.')
+					continue;
 				$domain = substr($v["name"], 0, strlen($v["name"])-1);
 				$zones[$domain] = array( 
 					"zone_id" => $v["id"],
 					"serial" => $v["serial"],
-					#"status" => $v["status"], 
+					"kind" => $v["kind"] ?? '',
+					#"status" => $v["status"],
 					#"nameservers" => implode(', ', $v["name_servers"])
 				);
 			}
@@ -298,18 +307,31 @@ function add_domain_in_dns($domain, $server_ip) {
 				{"name": "'.$domain.'.", "type": "MX", "ttl": 14400, "records": [{"content": "0 '.$domain.'.", "disabled": false}]}
 				]}';
 		} else {
-			$data = '{"name": "'.$domain.'.", "kind": "Native", "masters": [], "nameservers": ["ns1.'.$domain.'.", "ns2.'.$domain.'."], "rrsets":
-				[{"name": "'.$domain.'.", "type": "SOA", "ttl": 14400, "records": [{"content": "ns1.'.$domain.'. hostmaster.'.$domain.'. '.date('Ymd').'01 3600 1800 1209600 86400", "disabled": false}]},
-				{"name": "'.$domain.'.", "type": "A", "ttl": 14400, "records": [{"content": "'.$server_ip.'", "disabled": false}]},
-				{"name": "ns1.'.$domain.'.", "type": "A", "ttl": 14400, "records": [{"content": "'.$server_ip.'", "disabled": false}]},
-				{"name": "www.'.$domain.'.", "type": "CNAME", "ttl": 14400, "records": [{"content": "'.$domain.'.", "disabled": false}]},
-				{"name": "mail.'.$domain.'.", "type": "CNAME", "ttl": 14400, "records": [{"content": "'.$domain.'.", "disabled": false}]},
-				{"name": "'.$domain.'.", "type": "MX", "ttl": 14400, "records": [{"content": "0 '.$domain.'.", "disabled": false}]}
-				]}';
+			/* the zones' name servers from DNS Settings; none set: ns1/ns2 of
+			   the domain itself, with this server's address (not the site's:
+			   an imported zone's site may be elsewhere) */
+			$ns = array_values(array_filter(array(rtrim((string)($settings['powerdns-ns1'] ?? ''), '.'), rtrim((string)($settings['powerdns-ns2'] ?? ''), '.')), 'strlen'));
+			$rr = array();
+			if (!$ns) {
+				$ns = array('ns1.'.$domain, 'ns2.'.$domain);
+				$own = function_exists('server_primary_ip') ? server_primary_ip() : '';
+				foreach ($ns as $n)
+					$rr[] = array('name' => $n.'.', 'type' => 'A', 'ttl' => 14400, 'records' => array(array('content' => $own !== '' ? $own : $server_ip, 'disabled' => false)));
+			}
+			$rec = function ($name, $type, $content) { return array('name' => $name, 'type' => $type, 'ttl' => 14400, 'records' => array(array('content' => $content, 'disabled' => false))); };
+			$rr[] = $rec($domain.'.', 'SOA', $ns[0].'. hostmaster.'.$domain.'. '.date('Ymd').'01 3600 1800 1209600 86400');
+			$rr[] = $rec($domain.'.', 'A', $server_ip);
+			$rr[] = $rec('www.'.$domain.'.', 'CNAME', $domain.'.');
+			$rr[] = $rec('mail.'.$domain.'.', 'CNAME', $domain.'.');
+			$rr[] = $rec($domain.'.', 'MX', '0 '.$domain.'.');
+			/* with secondaries (DNS cluster): kind Master, in the catalog */
+			$data = json_encode(array_merge(array('name' => $domain.'.', 'kind' => 'Native', 'masters' => array(),
+			                          'nameservers' => array_map(function ($n) { return $n.'.'; }, $ns), 'rrsets' => $rr),
+			                    function_exists('dns_cluster_zone_fields') ? dns_cluster_zone_fields() : array()));
 		}
 		$json = powerdns_api($url.'/zones', true, 'POST', $data);
 		if ($json["success"] != 1)
-			return 'Error: DNS API: zone create failed, code '.$json["reason"];
+			return 'Error: DNS API: zone create failed, code '.$json["reason"].(isset($json['error']) && is_string($json['error']) ? ': '.$json['error'] : '');
 		if ($hidden_master) {
 			if (!powerdns_agent_call('add_zone', ['domain' => $domain, 'ip' => $server_ip], $agent_err))
 				return 'Error: DNS agent: '.($agent_err ?? 'no response');
@@ -332,10 +354,13 @@ function delete_domain_from_dns($domain) {
 					return 'Error: DNS agent: '.($agent_err ?? 'no response');
 			}
 			$json = powerdns_api($url.'/zones/'.$zones[$domain]["zone_id"], true, 'DELETE');
-			if($json["success"]==1)
+			if($json["success"]==1) {
+				if (function_exists('dns_key_zone_forget'))
+					dns_key_zone_forget($domain);   /* no DNS API key holds a zone that is gone */
 				return '';
+			}
 			else
-				return 'Error: DNS API: domain '.$domain.' error code '.$json["reason"];
+				return 'Error: DNS API: domain '.$domain.' error code '.$json["reason"].(isset($json['error']) && is_string($json['error']) ? ': '.$json['error'] : '');
 		} else {
 			return 'Error: DNS API: domain '.$domain.' does not exists on DNS server';
 		}
@@ -687,6 +712,8 @@ function add_update_spf($domain, $spf = 'v=spf1 +a +mx ~all') {
 		if(array_key_exists($domain, $zones)) {
 			#echo '<pre>$$$'; print_r(get_zone_record($domain, $domain, 'TXT')); exit;
 			$records = get_zone_record($domain, $domain, 'TXT');
+			if(!is_array($records))
+				$records = array();   // no TXT at the apex yet
 			$spf_found = false;
 			foreach($records as $i => $k) {
 				#echo '<br>'.$i.'. '.$k["content"].' '.$k["disabled"]."\n";
@@ -779,3 +806,115 @@ function add_update_local_mx($domain) {
 }
 
 #echo '<pre>#add_update_local_mx#'."\n"; print_r(add_update_local_mx('test-domain4.dom')); echo "\n"; print_r(get_zone_record('test-domain4.dom', '', 'MX')); exit;
+
+/* ---- record sets (dns_rrset_get / dns_rrset_set, see functions.php) ------- */
+function powerdns_rrset($name, $type, &$zone = null, &$url = null) {
+	$url = get_server_url();
+	if (substr($url, 0, 6) == 'Error:')
+		return null;
+	$name  = strtolower(rtrim(trim($name), '.'));
+	$zones = get_zones();
+	$zone  = dns_zone_for($name, $zones);
+	if ($zone === '')
+		return null;
+	$json = powerdns_api($url.'/zones/'.$zones[$zone]['zone_id'], true);
+	if (($json['success'] ?? 0) != 1)
+		return null;
+	foreach ((array)($json['rrsets'] ?? array()) as $rr)
+		if ($rr['type'] === $type && strtolower($rr['name']) === $name.'.')
+			return $rr;
+	return array('name' => $name.'.', 'type' => $type, 'ttl' => 3600, 'records' => array());
+}
+
+function dns_rrset_get($name, $type) {
+	$rr = powerdns_rrset($name, $type);
+	if ($rr === null)
+		return null;
+	$out = array();
+	foreach ($rr['records'] as $r)
+		if (empty($r['disabled']))
+			$out[] = $type === 'TXT' ? dns_txt_decode($r['content']) : strtolower($r['content']);
+	return $out;
+}
+
+function dns_rrset_set($name, $type, $values) {
+	global $settings;
+	$name = strtolower(rtrim(trim($name), '.'));
+	$rr = powerdns_rrset($name, $type, $zone, $url);
+	if ($rr === null)
+		return 'Error: DNS API: no managed zone holds '.$name.'.';
+	/* values already there keep their exact text */
+	$have = array();
+	foreach ($rr['records'] as $r)
+		$have[$type === 'TXT' ? dns_txt_decode($r['content']) : strtolower($r['content'])] = $r['content'];
+	$records = array();
+	foreach (array_unique(array_map('strval', $values)) as $v)
+		$records[] = array('content' => $have[$v] ?? ($type === 'TXT' ? dns_txt_encode($v) : $v), 'disabled' => false);
+	$set = $records
+		? array('name' => $name.'.', 'type' => $type, 'ttl' => (int)($rr['ttl'] ?: 3600), 'changetype' => 'REPLACE', 'records' => $records)
+		: array('name' => $name.'.', 'type' => $type, 'changetype' => 'DELETE');
+	$zones = get_zones();
+	$json = powerdns_api($url.'/zones/'.$zones[$zone]['zone_id'], true, 'PATCH', json_encode(array('rrsets' => array($set))));
+	if ($json['success'] != 1)
+		return 'Error: DNS API: '.$type.' '.$name.' error code '.$json['reason'];
+	if (!powerdns_sync_zone($zone, $agent_err))
+		return 'Error: saved in local PowerDNS, but the push to the DNS agent ('.$settings['powerdns-agent-url'].') failed: '.($agent_err ?? 'no response');
+	return '';
+}
+
+/* ---- whole zones (dns_zone_rrsets / dns_zone_put, see functions.php) ------ */
+function powerdns_zone_rrsets($zone, &$url = null, &$zone_id = null) {
+	$url = get_server_url();
+	if (substr($url, 0, 6) == 'Error:')
+		return null;
+	$zone  = strtolower(rtrim(trim($zone), '.'));
+	$zones = get_zones();
+	if (!is_array($zones) || !isset($zones[$zone]))
+		return null;
+	$zone_id = $zones[$zone]['zone_id'];
+	$json = powerdns_api($url.'/zones/'.$zone_id, true);
+	return ($json['success'] ?? 0) == 1 ? (array)($json['rrsets'] ?? array()) : null;
+}
+
+function dns_zone_rrsets($zone) {
+	$rrsets = powerdns_zone_rrsets($zone);
+	if ($rrsets === null)
+		return null;
+	$out = array();
+	foreach ($rrsets as $rr) {
+		$values = array();
+		foreach ((array)$rr['records'] as $r)
+			if (empty($r['disabled']))
+				$values[] = dns_value_from_zone($rr['type'], $r['content']);
+		if ($values)
+			$out[] = array('name' => strtolower(rtrim($rr['name'], '.')), 'type' => $rr['type'], 'ttl' => (int)$rr['ttl'], 'values' => $values, 'proxied' => null);
+	}
+	return $out;
+}
+
+function dns_zone_put($zone, $name, $type, $ttl, $values) {
+	global $settings;
+	$zone = strtolower(rtrim(trim($zone), '.'));
+	$name = strtolower(rtrim(trim($name), '.'));
+	$rrsets = powerdns_zone_rrsets($zone, $url, $zone_id);
+	if ($rrsets === null)
+		return 'Error: DNS API: no managed zone '.$zone.'.';
+	/* values already there keep their exact text */
+	$have = array();
+	foreach ($rrsets as $rr)
+		if ($rr['type'] === $type && strtolower($rr['name']) === $name.'.')
+			foreach ((array)$rr['records'] as $r)
+				$have[dns_value_from_zone($type, $r['content'])] = $r['content'];
+	$records = array();
+	foreach (array_unique(array_map('strval', $values)) as $v)
+		$records[] = array('content' => $have[$v] ?? dns_value_to_zone($type, $v), 'disabled' => false);
+	$set = $records
+		? array('name' => $name.'.', 'type' => $type, 'ttl' => (int)$ttl, 'changetype' => 'REPLACE', 'records' => $records)
+		: array('name' => $name.'.', 'type' => $type, 'changetype' => 'DELETE');
+	$json = powerdns_api($url.'/zones/'.$zone_id, true, 'PATCH', json_encode(array('rrsets' => array($set))));
+	if ($json['success'] != 1)
+		return 'Error: DNS API: '.$type.' '.$name.': '.rtrim(isset($json['error']) && is_string($json['error']) ? $json['error'] : 'error code '.$json['reason'], '.').'.';
+	if (!powerdns_sync_zone($zone, $agent_err))
+		return 'Error: saved in local PowerDNS, but the push to the DNS agent ('.$settings['powerdns-agent-url'].') failed: '.($agent_err ?? 'no response');
+	return '';
+}

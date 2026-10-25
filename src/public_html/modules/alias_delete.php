@@ -6,7 +6,6 @@
 $acct_user = preg_replace('/[^a-z0-9]/', '', trim($_POST['user'] ?? ''));
 $alias_id  = (int)($_POST['alias_id'] ?? 0);
 
-$is_apache = (substr(trim($ini['template'] ?? ''), 0, 7) == 'apache_');
 $errmsg = '';
 
 /* DNS provider (for best-effort record removal). */
@@ -37,8 +36,9 @@ if($errmsg === '') {
 
 if($errmsg === '') {
 	$db->query('DELETE FROM aliases WHERE id='.$alias_id.' AND account_id='.(int)$acct['id']);
+	plugin_hook('alias.deleted', array('user' => $acct['user'], 'alias' => $alias));
 
-	$vh = apply_account_vhost_names($db, $acct['domain'], $is_apache);
+	$vh = apply_account_vhost_names($db, $acct['domain']);
 	if($vh !== '')
 		$errmsg = 'Error: alias removed but web server update failed: '.$vh;
 

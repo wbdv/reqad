@@ -20,6 +20,10 @@
 		$filter_counts[$mb] = ($parsed === false) ? null : count($parsed);
 	}
 
+	/* columns plugins add after Usage (Hosting Pro: the mailbox size) */
+	$plugin_cols = array_values(array_filter((array)plugin_filter('emails.columns', array()),
+		function ($c) { return is_array($c) && isset($c['title'], $c['cell']) && is_callable($c['cell']); }));
+
 	include('templates/header.php');
 
 	/* One check for the whole page: each row's Webmail button is only
@@ -93,6 +97,9 @@
                         <th class="w-1" style="background-color:#DEF;">ID</th>
                         <th style="background-color:#DEF;">EMAIL <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' width='16' height='16'><path fill='none' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' stroke-width='1' d='M5 10l3 -3l3 3'/></svg></th>
                         <th class="w-10" style="background-color:#DEF;">Usage</th>
+<?php foreach ($plugin_cols as $pc): ?>
+                        <th style="background-color:#DEF;"><?=h($pc['title']);?></th>
+<?php endforeach; ?>
                         <th style="background-color:#DEF;">Status</th>
                         <th style="background-color:#DEF;">Filters</th>
                         <th class="w-5" style="background-color:#DEF;"></th>
@@ -105,7 +112,7 @@
                             <button id="email-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
                           </div>
                         </td>
-                        <td colspan="4" style="padding:4px 8px;"></td>
+                        <td colspan="<?=4 + count($plugin_cols);?>" style="padding:4px 8px;"></td>
                       </tr>
                     </thead>
                     <tbody>
@@ -134,15 +141,21 @@
 						<?	$mb_used   = (float)$email['disk_usage'];
 							$dom       = strtolower(substr(strrchr($email['email'], '@'), 1));
 							$acct_tot  = isset($acct_usage[$dom]) ? $acct_usage[$dom] : 0;
-							$mail_pct  = $acct_tot > 0 ? round($mb_used * 100 / $acct_tot, 1) : 0; ?>
+							$mail_pct  = $acct_tot > 0 ? round($mb_used * 100 / $acct_tot, 1) : 0;
+							ob_start(); ?>
                           <div class="d-flex">
                             <div><strong><?=$mb_used>0?human_mb($mb_used):'-';?></strong>
 							<? if($acct_tot > 0) { ?><span class="text-muted">(<?=$mail_pct;?>%)</span><? } ?></div>
                           </div>
                           <div class="progress progress-xs">
-                            <div class="progress-bar bg-success" role="progressbar" style="width: <?=min($mail_pct, 100);?>%"></div>
+                            <div class="progress-bar" role="progressbar" style="width: <?=min($mail_pct, 100);?>%"></div>
                           </div>
+						<?	/* plugins may show it against the mailbox's size (Hosting Pro) */
+							echo plugin_filter('emails.usage', ob_get_clean(), $email); ?>
                         </td>
+<?php foreach ($plugin_cols as $pc): ?>
+                        <td data-label="<?=h($pc['title']);?>"><?=call_user_func($pc['cell'], $email);?></td>
+<?php endforeach; ?>
                         <td class="text-muted" data-label="Status">
                         <? if($email['enabled']) { ?>
                           <span class="badge bg-green-lt border">Active</span>
@@ -203,7 +216,7 @@
 </svg>
 							  Client Setup
                             </a>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" data-bs-enabled="<?=$email['enabled']?1:0;?>">Change Password</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" data-bs-enabled="<?=$email['enabled']?1:0;?>" title="Edit this email account">Edit</a>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-email" data-bs-email="<?=$email['email'];?>">Delete</a>
                           </div>
                         </td>
@@ -275,15 +288,7 @@
 				</small>
             </div>
 
-			<? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>
-            <div class="mb-3">
-              <label class="form-label">Disk Space Quota</label>
-              <input name="disk_quota" type="range" class="form-range mb-2" value="1024" min="0" max="10240" step="256" oninput="if(this.value==0) { this.nextElementSibling.value = 'disabled'; } else { this.nextElementSibling.value = this.value + ' MB'; }" style="width:80%;align:left;margin-right:20px;" /><output>1024 MB</output></input>
-              <small id="userHelpBlock" class="form-text text-muted" style="display:block;margin-top:8px;">
-                Disk space quota is optional, you can set it to zero to disable account level quota.
-              </small>
-            </div>
-			<? } ?>
+			<?=plugin_filter('emails.create.form', '');?>
             <div class="row">
               <div class="col-lg-6">
                 <div class="mb-3" id="pwd-container">
@@ -334,15 +339,7 @@
               <label class="form-label">Email address:</label>
               <span id="email-title2" class="input-group-text"></span>
             </div>
-			<? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { /* TODO */ ?>
-            <div class="mb-3">
-              <label class="form-label">Disk Space Quota</label>
-              <input name="disk_quota" id="diskquota-edit" type="range" class="form-range mb-2" value="1024" min="0" max="<?=$ini["quota"];?>" step="256" oninput="if(this.value==0) { this.nextElementSibling.value = 'disabled'; } else { this.nextElementSibling.value = this.value + ' MB'; }" style="width:80%;align:left;margin-right:20px;" /><output><?=$ini["quota"];?> MB</output></input>
-              <small id="userHelpBlock" class="form-text text-muted" style="display:block;margin-top:8px;">
-                Disk space quota is optional, you can set it to zero to disable account level quota.
-              </small>
-            </div>
-			<? } ?>
+			<?=plugin_filter('emails.edit.form', '');?>
             <div class="row">
               <div class="col-lg-6">
                 <div class="mb-3" id="pwd-container2">
@@ -592,10 +589,6 @@ jQuery(document).ready(function () {
 		// optional, so the form can be submitted to flip the toggle alone.
 		$('#login-enabled').prop('checked', button.getAttribute('data-bs-enabled') !== '0')
 		                   .trigger('change');
-	// No per-mailbox quota is stored anywhere (the disk_quota block in
-	// edit_email.php is commented out and the column went with db/1032.sql), so
-	// the slider keeps its markup default instead of loading a value that does
-	// not exist. It previously read $row["disk_quota"], which was undefined here.
   	});
 
 	/* The switch is labelled with the object ("Email account"); the word next to

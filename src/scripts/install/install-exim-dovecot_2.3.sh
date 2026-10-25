@@ -48,8 +48,9 @@ elif [ "127.0.0.1.25" == "${EXIM_LOCAL}" ]; then
 fi
 
 (
-	mkdir -p /etc/exim/domains /etc/exim/forwards /etc/exim/keys
+	mkdir -p /etc/exim/domains /etc/exim/forwards /etc/exim/keys /etc/exim/virtual
 	touch /etc/exim/userdomains
+	touch /etc/exim/remotedomains
 	echo "if not first_delivery
 then
   finish
@@ -161,6 +162,8 @@ enabled=1
         mkdir /etc/dovecot
 		dnf -y install dovecot patch
 		touch /etc/dovecot/users
+		# mailbox password hashes: dovecot (auth runs as user dovecot) and root only
+		chown root:dovecot /etc/dovecot/users && chmod 0640 /etc/dovecot/users
 		patch -d /etc/dovecot -p 1 -ltN < /usr/local/reqad/scripts/install/config/dovecot.patch
 		rm -f /etc/dovecot/dh.pem
 		openssl dhparam -dsaparam -out /etc/dovecot/dh.pem 4096

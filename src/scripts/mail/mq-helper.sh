@@ -19,7 +19,11 @@
 #   deliver <id>                   -> force a delivery attempt, verbose log on stdout
 #   remove <id>                    -> delete the message from the queue
 #   freeze <id> | thaw <id>        -> exim -Mf / -Mt
-#   runq                           -> run the whole queue, forcing frozen messages
+#   runq                           -> start a background run of the whole queue,
+#                                     forcing frozen messages; prints
+#                                     "started <runners>" or "running"
+#   runq-status                    -> "running" or "idle"
+#   runq-worker                    -> internal: what the background run executes
 #   purge-frozen                   -> remove every frozen message
 #
 # Exit 0 on success. On failure, exit non-zero with the reason on stderr.
@@ -29,6 +33,8 @@ export LC_ALL=C
 
 EXIM="/usr/sbin/exim"
 EXIQGREP="/usr/sbin/exiqgrep"
+SELF="/usr/local/reqad/scripts/mail/mq-helper.sh"
+RUNQ_UNIT="reqad-mq-runq"
 BODY_MAX=65536
 BODY_MAX_LINES=300
 
@@ -44,6 +50,17 @@ valid_msgid() {
         *[!A-Za-z0-9-]* ) return 1 ;;
     esac
     printf '%s' "$1" | grep -qE '^[A-Za-z0-9]{6}-[A-Za-z0-9]{6,20}-[A-Za-z0-9]{2,6}$'
+}
+
+# Parallel runners for a forced queue run: exim's own queue_run_max (default 5),
+# capped so a misconfigured value cannot fork hundreds of runners.
+runq_runners() {
+    local n
+    n=$("$EXIM" -bP -n queue_run_max 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) n=5 ;; esac
+    [ "$n" -ge 1 ] || n=5
+    [ "$n" -le 10 ] || n=10
+    echo "$n"
 }
 
 need_msgid() {
@@ -180,9 +197,36 @@ thaw)
     ;;
 
 runq)
-    # -qff forces a run over every message, frozen ones included.
-    "$EXIM" -qff 2>&1
-    exit 0
+    # A forced run over a big queue takes far longer than any web request may
+    # (one runner delivers a few dozen messages a minute), so it runs as a
+    # transient systemd unit: outside the panel's PHP-FPM cgroup, one at a time,
+    # and visible to runq-status. Delivery results go to the exim main log.
+    if systemctl is-active --quiet "$RUNQ_UNIT"; then
+        echo "running"
+        exit 0
+    fi
+    systemctl reset-failed "$RUNQ_UNIT" >/dev/null 2>&1
+    systemd-run --quiet --collect --unit="$RUNQ_UNIT" \
+        --description="Reqad forced mail queue run" \
+        "$SELF" runq-worker >/dev/null 2>&1 || die "could not start the queue run"
+    echo "started $(runq_runners)"
+    ;;
+
+runq-status)
+    if systemctl is-active --quiet "$RUNQ_UNIT"; then echo "running"; else echo "idle"; fi
+    ;;
+
+runq-worker)
+    # -qff forces a run over every message, frozen ones included. Exim locks
+    # each message while it works on it, so parallel runners never deliver the
+    # same message twice; each one walks the queue in its own random order.
+    n=$(runq_runners)
+    echo "forced queue run: $n runners, $("$EXIM" -bpc 2>/dev/null) messages queued"
+    for _ in $(seq 1 "$n"); do
+        "$EXIM" -qff </dev/null >/dev/null 2>&1 &
+    done
+    wait
+    echo "forced queue run finished, $("$EXIM" -bpc 2>/dev/null) messages left"
     ;;
 
 purge-frozen)

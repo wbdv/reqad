@@ -5,6 +5,14 @@
 if (!defined('_PATH'))
 	define('_PATH', '/usr/local/reqad');
 
+/* The panel database is written by the panel, the CLI, cron jobs and background
+   runs at once. Without a busy timeout a write that meets another one's lock
+   fails at once ("database is locked") - an account delete once left its row
+   behind that way. defines.php opens it and is not replaced on updates, so the
+   timeout is set here, where every entry point passes. */
+if (isset($db) && $db instanceof SQLite3)
+	$db->busyTimeout(5000);
+
 function log_debug($message) {
 	global $_debug;
 	if(isset($_debug) && $_debug == true) {
@@ -60,6 +68,16 @@ if (!function_exists('clean')) {
  */
 function h($s) {
 	return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+}
+
+/* A small (i) icon next to a problem the panel shows, opening the reqad.com
+   docs section that says how to fix it. $page = docs slug, optionally with
+   #anchor (e.g. 'email#stopped'). Output is ready to echo. */
+function doc_hint($page, $title = 'How to fix this') {
+	return '<a href="https://www.reqad.com/docs/'.h($page).'" target="_blank" rel="noopener"'
+		.' class="doc-hint text-muted ms-1" title="'.h($title).'" aria-label="'.h($title).'">'
+		.'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;">'
+		.'<path stroke="none" d="M0 0h24v24H0z" fill="none"/><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12.01" y2="8"/><polyline points="11 12 12 12 12 16 13 16"/></svg></a>';
 }
 
 /*
@@ -267,7 +285,7 @@ function db_remote_normalize_ip($ip) {
 /* Users holding a localhost grant on $dbname. */
 function db_local_users($dbname) {
 	return mysql_rows('SELECT DISTINCT User FROM mysql.db WHERE '.mysql_db_match_sql($dbname).
-		" AND Host = 'localhost' AND User <> '' ORDER BY User");
+		" AND Host = 'localhost' AND User <> '' AND User NOT LIKE 'rqpma-%' ORDER BY User");   // not the account panel's phpMyAdmin logins
 }
 
 /* Remote hosts $dbuser is granted $dbname from. */
@@ -293,15 +311,15 @@ function db_remote_add($dbname, $dbuser, $ip) {
 		if ($out !== '')
 			return $out;
 	}
-	$out = trim(mysql_exec('GRANT ALL PRIVILEGES ON `'.$dbname.'`.* TO '.$acct));
+	// _ escaped: unescaped it is a wildcard matching other databases' names
+	$out = trim(mysql_exec('GRANT ALL PRIVILEGES ON '.database_grant_target($dbname).' TO '.$acct));
 	return $out;
 }
 
 /* Revoke $dbuser's remote access to $dbname from $ip, dropping the remote
    account once nothing else is granted to it. Returns '' or the error text. */
 function db_remote_remove($dbname, $dbuser, $ip) {
-	$acct = mysql_quote($dbuser).'@'.mysql_quote($ip);
-	$out  = trim(mysql_exec('REVOKE ALL PRIVILEGES ON `'.$dbname.'`.* FROM '.$acct));
+	$out = database_revoke_all($dbuser, $ip, $dbname);     // either spelling of the name
 	if ($out !== '')
 		return $out;
 	mysql_drop_user_if_unused($dbuser, $ip);
@@ -446,11 +464,135 @@ function smtp_configured() {
 	return setting_get('smtp_server') !== '' && setting_get('smtp_from') !== '';
 }
 
+/*
+ * Send one message through the sending method (Settings > Sending method).
+ * $html is the message body (wrap it in mail_html_layout() for the Reqad
+ * look); $text is the plain-text part. '' when sent, else the error.
+ * Used for the SMTP test, the login codes / alerts and the messages to
+ * hosting accounts ($from_name: their provider, app/functions/notify.php).
+ */
+function send_mail($to, $subject, $html, $text = '', $to_name = '', $from_name = 'Reqad') {
+	if (!smtp_configured())
+		return 'No sending method is set up (Settings > Sending method).';
+	if (!filter_var($to, FILTER_VALIDATE_EMAIL))
+		return 'Not a valid email address.';
+	require_once _PATH.'/public_html/dist/libs/phpmailer/PHPMailer.php';
+	require_once _PATH.'/public_html/dist/libs/phpmailer/SMTP.php';
+	$port = setting_get('smtp_port', '465') === '587' ? 587 : 465;
+	$mail = new PHPMailer();
+	$mail->isSMTP();
+	$mail->SMTPDebug  = SMTP::DEBUG_OFF;
+	$mail->Timeout    = 20;
+	$mail->Host       = setting_get('smtp_server');
+	$mail->Port       = $port;
+	$mail->SMTPSecure = $port === 465 ? PHPMailer::ENCRYPTION_SMTPS : PHPMailer::ENCRYPTION_STARTTLS;
+	$mail->SMTPAuth   = true;
+	$mail->Username   = setting_get('smtp_user');
+	$mail->Password   = setting_get('smtp_password');
+	$mail->CharSet    = 'UTF-8';
+	$mail->setFrom(setting_get('smtp_from'), $from_name !== '' ? $from_name : 'Reqad');
+	$mail->addAddress($to, $to_name);
+	$mail->Subject = $subject;
+	$mail->isHTML(true);
+	$mail->Body    = $html;
+	$mail->AltBody = $text !== '' ? $text : trim(html_entity_decode(strip_tags($html), ENT_QUOTES, 'UTF-8'));
+	if (!$mail->send())
+		return 'SMTP error: '.$mail->ErrorInfo;
+	return '';
+}
+
+/* The Reqad email look: logo strip, a title, $body_html, footer. $brand
+   (messages to a hosting account, app/functions/notify.php): name = the
+   hosting provider, shown instead of the Reqad logo; account + to for the
+   footer line saying why it came. */
+function mail_html_layout($title, $body_html, array $brand = null) {
+	$logo = 'data:image/svg+xml;base64,'.base64_encode((string)@file_get_contents(_PATH.'/public_html/images/reqad.svg'));
+	$head = $brand ? '<p style="margin:0;font-size:18px;font-weight:bold;color:#232e3c;">'.htmlspecialchars((string)$brand['name']).'</p>'
+	               : '<img src="'.$logo.'" alt="Reqad" height="36" border="0" style="display:block;height:36px;max-width:180px;">';
+	$foot = $brand && !empty($brand['account'])
+		? 'You get this because '.htmlspecialchars((string)$brand['to']).' is the contact address of the hosting account '.htmlspecialchars((string)$brand['account']).'. Choose which messages you get on the Profile page of your hosting panel.'
+		: ($brand ? htmlspecialchars((string)$brand['name']) : 'Reqad &mdash; The alternate hosting control panel');
+	return '<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background-color:#f4f6f8;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f6f8;padding:32px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background-color:#ffffff;overflow:hidden;border:1px solid #e0e4e8;">
+        <tr>
+          <td style="background-color:#ffffff;padding:20px 32px 16px 32px;border-top: 8px solid #2a6099">
+            <br>
+            '.$head.'
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#ffffff;padding:32px 32px 0 32px;border-top:1px solid #e0e4e8;">
+            <p style="margin:0;font-size:16pt;color:#000000;">'.htmlspecialchars($title).'</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px;background-color:#ffffff">'.$body_html.'</td>
+        </tr>
+        <tr>
+          <td style="background-color:#f4f6f8;padding:16px 32px;border-top:1px solid #e0e4e8;">
+            <p style="margin:0;font-size:12px;color:#8a929a;text-align:center;">'.$foot.'</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>';
+}
+
+/* Label/value rows for mail_html_layout() bodies (values are escaped). */
+function mail_html_facts(array $rows) {
+	$out = '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f6f8;border-radius:4px;padding:4px 0;margin:24px 0;">';
+	$i = 0;
+	foreach ($rows as $label => $value)
+		$out .= '<tr'.($i++ % 2 ? ' style="background-color:#eaecef;"' : '').'>'
+			.'<td style="padding:10px 16px;font-size:13px;color:#656d77;width:130px;">'.htmlspecialchars($label).'</td>'
+			.'<td style="padding:10px 16px;font-size:13px;color:#232e3c;font-weight:bold;">'.htmlspecialchars((string)$value).'</td></tr>';
+	return $out.'</table>';
+}
+
 /* Read from /etc/aliases rather than a stored flag, so the checkbox reflects
    what exim will actually do. */
 function root_mail_forward_active() {
 	$aliases = @file_get_contents('/etc/aliases') ?: '';
 	return (bool)preg_match('/^root:.*forward_root_mail/mi', $aliases);
+}
+
+/* Any root: alias, the forwarder or one set by hand. Without one, exim keeps
+   root's mail in /var/log/reqad/root-mail (scripts/root_mail_log.sh). */
+function root_mail_has_alias() {
+	$aliases = @file_get_contents('/etc/aliases') ?: '';
+	return (bool)preg_match('/^root:/mi', $aliases);
+}
+
+/* The last $n lines of root's mail kept on the server: root-mail.1 (the older
+   10 MB) and root-mail, oldest first. Both are reqad's own 0600 files, so the
+   panel reads them directly. The text is mail anyone can send to root: always
+   escape it. */
+function root_mail_log_tail($n = 100) {
+	$lines = array();
+	$size  = 0;
+	foreach (array('/var/log/reqad/root-mail', '/var/log/reqad/root-mail.1') as $f) {
+		$sz = @filesize($f);
+		if (!$sz) continue;
+		$size += $sz;
+		if (count($lines) >= $n) continue;
+		$fh = @fopen($f, 'rb');
+		if (!$fh) continue;
+		$want = 524288;
+		fseek($fh, max(0, $sz - $want));
+		$chunk = (string)fread($fh, $want);
+		fclose($fh);
+		$part = explode("\n", rtrim($chunk, "\n"));
+		if ($sz > $want) array_shift($part);   /* cut in the middle of a line */
+		$lines = array_merge($part, $lines);
+	}
+	return array('lines' => array_slice($lines, -$n), 'size' => $size);
 }
 
 /* The nightly `dnf update 'reqad*'` (scripts/auto_update.sh). On/off is read
@@ -1104,8 +1246,14 @@ function csrf_secret() {
 	return $secret;
 }
 
-/* The token for the current authenticated user. */
+/* The token for the current authenticated user. In web-login mode it is the
+   session's own random token (rotated at every login); on basic auth it is
+   derived from the per-install secret as before. */
 function csrf_token() {
+	if (function_exists('auth_web_enabled') && auth_web_enabled()) {
+		$s = auth_session_current();
+		return $s ? $s['csrf'] : hash('sha256', 'no-session|'.csrf_secret());
+	}
 	$user = isset($_SERVER['USER']) ? $_SERVER['USER'] : '';
 	return hash('sha256', $user.'|'.csrf_secret());
 }
@@ -1235,7 +1383,7 @@ function msg_render($token = null) {
 }
 
 /* Build the Tabler alert markup, mirroring the existing accounts.php blocks. */
-function msg_alert_html($type, $text) {
+function msg_alert_html($type, $text, $inline = false) {
     $map = array(
         'success' => array('alert-success', '#EFE', 'text-success', 'Success'),
         'error'   => array('alert-warning', '#FFE', 'text-danger',  'Error'),
@@ -1245,6 +1393,16 @@ function msg_alert_html($type, $text) {
     $c = isset($map[$type]) ? $map[$type] : $map['info'];
     list($alertClass, $bg, $textClass, $heading) = $c;
     $safe = htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+
+    /* $inline: heading and text on one line next to the icon (login page) */
+    if ($inline)
+        return '
+          <div class="alert '.$alertClass.'" role="alert" style="background:'.$bg.';">
+            <div class="d-flex align-items-center">
+              <div style="width:45px;flex-shrink:0;position:relative;top:3px;">'.msg_icon_svg($type, $textClass).'</div>
+              <div class="'.$textClass.'"><strong>'.$heading.':</strong> '.$safe.'</div>
+            </div>
+          </div>';
 
     return '
           <div class="alert '.$alertClass.'" role="alert" style="background:'.$bg.';">
@@ -1281,9 +1439,13 @@ function msg_icon_svg($type, $textClass) {
 // Is an ini feature flag enabled? Section flags default to OFF when absent
 // (matching header.php's "isset && ==1" menu checks). root_access defaults to
 // ON when absent (matching add_ssh_key.php / delete_ssh_key.php).
+// filemanager_compression ("Compress and download" in the file manager, the
+// API/MCP compress route) also defaults to ON, and needs filemanager=1 too.
 function feature_enabled($ini, $flag) {
 	if ($flag === 'root_access')
 		return !isset($ini[$flag]) ? true : ((int)$ini[$flag] === 1);
+	if ($flag === 'filemanager_compression')
+		return feature_enabled($ini, 'filemanager') && (!isset($ini[$flag]) || (int)$ini[$flag] === 1);
 	return isset($ini[$flag]) && (int)$ini[$flag] === 1;
 }
 
@@ -1307,6 +1469,12 @@ function route_required_features($route) {
 		'terminal'             => array('terminal'),
 		'transfer-tool'        => array('transfer'),
 		'addon-domains'        => array('addon_domains'),
+		'deployments'          => array('deployments'),
+		'apps'                 => array('deployments'),
+		'api-access'           => array('api'),
+		'ai-access'            => array('mcp'),
+		'dns-cluster'          => array('dnscluster'),
+		'dns-keys'             => array('dnscluster'),
 	);
 	if (isset($map[$route]))
 		return $map[$route];
@@ -1339,6 +1507,7 @@ function ajax_required_feature($action) {
 		'ajax-mq-view'            => 'email',
 		'ajax-mq-action'          => 'email',
 		'ajax-mq-runq'            => 'email',
+		'ajax-mq-runq-status'     => 'email',
 		'ajax-mq-purge-frozen'    => 'email',
 		'ajax-mailconf-validate'  => 'email',
 		'ajax-mailconf-save'      => 'email',
@@ -1359,7 +1528,7 @@ function ajax_required_feature($action) {
 		'ajax-fm-chmod'           => 'filemanager',
 		'ajax-fm-delete'          => 'filemanager',
 		'ajax-fm-upload'          => 'filemanager',
-		'ajax-fm-compress'        => 'filemanager',
+		'ajax-fm-compress'        => 'filemanager_compression',
 		'ajax-fm-extract'         => 'filemanager',
 		'ajax-fm-download'        => 'filemanager',
 		'ajax-restore-server-status' => 'backup',
@@ -1367,6 +1536,17 @@ function ajax_required_feature($action) {
 		'ajax-backup-exclude-setting' => 'backup',
 		'ajax-backup-exclude-suggest' => 'backup',
 		'ajax-terminal-target'    => 'terminal',
+		'ajax-deploy-run'         => 'deployments',
+		'ajax-deploy-rollback'    => 'deployments',
+		'ajax-deploy-log'         => 'deployments',
+		'ajax-deploy-releases'    => 'deployments',
+		'ajax-deploy-connect'     => 'deployments',
+		'ajax-app-control'        => 'deployments',
+		'ajax-app-logs'           => 'deployments',
+		'ajax-app-env'            => 'deployments',
+		'ajax-app-env-save'       => 'deployments',
+		'ajax-app-runtime'        => 'deployments',
+		'ajax-app-available'      => 'deployments',
 	);
 	if (isset($map[$action]))
 		return $map[$action];
@@ -1386,7 +1566,16 @@ function ajax_required_feature($action) {
 
 // Register one plugin manifest. Keyed by route so plugin_for_route() is O(1).
 // Manifest keys: route, title, icon, feature (ini flag, optional), template,
-// actions (POST action names), action_handler, ajax_handler, ajax_features.
+// actions (POST action names), action_handler, ajax_handler, ajax_features,
+// menu_parent ('accounts' / 'settings' = an entry in the Accounts or Settings
+// submenu instead of its own sidebar item), cli (commands for bin/reqad, see cli_plugin_command()
+// there: array(<command> => array('summary', 'usage' => fn($prog),
+// 'spec' => array(<sub> => array('opts' => [...], 'arg' => '')),
+// 'run' => fn($prog, $sub, $pos, $opts))) plus a cli.txt line per command,
+// "<command>  <summary>", for `reqad --help`), cli_subs (subcommands added to a
+// core command, e.g. `reqad account suspend`: array(<command> => array(<sub> =>
+// array('opts' => [...], 'arg' => '', 'run' => fn))) plus a cli-subs.txt line
+// per sub, "<command> <sub> <arguments><TAB><summary>", for its help).
 function plugin_register($m) {
 	if (!isset($GLOBALS['plugins']))
 		$GLOBALS['plugins'] = array();
@@ -1413,6 +1602,141 @@ function plugin_for_action($action) {
 		if (in_array($action, isset($pl['actions']) ? $pl['actions'] : array()))
 			return $pl;
 	return null;
+}
+
+/*
+ * Event hooks and filters for plugins (premium hosting packages, add-ons).
+ *
+ * A manifest may declare
+ *     'hooks'   => array('account.created' => function (array $data) { ... }),
+ *     'filters' => array('limit.allows'    => function ($value, ...$args) { return $value; }),
+ *
+ * plugin_hook() runs after something happened and cannot stop it; an error in
+ * a plugin is logged and never breaks the core operation. plugin_filter()
+ * passes a value through every plugin that filters it (limit_allows() uses
+ * 'limit.allows'); a plugin that throws keeps the value unchanged.
+ *
+ * Events fired by core (data keys in brackets):
+ *   account.created  [user, domain, uid, package ('' = not asked for)]
+ *   account.edited   [user, domain, changed]
+ *   account.deleted  [user, domain]
+ *   database.created [account, database, user] database.deleted [database, users_dropped]
+ *   database_user.created [account, user]     database_user.deleted [user, hosts]
+ *   database.access  [user, database, access (all|none)]
+ *   database.remote_added / .remote_removed [user, database, ip, account]
+ *   php.version      [account, domain, from, to]  php.settings [account, domain, settings (key => value, '' = default)]
+ *   mailbox.created  [email, account]          mailbox.deleted [email]
+ *   forwarder.created [email, account]         forwarder.deleted [email]
+ *   autoresponder.created [email, account]     autoresponder.deleted [email]
+ *   mailbox_filter.created [email, name, account]  mailbox_filter.changed / .deleted [email, name]
+ *   domain_filter.created [domain, id, name, account]  domain_filter.changed / .deleted [domain, id, name]
+ *   spam.changed     [account, changed]        mail_dns.fixed [domain, records]
+ *   alias.created    [user, alias, dns (its DNS record was asked for / made)]  alias.deleted [user, alias]
+ *   addon.created    [account, domain, docroot]  addon.deleted [account, domain, files]
+ *   mail_domain.created [account, domain]  (email turned on for an addon domain)  mail_domain.deleted [account, domain]  (turned off)
+ *   redirect.created [account, domain, from, to, code, match, keep, host]  redirect.deleted [account, domain, from, host]
+ *     (made from app/functions/domains.php: the API, the account panel)
+ *   dns_record.created [account ('' = a server token), zone, name, type, value]
+ *   dns_record.changed [account, zone, name, type, value, old: {name, type, value}]  dns_record.deleted [account, zone, name, type, value]
+ *     (app/functions/dns.php: the API, the account panel's DNS zone, 2087 DNS Zones)
+ *   dns_zone.created [zone, ip, key?]  dns_zone.deleted [zone, account (its owner, '' = none), key]  dns_zone.imported [account, zone, sets]
+ *     (app/functions/dns_tools.php: 2087 DNS Zones; filter dns.nameservers = the name servers zones should name;
+ *      key = the DNS API key that made / held the zone, app/functions/dns_keys.php)
+ *   mail_provider.changed [account, domain, provider (local|google|microsoft|zoho|other), remote (its mail is left to that provider)]
+ *     (app/functions/email_tools.php: the API, the account panel's DNS zone)
+ *   mail_spf.changed [account, domain, record]  mail_dmarc.changed [account, domain, record]  (the same, SPF / DMARC helpers)
+ *   cron.created    [account, id, name, schedule, command]  cron.updated [account, id, name, schedule, command, on]
+ *   cron.deleted     [account, id, schedule, command]  (app/functions/cron.php: the API, the account panel)
+ *   ssh_key.created [account, id, fingerprint, name]  ssh_key.deleted [account, id, fingerprint, name]
+ *     (app/functions/ssh.php: 2087's SSH keys, the API, the account panel)
+ *   account.contact_changed [account, email, old]  account.notify_changed [account, kinds]
+ *   account.notified [account, kind, to, subject]  (app/functions/notify.php: the account panel's Profile page)
+ *   ssl.issued       [account, domain, names]   (a Let's Encrypt certificate, domains.php)
+ *   wordpress.scanned [account, added, removed] (installs found / gone, app/functions/wordpress.php)
+ *   wordpress.updated [account, domain, what, items]
+ *   wordpress.installed [account, domain, path, database]
+ *   wordpress.tool    [account, domain, path, tool, on]  (Performance switch, wordpress_tools.php)
+ *   wordpress.cache_rules [account, domain, rules]     (Performance > page cache rules, wordpress_tools.php)
+ *   wordpress.security [account, domain, path, on]   (Security measures saved)
+ *   wordpress.auto    [account, domain, path, core, plugins, themes]  (auto-update settings saved, wordpress_auto.php)
+ *   wordpress.copied  [account, domain, kind (staging|clone), source, database]  wordpress.copy_deleted [account, domain, kind, database]
+ *     (Clone or staging, wordpress_copy.php)
+ *   wordpress.pushed  [account, domain, path, from (the staging copy), items, switches, uploads]  (Push to live, wordpress_push.php)
+ *   health.dismissed [id, until, by]
+ *   api.token.created [id, name, account, scopes, kind (api | mcp)]   api.token.revoked [id, name]
+ *   deployment.created [id, account, domain]   deployment.deleted [id, account, domain]
+ *   deployment.finished [id, domain, run, status, source, message]
+ *   app.created [id, account, domain, port]   app.deleted [id, account, domain]
+ *   app.packages [id, account, domain, status ok|warn|failed, message] (Install packages finished)
+ *   service.restarted [service]
+ *
+ * Filters besides limit.allows: api.routes (extra API routes and MCP tools,
+ * app/api/routes.php), health.checks (app/functions/health.php), server.logs
+ * (logs the API and MCP may read, app/functions/server.php),
+ * account.create.check ('' or why account_create() must refuse its $o, e.g.
+ * an unknown package), account.edit.check (the same for account_edit()),
+ * account.edit.apply (array(changes, warnings), + user, $o: a plugin's own
+ * part of account_edit(), run last), account.info (account_info()'s data,
+ * + user), accounts.create.form / accounts.edit.form (HTML added to the
+ * Create account / Manage account dialogs; Manage hands fields named
+ * plugin[<name>] to account.edit.apply as $o['plugin'][<name>]),
+ * accounts.user.badge (HTML after the user name in the accounts list, + user),
+ * accounts.columns (extra columns of the accounts list, after User:
+ * array(array('title' => ..., 'cell' => fn($row) => HTML), ...); with
+ * 'after' => 'domain' after Domain instead),
+ * email.create.check / email.edit.check ('' or why email_create() /
+ * email_edit() must refuse their $o, + $o, account; e.g. a mailbox size over
+ * the package's), email.create.apply / email.edit.apply (array(changes,
+ * warnings), + email, ...: a plugin's own part, run after the mailbox line is
+ * written), emails.create.form / emails.edit.form (HTML added to the Create /
+ * Edit email account dialogs), emails.columns (extra columns of the email
+ * accounts list, after Usage; cell gets the mailbox_usage_list() row),
+ * emails.usage (the HTML of a mailbox's Usage cell, + that row),
+ * api.mailboxes (the rows GET /v1/mailboxes returns, + the token's account
+ * or null: a plugin adds its fields, e.g. size_mb),
+ * account.active (true, or why the account may not run things now, + user:
+ * checked before a deploy run and before an app starts; e.g. suspended),
+ * account.notify.kinds (the kinds of message an account can choose, + user:
+ * an add-on adds its own and sends them with account_notify_send()),
+ * account.notify.brand (array(name, panel) the messages to an account come
+ * from, + user: the account panel sets the provider and its address;
+ * app/functions/notify.php),
+ * stats.needed (false, or true when an add-on needs the sites' logs counted
+ * while visitor stats are switched off: Hosting Pro's bandwidth limits;
+ * app/functions/stats.php).
+ * Plugins may add their own fields to a mailbox's /etc/dovecot/users line;
+ * core keeps them when it rewrites the line (mailbox_extra_fields()). For
+ * state every site of an account must carry, core writes named marker blocks
+ * into the account's vhosts: account_vhost_marker() (app/functions/accounts.php).
+ *
+ * Events fired by Hosting Pro: account.suspended [user, reason, source]
+ * account.unsuspended [user], account.ips [user, ipv4, ipv6], package.*
+ * (see plugins/hosting). Core binds an account's vhosts to extra addresses
+ * with account_vhost_listen() (app/functions/accounts.php).
+ */
+function plugin_hook($event, array $data = array()) {
+	foreach ((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl) {
+		if (empty($pl['hooks'][$event]) || !is_callable($pl['hooks'][$event]))
+			continue;
+		try {
+			call_user_func($pl['hooks'][$event], $data + array('event' => $event));
+		} catch (Throwable $e) {
+			log_debug('[plugin '.($pl['route'] ?? '?').'] hook '.$event.' failed: '.$e->getMessage());
+		}
+	}
+}
+
+function plugin_filter($name, $value, ...$args) {
+	foreach ((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl) {
+		if (empty($pl['filters'][$name]) || !is_callable($pl['filters'][$name]))
+			continue;
+		try {
+			$value = call_user_func($pl['filters'][$name], $value, ...$args);
+		} catch (Throwable $e) {
+			log_debug('[plugin '.($pl['route'] ?? '?').'] filter '.$name.' failed: '.$e->getMessage());
+		}
+	}
+	return $value;
 }
 
 // Appliance menu: a plugin can request a minimal sidebar by declaring a
@@ -1442,88 +1766,9 @@ function plugin_dashboard_actions($ini) {
 }
 
 /* ---- File Manager --------------------------------------------------------- */
-/* Account-level file manager helpers. Every filesystem op runs as the account
-   user (sudo -u <user>), all client paths are relative to the account home and
-   jailed inside it. See templates/file-manager-modal.php + ajax-fm-* handlers. */
-
-// Absolute home directory for an account user (convention: /home/<user>).
-// $user must already be sanitized to [a-z0-9]; we sanitize again defensively.
-function fm_home($user) {
-	return '/home/' . preg_replace('/[^a-z0-9]/', '', (string)$user);
-}
-
-/* Resolve a client-supplied relative path to an absolute path guaranteed to sit
-   inside the account home, or false on any escape/error. Uses `realpath -m` so it
-   also works for not-yet-existing targets (mkdir / newfile / rename destination). */
-function fm_resolve($user, $rel) {
-	$home = fm_home($user);
-	$rel  = (string)$rel;
-	if (strpos($rel, "\0") !== false) return false;            // null-byte guard
-	$rel = ltrim($rel, '/');                                    // always relative to home
-	$abs = shell_exec('sudo -u ' . escapeshellarg($user) .
-	       ' realpath -m ' . escapeshellarg($home . '/' . $rel) . ' 2>/dev/null');
-	$abs = trim((string)$abs);
-	if ($abs === '') return false;
-	if ($abs !== $home && strpos($abs, $home . '/') !== 0) return false;   // jail
-	return $abs;
-}
-
-/* List one directory as the account user. Returns an array of rows
-   [{name,type:'dir'|'file',size,mtime,perms}] or false on error. One parseable
-   `find` call: type / size / mtime / octal-perms / symbolic-perms / name. */
-function fm_list($user, $absdir) {
-	// %y type, %s size, %T.. mtime, %M symbolic-perms, %Y deref-type (follows
-	// symlinks: d/f/... or N for broken), %f name
-	$cmd = 'sudo -u ' . escapeshellarg($user) . ' find ' . escapeshellarg($absdir) .
-	       ' -maxdepth 1 -mindepth 1 -printf ' .
-	       escapeshellarg('%y\t%s\t%TY-%Tm-%Td %TH:%TM\t%M\t%Y\t%f\n') . ' 2>/dev/null';
-	$out = shell_exec($cmd);
-	if ($out === null) return array();
-	$rows = array();
-	foreach (explode("\n", rtrim($out, "\n")) as $line) {
-		if ($line === '') continue;
-		$p = explode("\t", $line, 6);
-		if (count($p) < 6) continue;
-		$is_link = ($p[0] === 'l');
-		$deref   = $p[4];   // %Y: type the symlink points at (d/f/…), N/L/? if unresolved
-		// effective type drives UI behaviour: a symlink to a dir navigates like a dir
-		$type = $is_link ? (($deref === 'd') ? 'dir' : 'file')
-		                 : (($p[0] === 'd') ? 'dir' : 'file');
-		$row = array(
-			'name'  => $p[5],
-			'type'  => $type,
-			'size'  => (int)$p[1],
-			'mtime' => $p[2],
-			'perms' => $p[3],   // symbolic (e.g. -rw-r--r-- or lrwxrwxrwx), matches the UI
-		);
-		if ($is_link) {
-			$row['link'] = true;
-			if ($deref === 'N' || $deref === 'L' || $deref === '?') $row['broken'] = true;
-		}
-		$rows[] = $row;
-	}
-	// folders first, then case-insensitive by name (mirrors the JS sample sort)
-	usort($rows, function($a, $b) {
-		if ($a['type'] !== $b['type']) return $a['type'] === 'dir' ? -1 : 1;
-		return strcasecmp($a['name'], $b['name']);
-	});
-	return $rows;
-}
-
-// True if $abspath is a small-enough, text (non-binary) file editable in the UI.
-function fm_is_text($user, $abspath, $max = 102400) {
-	$stat = trim((string)shell_exec('sudo -u ' . escapeshellarg($user) .
-	        ' stat -c %F/%s ' . escapeshellarg($abspath) . ' 2>/dev/null'));
-	if ($stat === '' || strpos($stat, 'regular') !== 0) return false;
-	$size = substr($stat, strrpos($stat, '/') + 1);
-	if ((int)$size >= $max) return false;
-	// `file` reports an empty file as "binary" (inode/x-empty), so short-circuit
-	if ((int)$size === 0) return true;
-	// `file --mime-encoding` reports "binary" for non-text content
-	$enc = trim((string)shell_exec('sudo -u ' . escapeshellarg($user) .
-	       ' file --mime-encoding -b ' . escapeshellarg($abspath) . ' 2>/dev/null'));
-	return $enc !== '' && strpos($enc, 'binary') === false;
-}
+/* The file operations themselves are app/functions/files.php (run as the
+   account by scripts/files/fm-run.sh); the 2087 modal's ajax-fm-* handlers
+   only find the account. */
 
 /* Confirm an account exists and return its sanitized user, or false. Mirrors the
    guard used by ajax-config-* (SELECT ... WHERE user=...). */
@@ -1590,23 +1835,108 @@ function account_server_names($domain, $alias_rows, $has_email = false) {
 	);
 }
 
+/* The names a new account's vhost template answers to (nginx server_name,
+   Apache ServerAlias - the same in the :80 and :443 blocks). account_create()
+   passes $account_aliases (www.<domain> or none) and $has_email; the old
+   adduserdomain path sets neither: www, no mail. */
+function template_server_names($domain, $account_aliases = null, $has_email = false) {
+	$aliases = is_array($account_aliases) ? $account_aliases : array('www.'.$domain);
+	$rows = array_map(function ($a) { return array('alias' => $a); }, $aliases);
+	return account_server_names($domain, $rows, $has_email)['http'];
+}
+
+/* ---- Web server template --------------------------------------------------- */
+
+/* What the configured template (server-software.ini `template`) means, so code
+   asks about capabilities instead of testing the template's name:
+     web_front()      nginx | httpd   owns :80/:443 - vhosts, certificates, SNI, server names
+     web_backend()    none  | httpd   a second server behind the front, on 127.0.0.1
+     php_mode()       fpm   | modphp  modphp = mod_php is the default handler, php-fpm optional per account
+     web_php_server() nginx | httpd   the server whose vhost holds the PHP handler
+   A template may ship scripts/templates/<template>.ini (front=, backend=, php=);
+   without one the name decides: apache_* is httpd + mod_php, anything else
+   nginx + php-fpm. scripts/web_caps.sh reads the same files for the shell scripts. */
+function web_caps($ini = null) {
+	static $cache = array();
+	if ($ini === null)
+		$ini = $GLOBALS['ini'] ?? array();
+	$tpl = basename(trim((string)($ini['template'] ?? '')));
+	if (isset($cache[$tpl]))
+		return $cache[$tpl];
+
+	$caps = (substr($tpl, 0, 7) == 'apache_')
+		? array('front' => 'httpd', 'backend' => 'none', 'php' => 'modphp')
+		: array('front' => 'nginx', 'backend' => 'none', 'php' => 'fpm');
+	$file = (defined('_PATH') ? _PATH : '/usr/local/reqad').'/scripts/templates/'.$tpl.'.ini';
+	/* RAW: the normal scanner turns "none" into '' */
+	if ($tpl !== '' && is_readable($file) && is_array($f = @parse_ini_file($file, false, INI_SCANNER_RAW))) {
+		$valid = array('front' => array('nginx', 'httpd'), 'backend' => array('none', 'httpd'), 'php' => array('fpm', 'modphp'));
+		foreach ($valid as $k => $ok)
+			if (isset($f[$k]) && in_array(trim($f[$k]), $ok, true))
+				$caps[$k] = trim($f[$k]);
+	}
+	return $cache[$tpl] = $caps;
+}
+
+function web_front($ini = null)   { return web_caps($ini)['front']; }
+function web_backend($ini = null) { return web_caps($ini)['backend']; }
+function php_mode($ini = null)    { return web_caps($ini)['php']; }
+
+function web_php_server($ini = null) {
+	$c = web_caps($ini);
+	return $c['backend'] !== 'none' ? $c['backend'] : $c['front'];
+}
+
+/* Group of document roots and php-fpm sockets: the front server's user, which
+   serves the static files. A backend joins that group (apache is a member of
+   nginx on nginx_apache_php-fpm), so nothing on disk changes with it. */
+function web_group($ini = null) {
+	return web_server(web_front($ini))['user'];
+}
+
+/* Where a backend server listens, on loopback only. nginx proxies https
+   requests to an https backend vhost, so Apache sees a real TLS connection:
+   %{HTTPS} in .htaccess, $_SERVER['HTTPS'] and the port are what the visitor
+   used, and "force https" rules do not loop. */
+function web_backend_addr($https = true) {
+	return $https ? '127.0.0.1:8443' : '127.0.0.1:8080';
+}
+
+/* Paths and commands of one web server, 'nginx' or 'httpd'. 'user' is the
+   server's own Unix user (pool listen.group, docroot group). */
+function web_server($server) {
+	if ($server === 'httpd')
+		return array('service' => 'httpd', 'bin' => 'httpd', 'test' => 'httpd -t', 'dir' => '/etc/httpd/conf.d',
+		             'user' => 'apache', 'label' => 'Apache', 'certbot' => 'apache');
+	return array('service' => 'nginx', 'bin' => 'nginx', 'test' => 'nginx -t', 'dir' => '/etc/nginx/conf.d',
+	             'user' => 'nginx', 'label' => 'nginx', 'certbot' => 'nginx');
+}
+
+/* A domain's vhost file on $server, the front server by default. */
+function web_vhost_path($domain, $server = null) {
+	return web_server($server ?? web_front())['dir'].'/'.$domain.'.conf';
+}
+
 /* Rewrite an account's live vhost server_name/ServerAlias from the alias table,
    validate the server config, and reload. Returns '' on success, or an error
-   string (the original file is restored on a failed config test). */
-function apply_account_vhost_names($db, $domain, $is_apache) {
+   string (the original file is restored on a failed config test). The names
+   live in the front server's vhost. */
+function apply_account_vhost_names($db, $domain) {
 	$res = $db->query('SELECT id, has_email FROM accounts WHERE domain="'.$db->escapeString($domain).'"');
 	$account = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
 	if(!$account) return 'Account not found for '.$domain;
 
 	$aliases = get_aliases($db, $account['id']);
 	$names   = account_server_names($domain, $aliases, !empty($account['has_email']));
-	$file    = $is_apache ? '/etc/httpd/conf.d/'.$domain.'.conf' : '/etc/nginx/conf.d/'.$domain.'.conf';
+	$server  = web_front();
+	$ws      = web_server($server);
+	$file    = web_vhost_path($domain, $server);
 
 	$content = shell_exec('sudo cat '.escapeshellarg($file).' 2>/dev/null');
 	if($content === null || trim($content) === '')
 		return 'vhost file not found: '.$file;
 
-	if(!$is_apache) {
+	if($server === 'nginx') {
 		/* Two server blocks: 1st server_name = :80 (http), 2nd = :443 (https). */
 		$i = 0;
 		$new = preg_replace_callback('/^([ \t]*)server_name[ \t]+[^;]*;/m', function($m) use (&$i, $names) {
@@ -1619,14 +1949,14 @@ function apply_account_vhost_names($db, $domain, $is_apache) {
 		$new = preg_replace('/^([ \t]*)ServerAlias[ \t]+.*$/m', '${1}ServerAlias    '.trim($names['http']), $content);
 	}
 	if($new === null || $new === $content)
-		return '';   // nothing to change (or regex no-op) — leave the file alone
+		return apply_backend_vhost_names($domain, $names['https']);   // nothing to change in the front vhost
 
 	$tmp = tempnam('/tmp', 'reqad');
 	file_put_contents($tmp, $new);
 	shell_exec('sudo cp '.escapeshellarg($tmp).' '.escapeshellarg($file));
 	@unlink($tmp);
 
-	$test = $is_apache ? shell_exec('sudo httpd -t 2>&1') : shell_exec('sudo nginx -t 2>&1');
+	$test = shell_exec('sudo '.$ws['test'].' 2>&1');
 	if(stripos($test, 'test is successful') === false && stripos($test, 'syntax ok') === false) {
 		/* roll back to the original content */
 		$bak = tempnam('/tmp', 'reqad');
@@ -1636,8 +1966,24 @@ function apply_account_vhost_names($db, $domain, $is_apache) {
 		log_debug('[apply_account_vhost_names] config test failed for '.$domain.': '.trim($test));
 		return 'Web server config test failed; change reverted.';
 	}
-	shell_exec('sudo systemctl reload '.($is_apache ? 'httpd' : 'nginx').' >> '.__DIR__.'/../../log/debug_log 2>&1');
-	return '';
+	shell_exec('sudo systemctl reload '.$ws['service'].' >> '.__DIR__.'/../../log/debug_log 2>&1');
+	return apply_backend_vhost_names($domain, $names['https']);
+}
+
+/* A backend server (Apache behind nginx) picks the site by the Host header
+   nginx passes on, so its vhost carries the same names: its ServerAlias line
+   is rewritten to $names. '' when there is no backend or nothing to change. */
+function apply_backend_vhost_names($domain, $names) {
+	if(web_backend() === 'none')
+		return '';
+	$file = web_vhost_path($domain, web_backend());
+	$content = (string)shell_exec('sudo cat '.escapeshellarg($file).' 2>/dev/null');
+	if(trim($content) === '')
+		return 'Backend vhost not found: '.$file;
+	$new = preg_replace('/^([ \t]*)ServerAlias[ \t]+.*$/m', '${1}ServerAlias    '.trim($names), $content);
+	if($new === null || $new === $content)
+		return '';
+	return account_vhost_apply($file, $new, $content, web_backend());
 }
 
 /* ---- Let's Encrypt cert extension (aliases) ------------------------------- */
@@ -1771,15 +2117,15 @@ function reissue_letsencrypt_cert($db, $domain, $has_email, $token = '') {
    array(path, test, service, label, mode) or null for an unknown key. The php-fpm
    version/path is inferred from which php-fpm.d dir holds the account's pool. */
 function account_config_target($ini, $domain, $which) {
-	$is_apache = (substr(trim($ini['template'] ?? ''), 0, 7) == 'apache_');
-
 	if($which === 'nginx') {
+		$server = web_front($ini);
+		$ws     = web_server($server);
 		return array(
-			'path'    => $is_apache ? '/etc/httpd/conf.d/'.$domain.'.conf' : '/etc/nginx/conf.d/'.$domain.'.conf',
-			'test'    => $is_apache ? 'sudo httpd -t 2>&1' : 'sudo nginx -t 2>&1',
-			'bin'     => $is_apache ? 'httpd' : 'nginx',
-			'service' => $is_apache ? 'httpd' : 'nginx',
-			'label'   => $is_apache ? 'Apache vhost' : 'nginx vhost',
+			'path'    => web_vhost_path($domain, $server),
+			'test'    => 'sudo '.$ws['test'].' 2>&1',
+			'bin'     => $ws['bin'],
+			'service' => $ws['service'],
+			'label'   => $ws['label'].' vhost',
 			'mode'    => 'nginx',
 		);
 	}
@@ -1833,7 +2179,12 @@ function validate_config_content($ini, $domain, $which, $content) {
 
 	if($which === 'nginx' && $t['bin'] === 'nginx') {
 		file_put_contents($dir.'/vhost.conf', $content);
-		file_put_contents($dir.'/nginx.conf', "events {}\nhttp {\n    include ".$dir."/vhost.conf;\n}\n");
+		/* the real nginx.conf's load_module lines, so directives of dynamic
+		   modules (modsecurity, more_set_headers, geoip2) are known here too */
+		$mods = '';
+		if(preg_match_all('/^[ \t]*load_module[ \t]+[^;\n]+;/m', (string)@file_get_contents('/etc/nginx/nginx.conf'), $m))
+			$mods = implode("\n", array_map('trim', $m[0]))."\n";
+		file_put_contents($dir.'/nginx.conf', $mods."events {}\nhttp {\n    include ".$dir."/vhost.conf;\n}\n");
 		$out = shell_exec('sudo nginx -t -c '.escapeshellarg($dir.'/nginx.conf').' 2>&1');
 	} elseif($which === 'fpm') {
 		file_put_contents($dir.'/pool.conf', $content);
@@ -2002,6 +2353,85 @@ function apply_account_config($ini, $user, $domain, $which, $content) {
 	return array('error' => '', 'success' => $t['label'].' saved and reloaded.');
 }
 
+/* The raw vhost and pool editors (and their validate/restore endpoints) are
+   root access in disguise: the nginx master opens log paths as root, Apache
+   runs piped logs as root, and a pool's "user =" picks who PHP runs as. With
+   root_access=0 they are read-only, the Process manager included. */
+function account_config_editable($ini) {
+	return feature_enabled($ini, 'root_access');
+}
+
+/* Process manager of an account's php-fpm pool, written by the server: only the
+   pm.* / request_terminate_timeout lines (and the comments Reqad wrote above
+   them) are replaced, from validated numbers (root_access=1 only, see
+   modules/pool_pm.php). $v: pm (ondemand|dynamic|static),
+   max, idle, start, minsp, maxsp, reqs, term. Same rules as the dialog. */
+function account_pool_pm_block(array $v) {
+	$pm = (string)($v['pm'] ?? '');
+	$n  = function ($k) use ($v) { return isset($v[$k]) && preg_match('/^\d+$/', (string)$v[$k]) ? (int)$v[$k] : -1; };
+	$max = $n('max'); $reqs = $n('reqs'); $term = $n('term');
+	if (!in_array($pm, array('ondemand', 'dynamic', 'static'), true))
+		return array('Unknown process manager mode.', null);
+	if ($max < 1 || $max > 500)
+		return array('Workers at most must be between 1 and 500.', null);
+	if ($reqs < 0 || $reqs > 100000 || $term < 0 || $term > 86400)
+		return array('Requests and seconds must be 0 or more.', null);
+	if ($pm === 'ondemand') {
+		$idle = $n('idle');
+		if ($idle < 1 || $idle > 3600)
+			return array('Stop idle workers after must be 1 to 3600 seconds.', null);
+		$block = array("; workers start with the first request and stop after $idle s idle",
+		               'pm = ondemand', "pm.max_children = $max", "pm.process_idle_timeout = {$idle}s");
+	} else if ($pm === 'dynamic') {
+		$st = $n('start'); $mn = $n('minsp'); $mx = $n('maxsp');
+		if (!($mn >= 1 && $mn <= $st && $st <= $mx && $mx <= $max))
+			return array('Needs: at least <= start with <= at most <= workers at most.', null);
+		$block = array("; $mn to $mx idle workers kept ready, up to $max in all",
+		               'pm = dynamic', "pm.max_children = $max", "pm.start_servers = $st",
+		               "pm.min_spare_servers = $mn", "pm.max_spare_servers = $mx");
+	} else {
+		$block = array("; a fixed $max workers, always running", 'pm = static', "pm.max_children = $max");
+	}
+	$block[] = "pm.max_requests = $reqs";
+	$block[] = "request_terminate_timeout = {$term}s";
+	return array('', $block);
+}
+
+function account_pool_pm_apply($ini, $user, $domain, array $v) {
+	list($err, $block) = account_pool_pm_block($v);
+	if ($err !== '')
+		return array('error' => $err, 'success' => '');
+	$t = account_config_target($ini, $domain, 'fpm');
+	$orig = $t ? (string)shell_exec('sudo cat '.escapeshellarg($t['path']).' 2>/dev/null') : '';
+	if ($orig === '')
+		return array('error' => 'This account has no php-fpm pool.', 'success' => '');
+
+	$keys = array('pm', 'pm.max_children', 'pm.start_servers', 'pm.min_spare_servers', 'pm.max_spare_servers',
+	              'pm.process_idle_timeout', 'pm.max_requests', 'request_terminate_timeout');
+	$out = array(); $at = -1;
+	foreach (explode("\n", rtrim(str_replace("\r\n", "\n", $orig), "\n")) as $l) {
+		$old = (bool)preg_match('/^\s*;\s*(workers start with the first request|site holds no memory|a fixed \d+ workers|\d+ to \d+ idle workers)/', $l);
+		foreach ($keys as $k)
+			if (preg_match('/^\s*'.preg_quote($k, '/').'\s*=/', $l)) $old = true;
+		if ($old) {
+			if ($at < 0 && (preg_match('/^\s*pm\s*=/', $l) || preg_match('/^\s*;/', $l))) $at = count($out);
+			continue;
+		}
+		$out[] = $l;
+	}
+	if ($at < 0) {
+		$at = count($out);
+		foreach ($out as $i => $l)
+			if (preg_match('/^\s*listen/', $l)) $at = $i + 1;
+		array_unshift($block, '');
+	}
+	array_splice($out, $at, 0, $block);
+	$r = apply_account_config($ini, $user, $domain, 'fpm', implode("\n", $out)."\n");
+	if ($r['error'] === '')
+		$r['success'] = 'Process manager: pm = '.$v['pm'].', up to '.(int)$v['max'].' workers. '.$r['success'];
+	return $r;
+}
+
 /**
  * State of wetty, the browser terminal behind the Terminal page.
  *
@@ -2103,9 +2533,9 @@ function reqad_server_ip() {
 	return trim(shell_exec("/usr/sbin/ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print \$2'} | awk -F/ {'print \$1'}"));
 }
 
-/* Is the panel serving sites with nginx (vs apache)? Nginx cache only applies then. */
+/* Is nginx the front server? The nginx cache only applies then. */
 function wp_is_nginx($ini) {
-	return substr(trim($ini['template'] ?? ''), 0, 7) != 'apache_';
+	return web_front($ini) === 'nginx';
 }
 
 /* Sanitised zone/prefix for an account — used for the cache zone, cache dir and
@@ -2115,9 +2545,15 @@ function wp_cache_zone($user) {
 	return preg_replace('/[^a-z0-9]/', '', strtolower((string)$user));
 }
 
-/* Absolute docroot for a tracked WordPress install (honours the subdir `path`). */
-function wp_site_docroot($user, $path = '') {
+/* Absolute folder of a tracked WordPress install: the site's document root
+   ($domain: an addon domain or subdomain of $user has its own; the main
+   domain's is ~/public_html) plus the install's subfolder `path`. */
+function wp_site_docroot($user, $path = '', $domain = '') {
+	global $ini;
 	$base = '/home/'.$user.'/public_html';
+	if ($domain !== '' && ($a = addon_domain_get($ini, strtolower($domain))) && $a['user'] === $user
+	    && strpos((string)$a['docroot'], '/home/'.$user.'/') === 0)
+		$base = rtrim($a['docroot'], '/');
 	$path = trim((string)$path, '/');
 	return $path === '' ? $base : $base.'/'.$path;
 }
@@ -2131,8 +2567,29 @@ function wp_nginx_conf_path($domain) {
 
 /* Build the three marker-delimited config fragments for a site.
    Returns array('http' => ..., 'purge' => ..., 'fcgi' => ...). Uses nowdoc so
-   nginx '$' variables survive verbatim; only %ZONE% / %IP% are substituted. */
-function wp_nginx_cache_fragments($zone, $ip) {
+   nginx '$' variables survive verbatim; only %ZONE% / %IP% are substituted.
+   $rules: the site's own additions (wp_cache_rules_get()): 'pages' = paths
+   that are never cached, 'cookies' = cookie names that turn the cache off.
+
+   Query strings: a request whose query holds only campaign tags (utm_*, click
+   ids: wp_cache_tracking_params()) uses the cache entry of the plain address,
+   and PHP gets it WITHOUT the tags when the answer may be cached, so no
+   visitor's click id ends up in a page the others get. Any other parameter
+   skips the cache, as before. The key is the path alone (%ZONE%_cache_path):
+   only cacheable requests ever read or write it. */
+function wp_nginx_cache_fragments($zone, $ip, array $rules = array()) {
+	$cookies = '';
+	foreach (wp_cache_rules_clean($rules)['cookies'] as $c) {
+		$name = preg_quote(rtrim($c, '*'));
+		$cookies .= '    "~*(^|;)\s*'.$name.(substr($c, -1) === '*' ? '[^=;]*' : '').'=" 1;'."\n";
+	}
+	$pages = '';
+	foreach (wp_cache_rules_clean($rules)['pages'] as $p)
+		$pages .= '    "~*^'.str_replace('\*', '.*', preg_quote($p)).'" 1;'."\n";
+	$track = implode('|', array_map(function ($t) {
+		return substr($t, -1) === '*' ? preg_quote(rtrim($t, '*'), '/').'[a-z0-9_]*' : preg_quote($t, '/');
+	}, wp_cache_tracking_params()));
+
 	$http = <<<'EOT'
 # BEGIN reqad-nginx-cache
 # FastCGI microcache — managed by the Reqad WP Toolkit "Manage" panel.
@@ -2149,22 +2606,21 @@ map $http_cookie $%ZONE%_nc_cookie {
     ~*woocommerce_items_in_cart 1;
     ~*woocommerce_cart_hash     1;
     ~*wp_woocommerce_session    1;
-}
+%COOKIES%}
 
 map $request_uri $%ZONE%_nc_uri {
     default                          0;
-    ~*^/wp-admin                     1;
-    ~*^/wp-login\.php                1;
-    ~*^/wp-cron\.php                 1;
-    ~*^/xmlrpc\.php                  1;
-    ~*^/wp-json                      1;
-    ~*^/feed                         1;
-    ~*^/sitemap.*\.xml               1;
+    ~*/wp-admin                      1;
+    ~*/wp-[a-z_-]+\.php              1;
+    ~*/xmlrpc\.php                   1;
+    ~*/wp-json                       1;
+    ~*/feed                          1;
+    ~*/sitemap[^/]*\.xml             1;
     ~*^/purge                        1;
-    ~*^/(cart|checkout|my-account)   1;
-    ~*^/wc-api                       1;
-    ~*^/store-api                    1;
-}
+    ~*/(cart|basket|checkout|my-account) 1;
+    ~*/wc-api                        1;
+    ~*/store-api                     1;
+%PAGES%}
 
 map $request_method $%ZONE%_nc_method {
     default 1;
@@ -2172,14 +2628,37 @@ map $request_method $%ZONE%_nc_method {
     HEAD    0;
 }
 
-map $query_string $%ZONE%_nc_query {
+# 1 = the query string holds only campaign tags (utm_*, gclid, fbclid...)
+map $query_string $%ZONE%_nc_track {
+    default 0;
+    "~*^(?:(?:%TRACK%)(?:=[^&]*)?(?:&|$))+$" 1;
+}
+
+map "$query_string:$%ZONE%_nc_track" $%ZONE%_nc_query {
     default 1;
-    ""      0;
+    ":0"    0;
+    "~:1$"  0;
 }
 
 map "$%ZONE%_nc_cookie$%ZONE%_nc_uri$%ZONE%_nc_method$%ZONE%_nc_query" $%ZONE%_skip_cache {
     default 1;
     "0000"  0;
+}
+
+# the cache key: the address without its query string
+map $request_uri $%ZONE%_cache_path {
+    default                  $request_uri;
+    "~^(?<%ZONE%_cp>[^?]*)"  $%ZONE%_cp;
+}
+
+# what PHP sees: a cacheable request with campaign tags gets the plain address
+map "$%ZONE%_skip_cache$%ZONE%_nc_track" $%ZONE%_php_query {
+    default $query_string;
+    "01"    "";
+}
+map "$%ZONE%_skip_cache$%ZONE%_nc_track" $%ZONE%_php_uri {
+    default $request_uri;
+    "01"    $%ZONE%_cache_path;
 }
 # END reqad-nginx-cache
 
@@ -2208,12 +2687,12 @@ EOT;
 
 	$fcgi = <<<'EOT'
             # BEGIN reqad-nginx-cache-fcgi
-            # $request_uri (not $uri): try_files rewrites $uri to /index.php, which
-            # would collapse every page onto one cache entry. Query strings are never
-            # cached (see the %ZONE%_nc_query map) so the key stays a clean path.
+            # The key is the path from $request_uri (not $uri: try_files rewrites
+            # $uri to /index.php, which would collapse every page onto one entry).
+            # Only requests without a query, or with campaign tags alone, are cached.
             open_file_cache             off;
             fastcgi_cache               %ZONE%;
-            fastcgi_cache_key           "$scheme$host$request_uri";
+            fastcgi_cache_key           "$scheme$host$%ZONE%_cache_path";
             fastcgi_cache_methods       GET;
             fastcgi_cache_valid         200 301 302 12h;
             fastcgi_cache_valid         404 1m;
@@ -2224,14 +2703,157 @@ EOT;
             fastcgi_ignore_headers      Cache-Control Expires;
             fastcgi_cache_bypass        $%ZONE%_skip_cache;
             fastcgi_no_cache            $%ZONE%_skip_cache;
+            # after include fastcgi_params: PHP-FPM keeps the last value
+            fastcgi_param               QUERY_STRING $%ZONE%_php_query;
+            fastcgi_param               REQUEST_URI  $%ZONE%_php_uri;
             # END reqad-nginx-cache-fcgi
 
 EOT;
 
-	$sub = function($s) use ($zone, $ip) {
-		return str_replace(array('%ZONE%', '%IP%'), array($zone, $ip), $s);
+	$sub = function($s) use ($zone, $ip, $cookies, $pages, $track) {
+		return str_replace(array('%ZONE%', '%IP%', '%COOKIES%', '%PAGES%', '%TRACK%'), array($zone, $ip, $cookies, $pages, $track), $s);
 	};
 	return array('http' => $sub($http), 'purge' => $sub($purge), 'fcgi' => $sub($fcgi));
+}
+
+/* The query parameters that only tag a visit (ads, newsletters, social
+   networks): a query holding nothing else is served from the cache. A
+   trailing * = every name starting so. */
+function wp_cache_tracking_params() {
+	return array('utm_*', 'gclid', 'gbraid', 'wbraid', 'gad_source', 'gad_campaignid', 'dclid', 'fbclid', 'msclkid', 'ttclid', 'twclid',
+	             'li_fat_id', 'srsltid', 'igshid', 'yclid', 'mc_cid', 'mc_eid', '_ga', '_gl', '_hsenc', '_hsmi', 'mkt_tok', 'oly_enc_id', 'oly_anon_id',
+	             'vero_id', 'rb_clickid', 's_cid', 'epik', 'pk_campaign', 'pk_kwd', 'pk_source', 'pk_medium', 'mtm_campaign', 'mtm_source', 'mtm_medium', 'ref_src');
+}
+
+/* A site's own cache rules, checked and normalised: array('pages' => [...],
+   'cookies' => [...]). Pages: start with /, no spaces or quotes, * = any text.
+   Cookies: letters, digits, . _ - and a trailing * for a prefix. At most 50
+   of each; duplicates dropped. Invalid entries are left out here; the setter
+   (wordpress_cache_rules_set()) refuses them with a message. */
+function wp_cache_rules_clean(array $rules) {
+	$out = array('pages' => array(), 'cookies' => array());
+	foreach ((array)($rules['pages'] ?? array()) as $p) {
+		$p = trim((string)$p);
+		if (wp_cache_rule_error('pages', $p) === '' && !in_array(strtolower($p), array_map('strtolower', $out['pages']), true))
+			$out['pages'][] = $p;
+	}
+	foreach ((array)($rules['cookies'] ?? array()) as $c) {
+		$c = trim((string)$c);
+		if (wp_cache_rule_error('cookies', $c) === '' && !in_array(strtolower($c), array_map('strtolower', $out['cookies']), true))
+			$out['cookies'][] = $c;
+	}
+	$out['pages'] = array_slice($out['pages'], 0, 50);
+	$out['cookies'] = array_slice($out['cookies'], 0, 50);
+	return $out;
+}
+
+/* Why a cache rule is refused ('' = fine). $kind: pages | cookies. */
+function wp_cache_rule_error($kind, $v) {
+	if ($kind === 'pages') {
+		if ($v === '' || $v[0] !== '/')
+			return 'A page must start with / (for example /members/).';
+		if (strlen($v) > 200 || !preg_match('#^/[A-Za-z0-9/_.~%*+,:@=!()-]*$#', $v))
+			return 'A page may hold letters, digits, / and . _ - ~ % * + , : @ = ! ( ) only (no spaces, quotes or ?).';
+		return '';
+	}
+	if ($v === '' || strlen($v) > 100 || !preg_match('/^[A-Za-z0-9._-]+\*?$/', $v))
+		return 'A cookie name may hold letters, digits and . _ - only, with an optional * at the end.';
+	return '';
+}
+
+/* The cache rules a site has (table wordpress_cache_rules, db 1054), per
+   domain: the page cache is the site's (vhost), not one install's. */
+function wp_cache_rules_get($domain) {
+	global $db;
+	$out = array('pages' => array(), 'cookies' => array());
+	$stmt = @$db->prepare('SELECT kind, value FROM wordpress_cache_rules WHERE domain = :d ORDER BY rowid');
+	if (!$stmt)
+		return $out;     // before db 1054
+	$stmt->bindValue(':d', strtolower((string)$domain), SQLITE3_TEXT);
+	$res = $stmt->execute();
+	while ($res && ($r = $res->fetchArray(SQLITE3_ASSOC)))
+		if (isset($out[$r['kind']]))
+			$out[$r['kind']][] = $r['value'];
+	return $out;
+}
+
+/* Replace a site's cache rules in the table (already checked). */
+function wp_cache_rules_put($domain, array $rules) {
+	global $db;
+	$domain = strtolower((string)$domain);
+	$rules = wp_cache_rules_clean($rules);
+	$db->exec('BEGIN');
+	$del = $db->prepare('DELETE FROM wordpress_cache_rules WHERE domain = :d');
+	if (!$del) { $db->exec('ROLLBACK'); return false; }
+	$del->bindValue(':d', $domain, SQLITE3_TEXT);
+	$del->execute();
+	$ins = $db->prepare('INSERT OR IGNORE INTO wordpress_cache_rules (domain, kind, value) VALUES (:d, :k, :v)');
+	foreach ($rules as $k => $list)
+		foreach ($list as $v) {
+			$ins->bindValue(':d', $domain, SQLITE3_TEXT);
+			$ins->bindValue(':k', $k, SQLITE3_TEXT);
+			$ins->bindValue(':v', $v, SQLITE3_TEXT);
+			$ins->execute();
+			$ins->reset();
+		}
+	return $db->exec('COMMIT');
+}
+
+/* A removed site leaves no cache rules behind (a later site of that name
+   starts without them). */
+function wp_cache_rules_forget($domain) {
+	global $db;
+	if (!($db instanceof SQLite3))
+		return;
+	$stmt = @$db->prepare('DELETE FROM wordpress_cache_rules WHERE domain = :d');
+	if (!$stmt)
+		return;
+	$stmt->bindValue(':d', strtolower((string)$domain), SQLITE3_TEXT);
+	$stmt->execute();
+}
+
+/* A vhost's text with its cache blocks written again from the current
+   fragments (same zone, the site's rules), or null when it has no cache. The
+   purge block keeps the address it allows. */
+function wp_nginx_cache_rewrite($conf, $domain) {
+	if (!preg_match('/^# BEGIN reqad-nginx-cache[ \t]*$/m', $conf) || !preg_match('/keys_zone=([a-z0-9_]+):/', $conf, $zm))
+		return null;
+	$ip = preg_match('/# BEGIN reqad-nginx-cache-purge.*?allow\s+(?!127\.0\.0\.1|::1)([0-9a-fA-F.:]+);/s', $conf, $im) ? $im[1] : reqad_server_ip();
+	$frag = wp_nginx_cache_fragments($zm[1], $ip, wp_cache_rules_get($domain));
+	$swap = function ($mk, $text, $c) {
+		/* the block keeps the indent of its BEGIN line */
+		$text = trim($text, "\n");
+		$lead = preg_match('/^[ \t]*/', $text, $l) ? $l[0] : '';
+		$text = preg_replace('/^'.preg_quote($lead, '/').'/m', '', $text);    // the fragment's own indent off
+		return preg_replace_callback('/^([ \t]*)# BEGIN '.$mk.'[ \t]*\n.*?# END '.$mk.'[^\n]*\n?/ms', function ($m) use ($text) {
+			return conf_indent($text, $m[1])."\n";
+		}, $c, 1);
+	};
+	$conf = $swap('reqad-nginx-cache', $frag['http'], $conf);
+	$conf = $swap('reqad-nginx-cache-purge', $frag['purge'], $conf);
+	$conf = $swap('reqad-nginx-cache-fcgi', $frag['fcgi'], $conf);
+	return $conf;
+}
+
+/* Write a site's cache blocks again (its rules changed, or the blocks are an
+   older version). nginx -t before the reload, the old file back on a failure.
+   $reload false: the caller reloads once after several sites.
+   Returns array(error, changed). */
+function wp_nginx_cache_refresh($domain, $reload = true) {
+	$path = wp_nginx_conf_path($domain);
+	$orig = wp_read_conf($path);
+	$new = $orig !== '' ? wp_nginx_cache_rewrite($orig, $domain) : null;
+	if ($new === null || $new === $orig)
+		return array('', false);
+	wp_write_conf($path, $new);
+	$test = (string)shell_exec('sudo nginx -t 2>&1');
+	if (stripos($test, 'test is successful') === false) {
+		wp_write_conf($path, $orig);
+		return array('nginx did not accept the new cache rules; nothing was changed. '.trim(preg_replace('/\s+/', ' ', $test)), false);
+	}
+	if ($reload)
+		shell_exec('sudo systemctl reload nginx 2>&1');
+	return array('', true);
 }
 
 /* Read a vhost via sudo (root-owned files are common in conf.d). */
@@ -2305,10 +2927,12 @@ function wp_install_cache_purger($user, $docroot) {
 /* Enable the nginx FastCGI cache for a site: inject the three fragments into the
    vhost, create the cache dir, install+activate the purge plugin, test & reload.
    Reverts the vhost on a failed `nginx -t`. Returns array(error, success, log). */
-function wp_nginx_cache_enable($ini, $user, $domain, $docroot) {
+function wp_nginx_cache_enable($ini, $user, $domain, $docroot, $zone = null) {
 	$log = '';
 	if(!wp_is_nginx($ini))
 		return array('error' => 'This server does not use nginx, so the FastCGI cache is not available.', 'success' => '', 'log' => '');
+	if(web_backend($ini) !== 'none')
+		return array('error' => 'The nginx cache needs nginx to run PHP itself; with Apache behind nginx it is not available yet.', 'success' => '', 'log' => '');
 
 	$path = wp_nginx_conf_path($domain);
 	$orig = wp_read_conf($path);
@@ -2317,9 +2941,10 @@ function wp_nginx_cache_enable($ini, $user, $domain, $docroot) {
 	if(strpos($orig, '# BEGIN reqad-nginx-cache') !== false)
 		return array('error' => '', 'success' => 'Nginx cache is already enabled.', 'log' => '');
 
-	$zone = wp_cache_zone($user);
+	/* the zone: wordpress_tool_ctx() gives one per site (an account's sites must not share one) */
+	$zone = $zone ?? wp_cache_zone($user);
 	$ip   = reqad_server_ip();
-	$frag = wp_nginx_cache_fragments($zone, $ip);
+	$frag = wp_nginx_cache_fragments($zone, $ip, wp_cache_rules_get($domain));
 
 	// 1) http-context block at the very top of the file (conf.d is http context).
 	$new = $frag['http']."\n".$orig;
@@ -2380,7 +3005,7 @@ function wp_nginx_cache_enable($ini, $user, $domain, $docroot) {
 
 /* Disable the nginx cache: strip the three marker blocks, test & reload, empty
    the cache dir and deactivate the purge plugin. Returns array(error, success, log). */
-function wp_nginx_cache_disable($ini, $user, $domain, $docroot) {
+function wp_nginx_cache_disable($ini, $user, $domain, $docroot, $zone = null) {
 	$log = '';
 	if(!wp_is_nginx($ini))
 		return array('error' => 'This server does not use nginx.', 'success' => '', 'log' => '');
@@ -2412,7 +3037,9 @@ function wp_nginx_cache_disable($ini, $user, $domain, $docroot) {
 	shell_exec('sudo systemctl reload nginx 2>&1');
 
 	// Clear the cache store and deactivate the plugin (leave it installed).
-	$zone = wp_cache_zone($user);
+	if(preg_match('/keys_zone=([a-z0-9_]+):/', $orig, $zm))
+		$zone = $zm[1];
+	$zone = preg_replace('/[^a-z0-9_]/', '', (string)($zone ?? wp_cache_zone($user)));
 	if($zone !== '')
 		shell_exec('sudo rm -rf /var/cache/nginx/fcgi-'.escapeshellarg($zone).'/* 2>/dev/null');
 	// Deactivate the canonical slug, plus any branch-suffixed copy left behind by
@@ -2427,21 +3054,9 @@ function wp_nginx_cache_disable($ini, $user, $domain, $docroot) {
 	return array('error' => '', 'success' => 'Nginx FastCGI cache disabled and nginx reloaded.', 'log' => $log);
 }
 
-/* --- Disable WP-Cron ----------------------------------------------------- */
-
-/* Marker appended to the crontab line so we can find/remove exactly our entry. */
-function wp_cron_marker($user) {
-	return '# reqad-wpcron-'.wp_cache_zone($user);
-}
-
-/* The full crontab line for the "Disable WP-Cron" system cron. Output goes to
-   ~/logs/cron.log (the account's own logs dir, created with the account) instead
-   of /dev/null, so a wp-cli that cannot start -- e.g. PHP dying on a broken
-   OPcache ini -- leaves a trace instead of silently running nothing. */
-function wp_cron_line($user, $docroot) {
-	return '*/2 * * * * /usr/local/bin/wp cron event run --due-now --path='.$docroot
-	     . ' >> /home/'.$user.'/logs/cron.log 2>&1 '.wp_cron_marker($user);
-}
+/* Disable WP-Cron, search engine indexing, maintenance mode, the must-use
+   plugins and file permissions: app/functions/wordpress_tools.php (as the
+   account, per install), for both panels. */
 
 /* Run one wp-cli command as $user. Returns array('out' => string, 'rc' => int).
    stderr is folded into the output and the exit status is kept, because PHP can
@@ -2469,115 +3084,35 @@ function wp_cli_error($r) {
 		return 'PHP itself cannot start on this server: OPcache is misconfigured. '
 		     . 'opcache.interned_strings_buffer must be well below opcache.memory_consumption. '
 		     . 'Fix it under PHP Settings, then restart php-fpm.';
-	if(stripos($out, 'Fatal Error') !== false || stripos($out, 'PHP Fatal') !== false)
-		return 'wp-cli could not start: '.trim((string)strtok($out, "\n"));
+	if($r['rc'] === 124 || $r['rc'] === 137)
+		return 'wp-cli did not finish in time and was stopped. The site may be stuck: its code waits for another server or runs in a loop.';
+	if(stripos($out, 'establishing a database connection') !== false)
+		return 'WordPress cannot connect to its database. Check DB_NAME, DB_USER, DB_PASSWORD and DB_HOST in wp-config.php, and that the database and its user still exist.';
+	if(stripos($out, 'does not seem to be a WordPress installation') !== false)
+		return 'There is no complete WordPress in this folder (wp-config.php or the WordPress files are missing).';
+	/* the PHP error itself, without its stack trace; homes as ~/ */
+	if(preg_match('/PHP (Fatal|Parse) error:\s*(?:Uncaught\s+)?(.+)$/mi', $out, $m) || preg_match('/^(Fatal|Parse) error:\s*(?:Uncaught\s+)?(.+)$/mi', $out, $m)) {
+		$msg = preg_replace(array('/\s*Stack trace:.*$/s', '/^Error:\s*/'), '', trim($m[2]));
+		$msg = preg_replace('~/home/[A-Za-z0-9_.-]+/~', '~/', $msg);
+		/* wp-cli runs wp-config.php through eval() */
+		$msg = preg_replace('~ in phar://\S+Runner\.php\(\d+\) : eval\(\)\'d code on line (\d+)~', ' in wp-config.php, around line $1', $msg);
+		return 'WordPress stops with a PHP error: '.(mb_strlen($msg) > 400 ? mb_substr($msg, 0, 400).'…' : $msg);
+	}
+	if(stripos($out, 'critical error on this website') !== false)
+		return 'WordPress stops with a PHP error (in a plugin, the theme or its own files); wp-cli did not say which.';
 	if(trim($out) === '')
 		return 'wp-cli failed (exit '.$r['rc'].') with no output.';
 	return trim($out);
 }
 
-/* Live state of the "Disable WP-Cron" option: 'on' | 'off'. Considered ON only
-   when BOTH the DISABLE_WP_CRON constant is true AND our system cron is present. */
-function wp_wpcron_state($user, $docroot) {
-	$get = wp_cli_run($user, 'config get DISABLE_WP_CRON --path='.escapeshellarg($docroot));
-	$has = $get['rc'] === 0 ? trim($get['out']) : '';
-	$const_on = in_array(strtolower($has), array('1', 'true'), true);
-	$cron_on  = ((int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg(wp_cron_marker($user)).' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null'))) > 0;
-	return ($const_on && $cron_on) ? 'on' : 'off';
-}
-
-/* Enable "Disable WP-Cron": set the constant and install an every-2-minutes system
-   cron that runs due events via wp-cli. Both steps are idempotent. */
-function wp_wpcron_enable($user, $docroot) {
-	$log = '';
-	// 1) Constant. `wp config set` updates in place if it already exists.
-	$has = wp_cli_run($user, 'config has DISABLE_WP_CRON --path='.escapeshellarg($docroot));
-	if($has['rc'] === 0)
-		$log .= "DISABLE_WP_CRON already present in wp-config.php.\n";
-	$set = wp_cli_run($user, 'config set DISABLE_WP_CRON true --raw --type=constant --path='.escapeshellarg($docroot));
-	$log .= $set['out']."\n";
-	/* Bail out BEFORE installing the cron. wp-cli exiting non-zero (or dying in
-	   PHP startup) used to fall through to step 2, so the site ended up with a
-	   system cron and no DISABLE_WP_CRON constant -- double cron runs -- while
-	   the panel reported success. */
-	$err = wp_cli_error($set);
-	if($err === '' && stripos($set['out'], 'Error:') !== false)
-		$err = trim($set['out']);
-	if($err !== '')
-		return array('error' => 'Could not update wp-config.php: '.$err, 'success' => '', 'log' => $log);
-
-	// 2) System cron (per-user spool). Skip if our exact line is already there;
-	// a marked line in an older form (>/dev/null, before cron.log) is replaced.
-	$marker = wp_cron_marker($user);
-	$line   = wp_cron_line($user, $docroot);
-	$spool  = '/var/spool/cron/'.escapeshellarg($user);
-	$cur    = trim((string)shell_exec('sudo grep -F '.escapeshellarg($marker).' '.$spool.' 2>/dev/null'));
-	if($cur === $line) {
-		$log .= "System cron already present.\n";
-	} else {
-		if($cur !== '') {
-			// same bare-slug delete as wp_wpcron_disable()
-			shell_exec('sudo sed -i '.escapeshellarg('/reqad-wpcron-'.wp_cache_zone($user).'/d').' '.$spool.' 2>/dev/null');
-			$log .= "Replaced the previous wp-cron system cron line.\n";
-		}
-		// logs/ exists on accounts created by the panel; make sure, as the user,
-		// or the >> redirect fails and the job never runs.
-		shell_exec('sudo -u '.escapeshellarg($user).' mkdir -p '.escapeshellarg('/home/'.$user.'/logs').' 2>/dev/null');
-		shell_exec('echo '.escapeshellarg($line).' | sudo tee --append '.$spool.' > /dev/null');
-		shell_exec('sudo chown '.escapeshellarg($user).': '.$spool.' 2>/dev/null');
-		shell_exec('sudo chmod 600 '.$spool.' 2>/dev/null');
-		$log .= "Installed */2 wp-cron system cron (output: ~/logs/cron.log).\n";
-	}
-
-	log_debug('[wp-manage] wp-cron disabled (system cron installed) for '.$user);
-	return array('error' => '', 'success' => 'WP-Cron disabled — a system cron now runs due events every 2 minutes.', 'log' => $log);
-}
-
-/* Disable the option again: remove the constant and our system cron line. */
-function wp_wpcron_disable($user, $docroot) {
-	$log = '';
-	$has = wp_cli_run($user, 'config has DISABLE_WP_CRON --path='.escapeshellarg($docroot));
-	if($has['rc'] === 0) {
-		$del = wp_cli_run($user, 'config delete DISABLE_WP_CRON --path='.escapeshellarg($docroot));
-		$log .= $del['out']."\n";
-		/* Leaving the constant behind while we drop the cron would stop cron
-		   entirely for the site, so report it instead of claiming success. */
-		$err = wp_cli_error($del);
-		if($err !== '')
-			return array('error' => 'Could not update wp-config.php: '.$err, 'success' => '', 'log' => $log);
-	}
-	// Remove our marked crontab line. Match the bare marker slug (no '#', no
-	// slashes) so '/'-delimited sed is safe.
-	$slug = 'reqad-wpcron-'.wp_cache_zone($user);
-	shell_exec('sudo sed -i '.escapeshellarg('/'.$slug.'/d').' /var/spool/cron/'.escapeshellarg($user).' 2>/dev/null');
-	$log .= "Removed system cron.\n";
-
-	log_debug('[wp-manage] wp-cron re-enabled (system cron removed) for '.$user);
-	return array('error' => '', 'success' => 'WP-Cron re-enabled — the system cron was removed.', 'log' => $log);
-}
-
-/* Performance-tab status for a site. Looks the account up in `wordpress` by
-   user, so the caller only supplies a (validated) username. Returns null if the
-   user is not a tracked WordPress install. Pass a wp_site_probe() result to
-   avoid a second wp-cli round trip. */
+/* Performance-tab status of an account's tracked install (2087's site page,
+   one per account): core's wordpress_tools_status(). null when the account
+   has no tracked install. $probe: a wp_site_probe() result, if at hand. */
 function wp_manage_status($db, $ini, $user, $probe = null) {
 	$row = wp_site_row($db, $user);
 	if(!$row) return null;
-	$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
-	if($probe === null)
-		$probe = wp_site_probe($row['user'], $docroot);
-	$wp_ok = ($probe['error'] ?? 'x') === '';
-	$cron_on = ((int)trim((string)shell_exec('sudo grep -cF '.escapeshellarg(wp_cron_marker($row['user'])).' /var/spool/cron/'.escapeshellarg($row['user']).' 2>/dev/null'))) > 0;
-	return array(
-		'user'        => $row['user'],
-		'domain'      => $row['domain'],
-		'is_nginx'    => wp_is_nginx($ini),
-		'nginx_cache' => wp_nginx_cache_state($ini, $row['domain']),
-		// same rule as wp_wpcron_state(): constant AND our system cron
-		'wp_cron'     => $wp_ok ? (($probe['disable_wp_cron'] && $cron_on) ? 'on' : 'off') : 'na',
-		'indexing'    => $wp_ok ? ($probe['blog_public'] === '0' ? 'off' : 'on') : 'na',
-		'maintenance' => wp_maintenance_state($docroot),
-	);
+	$st = wordpress_tools_status($row, $probe);
+	return array('user' => $row['user'], 'domain' => $row['domain'], 'is_nginx' => wp_is_nginx($ini)) + $st['data']['performance'];
 }
 
 /* --- WP Toolkit site page (/wp-toolkit/<user>/) --------------------------- */
@@ -2642,6 +3177,9 @@ $up  = get_site_transient('update_plugins');
 $weak = 0;
 foreach (array('AUTH_KEY','SECURE_AUTH_KEY','LOGGED_IN_KEY','NONCE_KEY','AUTH_SALT','SECURE_AUTH_SALT','LOGGED_IN_SALT','NONCE_SALT') as $k)
 	if (!defined($k) || strlen(constant($k)) < 32 || constant($k) === 'put your unique phrase here') $weak++;
+/* WPS Hide Login's own address: /<slug>/ with pretty permalinks, /?<slug> without */
+$whl = (string)get_option('whl_page');
+$ps = (string)get_option('permalink_structure');
 echo "\n##REQAD##".json_encode(array(
 	'wp_version'      => get_bloginfo('version'),
 	'title'           => get_bloginfo('name'),
@@ -2660,7 +3198,11 @@ echo "\n##REQAD##".json_encode(array(
 	'blog_public'     => (string)get_option('blog_public'),
 	'weak_salts'      => $weak,
 	'hide_login'      => is_plugin_active('wps-hide-login/wps-hide-login.php'),
-	'login_slug'      => (string)get_option('whl_page'),
+	'login_slug'      => $whl,
+	'login_url'       => $whl === '' ? '' : home_url('/').($ps !== '' ? $whl.(substr($ps, -1) === '/' ? '/' : '') : '?'.$whl),
+	'maintenance'     => is_file((defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR.'/mu-plugins').'/reqad-maintenance.php'),
+	'hide_version'    => is_file((defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR.'/mu-plugins').'/reqad-hide-version.php'),
+	'mu_dir'          => defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR.'/mu-plugins',
 ));
 EOT;
 	// --skip-plugins: everything read here is options, constants and plugin
@@ -2692,82 +3234,12 @@ function wp_site_probe_cached($user) {
 
 /* Empty a site's nginx FastCGI cache (no-op when there is none). Used when an
    option changes what anonymous visitors must see (maintenance, robots.txt). */
-function wp_nginx_cache_purge_all($user) {
-	$zone = wp_cache_zone($user);
+/* $zone: a site's cache zone, or an account name - then every site of the account
+   (their zones are <account> and <account>_<hash>, wordpress_tool_ctx()) */
+function wp_nginx_cache_purge_all($zone) {
+	$zone = preg_replace('/[^a-z0-9_]/', '', strtolower((string)$zone));
 	if($zone !== '')
-		shell_exec('sudo rm -rf /var/cache/nginx/fcgi-'.escapeshellarg($zone).'/* 2>/dev/null');
-}
-
-/* --- Search engine indexing (Settings > Reading > "Discourage search engines") */
-
-function wp_indexing_set($user, $docroot, $enable) {
-	$r = wp_cli_run($user, 'option update blog_public '.($enable ? '1' : '0').' --path='.escapeshellarg($docroot));
-	$err = wp_cli_error($r);
-	if($err !== '')
-		return array('error' => 'Could not change search engine indexing: '.$err, 'success' => '', 'log' => $r['out']);
-	wp_nginx_cache_purge_all($user);   // robots.txt is generated by WP and may be cached
-	return array('error' => '', 'log' => $r['out'],
-		'success' => $enable ? 'Search engines may now index the site.' : 'Search engines are now asked not to index the site.');
-}
-
-/* --- Maintenance mode ----------------------------------------------------
-   A must-use plugin rather than WordPress's own .maintenance file: that one
-   expires after 10 minutes and locks the admin out too. This one answers
-   visitors with a 503 + Retry-After while logged-in editors (and wp-login,
-   wp-admin, cron, REST) keep working, so the panel's Login button still does. */
-
-function wp_maintenance_file($docroot) {
-	return $docroot.'/wp-content/mu-plugins/reqad-maintenance.php';
-}
-
-function wp_maintenance_state($docroot) {
-	return trim((string)shell_exec('sudo test -f '.escapeshellarg(wp_maintenance_file($docroot)).' && echo on')) === 'on' ? 'on' : 'off';
-}
-
-function wp_maintenance_set($user, $docroot, $enable) {
-	$file = wp_maintenance_file($docroot);
-	$asuser = 'sudo -u '.escapeshellarg($user).' ';
-	if($enable) {
-		$src = _PATH.'/scripts/templates/wordpress-maintenance.php';
-		shell_exec($asuser.'mkdir -p '.escapeshellarg(dirname($file)).' 2>&1');
-		// cat as root into a file created by the user, so ownership stays the tenant's
-		shell_exec('sudo cat '.escapeshellarg($src).' | '.$asuser.'tee '.escapeshellarg($file).' > /dev/null');
-	} else {
-		shell_exec('sudo rm -f '.escapeshellarg($file));
-	}
-	wp_nginx_cache_purge_all($user);   // cached pages would otherwise bypass it
-	if(wp_maintenance_state($docroot) !== ($enable ? 'on' : 'off'))
-		return array('error' => 'Could not '.($enable ? 'create' : 'remove').' '.$file.'.', 'success' => '', 'log' => '');
-	return array('error' => '', 'log' => '',
-		'success' => $enable ? 'Maintenance mode is on — visitors get a "back soon" page, logged-in users see the site.'
-		                     : 'Maintenance mode is off.');
-}
-
-/* --- Reqad must-use plugins ------------------------------------------------
-   Small single-file plugins copied from scripts/templates/ into the site's
-   wp-content/mu-plugins/ (always loaded, cannot be disabled from wp-admin).
-   The file's presence is the state. Written through the site user so it
-   stays tenant-owned. */
-
-function wp_muplugin_path($docroot, $file) {
-	return $docroot.'/wp-content/mu-plugins/'.$file;
-}
-
-function wp_muplugin_state($docroot, $file) {
-	return trim((string)shell_exec('sudo test -f '.escapeshellarg(wp_muplugin_path($docroot, $file)).' && echo on')) === 'on' ? 'on' : 'off';
-}
-
-/* Returns '' or an error. */
-function wp_muplugin_set($user, $docroot, $file, $src, $enable) {
-	$dst = wp_muplugin_path($docroot, $file);
-	if($enable) {
-		$asuser = 'sudo -u '.escapeshellarg($user).' ';
-		shell_exec($asuser.'mkdir -p '.escapeshellarg(dirname($dst)).' 2>&1');
-		shell_exec('sudo cat '.escapeshellarg(_PATH.'/scripts/templates/'.$src).' | '.$asuser.'tee '.escapeshellarg($dst).' > /dev/null');
-	} else {
-		shell_exec('sudo rm -f '.escapeshellarg($dst));
-	}
-	return wp_muplugin_state($docroot, $file) === ($enable ? 'on' : 'off') ? '' : 'Could not '.($enable ? 'create' : 'remove').' '.$dst.'.';
+		shell_exec('sudo sh -c '.escapeshellarg('rm -rf /var/cache/nginx/fcgi-'.$zone.'/* /var/cache/nginx/fcgi-'.$zone.'_*/*').' 2>/dev/null');
 }
 
 /* --- Site screenshot -----------------------------------------------------
@@ -3053,10 +3525,10 @@ function wp_sec_nginx_rules($key, $p, $ctx = array()) {
 			return "location ~* ^$p/(readme\.html|license\.txt|wp-config-sample\.php|wp-admin/(install|setup-config)\.php)\$ { return 404; }\n"
 			     . "location ~ /\.(?!well-known/) { return 404; }\n"
 			     . "location ~* (\.(sql|sql\.gz|bak|old|orig|save|swp|swo|log|ini|sh|inc|dist)|~)\$ { return 404; }";
+		/* server level (wp_sec_server_body()): an `if` in `location /` does not reach
+		   the nested locations, such as a WordPress folder's (reqad-wp-folders) */
 		case 'author_scans':
-			return "if (\$arg_author ~ \"^[0-9]\") { return 404; }";
 		case 'bad_bots':
-			return "if (\$http_user_agent ~* \"(AhrefsBot|AhrefsSiteAudit|SemrushBot|MJ12bot|DotBot|BLEXBot|SEOkicks|dataforseo|rogerbot|serpstatbot|SeekportBot|Timpibot|Bytespider|PetalBot|MegaIndex|Barkrowler)\") { return 404; }";
 		case 'security_headers':
 			return "# server-level: ".wp_sec_server_path($ctx['domain'] ?? '');
 		case 'admin_ip_allow':
@@ -3074,6 +3546,23 @@ function wp_sec_nginx_rules($key, $p, $ctx = array()) {
 	return '';
 }
 
+/* The URL prefix (a regex) of a domain's Security rules: its one install's
+   folder, or any folder when the domain has several installs (the rules are
+   per vhost, so they must cover all of them). null when a folder cannot go
+   into a regex. */
+function wp_sec_domain_prefix($domain, $path) {
+	global $db;
+	$paths = array();
+	$stmt = $db->prepare('SELECT path FROM wordpress WHERE lower(domain) = :d');
+	$stmt->bindValue(':d', strtolower((string)$domain), SQLITE3_TEXT);
+	$res = $stmt->execute();
+	while($res && ($r = $res->fetchArray(SQLITE3_ASSOC)))
+		$paths[trim((string)$r['path'], '/')] = true;
+	if(count($paths) > 1)
+		return '(?:/.*)?';
+	return wp_site_url_prefix($paths ? array_keys($paths)[0] : $path);
+}
+
 function wp_sec_inc_path($domain) {
 	return WP_SEC_INC_DIR.'/'.$domain.'.conf';
 }
@@ -3089,12 +3578,27 @@ function wp_sec_server_line($domain) {
 	return '	include '.wp_sec_server_path($domain).'; # reqad-wp-security-server';
 }
 
-function wp_sec_server_body() {
-	return "# Managed by the Reqad WP Toolkit (Security tab) — changes here are overwritten.\n"
+/* The measures that must sit at server level */
+function wp_sec_server_keys() {
+	return array('security_headers', 'author_scans', 'bad_bots');
+}
+
+function wp_sec_server_body($keys = array('security_headers')) {
+	$b = "# Managed by the Reqad WP Toolkit (Security tab) — changes here are overwritten.\n";
+	if(in_array('author_scans', $keys, true))
+		$b .= "if (\$arg_author ~ \"^[0-9]\") { return 404; }\n";
+	if(in_array('bad_bots', $keys, true))
+		$b .= "if (\$http_user_agent ~* \"(AhrefsBot|AhrefsSiteAudit|SemrushBot|MJ12bot|DotBot|BLEXBot|SEOkicks|dataforseo|rogerbot|serpstatbot|SeekportBot|Timpibot|Bytespider|PetalBot|MegaIndex|Barkrowler)\") { return 404; }\n";
+	if(!in_array('security_headers', $keys, true))
+		return $b;
+	return $b
 	     . "# Drop the copies PHP (WordPress, plugins) may send, so each header appears once.\n"
 	     . "fastcgi_hide_header Strict-Transport-Security;\n"
 	     . "fastcgi_hide_header X-Frame-Options;\n"
 	     . "fastcgi_hide_header X-Content-Type-Options;\n"
+	     . "proxy_hide_header Strict-Transport-Security;\n"
+	     . "proxy_hide_header X-Frame-Options;\n"
+	     . "proxy_hide_header X-Content-Type-Options;\n"
 	     . "add_header Strict-Transport-Security \"max-age=31536000\" always;\n"
 	     . "add_header X-Frame-Options \"SAMEORIGIN\" always;\n"
 	     . "add_header X-Content-Type-Options \"nosniff\" always;\n";
@@ -3189,7 +3693,8 @@ function wp_sec_php_handler($vhost) {
 		if(strpos($t, '{') !== false || strpos($t, '}') !== false) return '';   // nested blocks: too custom to copy
 		$out .= "    $t\n";
 	}
-	return (strpos($out, 'fastcgi_pass') !== false) ? $out : '';
+	/* fastcgi_pass, or the proxy to Apache behind nginx (nginx_backend_root()) */
+	return (strpos($out, 'fastcgi_pass') !== false || strpos($out, 'reqad-backend.conf') !== false) ? $out : '';
 }
 
 /* Pure text step of wp_sec_nginx_apply(): new vhost + both include bodies
@@ -3219,19 +3724,20 @@ function wp_sec_nginx_render($orig_v, $domain, $p, $keys, $ips) {
 	$out = array(); $done = false;
 	foreach(explode("\n", $new_v) as $ln) {
 		$out[] = $ln;
-		if(!$done && preg_match('#^\s*try_files\s+\$uri\s+\$uri/\s+/index\.php#', $ln)) {
+		/* nginx_php-fpm: after try_files; Apache behind nginx: after the proxy include */
+		if(!$done && preg_match('#^\s*(try_files\s+\$uri\s+\$uri/\s+/index\.php|include\s+/etc/nginx/reqad-backend\.conf;)#', $ln)) {
 			$out[] = wp_sec_include_line($domain);
 			$done = true;
 		}
 	}
 	if(!$done)
-		return array('Could not find the `try_files ... /index.php` line in the vhost to attach the security rules.', '', '', '', '');
+		return array('Could not find the `try_files ... /index.php` line (or the Apache include) in the vhost to attach the security rules.', '', '', '', '');
 	$new_v = implode("\n", $out);
 
-	// security headers: server level, after the HTTPS server's `index` line
-	// (the port-80 server only redirects and has none)
+	// security headers, author scans, crawlers: server level, after the HTTPS
+	// server's `index` line (the port-80 server only redirects and has none)
 	$srv = '';
-	if(in_array('security_headers', $keys, true)) {
+	if(array_intersect(wp_sec_server_keys(), $keys)) {
 		$out = array(); $done = false;
 		foreach(explode("\n", $new_v) as $ln) {
 			$out[] = $ln;
@@ -3243,7 +3749,7 @@ function wp_sec_nginx_render($orig_v, $domain, $p, $keys, $ips) {
 		if(!$done)
 			return array('Could not find the `index` line in the vhost to attach the security headers.', '', '', '', '');
 		$new_v = implode("\n", $out);
-		$srv = wp_sec_server_body();
+		$srv = wp_sec_server_body($keys);
 	}
 
 	if($http !== '')
@@ -3254,7 +3760,7 @@ function wp_sec_nginx_render($orig_v, $domain, $p, $keys, $ips) {
 /* Rewrite the site's includes to exactly $keys (wiring/unwiring the vhost),
    test, reload — or put all three files back if nginx rejects the result. */
 function wp_sec_nginx_apply($user, $domain, $path, $keys, $ips = array()) {
-	$p = wp_site_url_prefix($path);
+	$p = wp_sec_domain_prefix($domain, $path);
 	if($p === null)
 		return array('error' => 'Unsupported install path: '.$path, 'log' => '');
 	$vhost = wp_nginx_conf_path($domain);
@@ -3304,41 +3810,10 @@ function wp_sec_restore_inc($inc, $content) {
 	else wp_write_conf($inc, $content);
 }
 
-/* Anything world-writable under the docroot? (stops at the first hit) */
-function wp_sec_world_writable($docroot) {
-	return trim((string)shell_exec('sudo find '.escapeshellarg($docroot).' -perm -0002 ! -type l -print -quit 2>/dev/null')) !== '';
-}
-
-function wp_sec_permissions_state($ini, $docroot) {
-	if(!wp_is_nginx($ini)) return 'na';   // mod_php reads wp-config.php as apache
-	$mode = trim((string)shell_exec('sudo stat -c %a '.escapeshellarg($docroot.'/wp-config.php').' 2>/dev/null'));
-	if($mode === '') return 'na';          // wp-config.php kept outside the docroot
-	return (in_array($mode, array('400', '600'), true) && !wp_sec_world_writable($docroot)) ? 'on' : 'off';
-}
-
-/* State of every Security option: 'on' | 'off' | 'na'. $probe = wp_site_probe(). */
+/* State of every Security option: 'on' | 'off' | 'na' (core's wordpress_tools_status()). */
 function wp_security_status($ini, $row, $probe) {
-	$docroot = wp_site_docroot($row['user'], $row['path'] ?? '');
-	$nginx   = wp_is_nginx($ini) ? wp_sec_nginx_enabled($row['domain']) : null;
-	$wp_ok   = ($probe['error'] ?? 'x') === '';
-	$st = array();
-	foreach(wp_security_options() as $k => $o) {
-		switch($o['type']) {
-			case 'nginx': $st[$k] = ($nginx === null) ? 'na' : (in_array($k, $nginx, true) ? 'on' : 'off'); break;
-			case 'muplugin': $st[$k] = wp_muplugin_state($docroot, $o['file']); break;
-			default:      $st[$k] = 'na';
-		}
-	}
-	if($wp_ok) {
-		$st['file_edit']           = $probe['file_edit_off'] ? 'on' : 'off';
-		$st['concatenate_scripts'] = $probe['concat_off'] ? 'on' : 'off';
-		// WordPress only allows pings when the value is exactly 'open' ('' counts as closed)
-		$st['pingbacks']           = ($probe['ping_status'] !== 'open' && $probe['pingback_flag'] !== '1') ? 'on' : 'off';
-		$st['hide_login']          = $probe['hide_login'] ? 'on' : 'off';
-		$st['security_keys']       = ((int)$probe['weak_salts'] === 0) ? 'on' : 'off';
-	}
-	$st['permissions'] = wp_sec_permissions_state($ini, $docroot);
-	return $st;
+	$st = wordpress_tools_status($row, $probe);
+	return $st['data']['security'];
 }
 
 /* Validated custom login slug, or '' when unusable. */
@@ -3349,123 +3824,10 @@ function wp_login_slug_valid($slug) {
 	return $slug;
 }
 
-/* Apply the Security tab: $want = keys the admin left ticked. Only options whose
-   state actually differs are touched; nginx changes go in one reload.
-   Returns array(error => [..], log => string). */
+/* Apply the Security tab (core's wordpress_security_apply()). Returns array(error => [..], log => string). */
 function wp_security_apply($ini, $row, $want, $login_slug, $regen_keys, $allow_ips = array()) {
-	$user    = $row['user'];
-	$docroot = wp_site_docroot($user, $row['path'] ?? '');
-	$wpp     = ' --path='.escapeshellarg($docroot);
-	$probe   = wp_site_probe($user, $docroot);
-	$cur     = wp_security_status($ini, $row, $probe);
-	$opts    = wp_security_options();
-	$errors  = array();
-	$log     = '';
-
-	$on = function($k) use ($want) { return in_array($k, $want, true); };
-	$wp = function($args, $what) use ($user, $wpp, &$errors, &$log) {
-		$r = wp_cli_run($user, $args.$wpp);
-		$log .= '$ wp '.$args."\n".$r['out']."\n";
-		$e = wp_cli_error($r);
-		if($e !== '') $errors[] = $what.': '.$e;
-		return $e === '';
-	};
-
-	// 1) nginx rules, all at once
-	if($on('admin_ip_allow') && $on('hide_login')) {
-		// WPS Hide Login serves the login form from index.php at the new URL,
-		// which an nginx rule on /wp-login.php never sees — pick one
-		return array('error' => array('Choose either "Hide wp-admin" or "Allow login only from these IPs" — with a hidden login URL the IP rule would not apply.'), 'log' => '');
-	}
-	if(wp_is_nginx($ini)) {
-		$ips = array();
-		foreach($allow_ips as $ip) {
-			if(trim($ip) === '') continue;
-			$v = wp_sec_valid_ip($ip);
-			if($v === '') return array('error' => array('Not a valid IP address or range: '.$ip), 'log' => '');
-			$ips[] = $v;
-		}
-		$ips = array_values(array_unique($ips));
-		$nk_cur = array(); $nk_want = array();
-		foreach($opts as $k => $o) {
-			if($o['type'] !== 'nginx') continue;
-			if($cur[$k] === 'on') $nk_cur[] = $k;
-			if($on($k)) $nk_want[] = $k;
-		}
-		/* Always re-render: besides a changed selection, this rewrites rules
-		   written by an older Reqad (e.g. 403 -> 404). An identical result is
-		   a no-op without nginx test or reload. */
-		{
-			$r = wp_sec_nginx_apply($user, $row['domain'], $row['path'] ?? '', $nk_want, $ips);
-			$log .= $r['log'];
-			if($r['error'] !== '') $errors[] = $r['error'];
-		}
-	}
-
-	if(($probe['error'] ?? '') !== '') {
-		$errors[] = 'WordPress options were not changed: '.$probe['error'];
-	} else {
-		// 2) wp-config constants
-		if($on('file_edit') && $cur['file_edit'] !== 'on')
-			$wp('config set DISALLOW_FILE_EDIT true --raw --type=constant', 'Disable file editing');
-		if(!$on('file_edit') && $cur['file_edit'] === 'on')
-			$wp('config delete DISALLOW_FILE_EDIT', 'Disable file editing');
-		if($on('concatenate_scripts') && $cur['concatenate_scripts'] !== 'on')
-			$wp('config set CONCATENATE_SCRIPTS false --raw --type=constant', 'Script concatenation');
-		if(!$on('concatenate_scripts') && $cur['concatenate_scripts'] === 'on')
-			$wp('config delete CONCATENATE_SCRIPTS', 'Script concatenation');
-
-		// 3) pingbacks
-		if($on('pingbacks') !== ($cur['pingbacks'] === 'on')) {
-			/* update_option() through eval, not `wp option update`: wp-cli runs the
-			   CURRENT value through sanitize_option() before comparing, which turns
-			   a stored '' into 'closed' — it then reports "unchanged" and writes
-			   nothing. Core update_option() compares the raw value. */
-			$ping = $on('pingbacks') ? 'closed' : 'open';
-			$flag = $on('pingbacks') ? '0' : '1';
-			$wp('eval '.escapeshellarg('update_option("default_ping_status", "'.$ping.'"); update_option("default_pingback_flag", "'.$flag.'");'
-				.' echo "default_ping_status=", get_option("default_ping_status"), " default_pingback_flag=", get_option("default_pingback_flag"), "\n";'), 'Pingbacks');
-		}
-
-		// 4) hidden login URL (WPS Hide Login)
-		if($on('hide_login')) {
-			$slug = wp_login_slug_valid($login_slug);
-			if($slug === '')
-				$errors[] = 'Hide wp-admin: the login URL must be 4-40 characters of a-z, 0-9 and dashes, and not a WordPress path.';
-			elseif($cur['hide_login'] !== 'on') {
-				if($wp('plugin install wps-hide-login --activate', 'Hide wp-admin'))
-					$wp('option update whl_page '.escapeshellarg($slug), 'Hide wp-admin');
-			} elseif($slug !== $probe['login_slug'])
-				$wp('option update whl_page '.escapeshellarg($slug), 'Hide wp-admin');
-		} elseif($cur['hide_login'] === 'on') {
-			$wp('plugin uninstall wps-hide-login --deactivate', 'Hide wp-admin');
-		}
-
-		// 4b) must-use plugins
-		foreach($opts as $k => $o) {
-			if($o['type'] !== 'muplugin' || $on($k) === ($cur[$k] === 'on')) continue;
-			$e = wp_muplugin_set($user, $docroot, $o['file'], $o['src'], $on($k));
-			$log .= ($on($k) ? 'Installed ' : 'Removed ').'mu-plugin '.$o['file']."\n";
-			if($e !== '') $errors[] = $o['label'].': '.$e;
-		}
-
-		// 5) keys — one-way
-		if(($on('security_keys') && $cur['security_keys'] !== 'on') || $regen_keys)
-			$wp('config shuffle-salts', 'Security keys');
-	}
-
-	// 6) permissions — one-way
-	if($on('permissions') && $cur['permissions'] === 'off') {
-		$asuser = 'sudo -u '.escapeshellarg($user).' ';
-		$log .= (string)shell_exec($asuser.'chmod 600 '.escapeshellarg($docroot.'/wp-config.php').' 2>&1');
-		$log .= (string)shell_exec($asuser.'find '.escapeshellarg($docroot).' -perm -0002 ! -type l -exec chmod o-w {} + 2>&1');
-		if(wp_sec_permissions_state($ini, $docroot) !== 'on')
-			$errors[] = 'Permissions: some files could not be fixed (owned by another user?).';
-		$log .= "Permissions tightened.\n";
-	}
-
-	log_debug('[wp-security] '.$user.' want='.implode(',', $want).' errors='.count($errors));
-	return array('error' => $errors, 'log' => $log);
+	$r = wordpress_security_apply($row, $want, array('login_slug' => $login_slug, 'regen_keys' => $regen_keys, 'allow_ips' => $allow_ips));
+	return array('error' => $r['ok'] ? array() : array($r['error']), 'log' => (string)($r['data']['log'] ?? ''));
 }
 
 /* ── Email filters (3-tier Sieve) ─────────────────────────────────────────────
@@ -3658,6 +4020,9 @@ function sieve_render_rules($rules, $is_admin_tier = false) {
 		if ($off && $is_admin_tier)
 			continue;
 		$disabled_prefix = $off ? 'false # ' : '';
+		/* the # comments out the rest of the line, so the brace of a disabled
+		   rule goes on the next line (as Roundcube writes it) */
+		$open = $off ? "\n{" : ' {';
 
 		$conds = json_decode(isset($r['conditions']) ? $r['conditions'] : '[]', true);
 		$acts  = json_decode(isset($r['actions'])    ? $r['actions']    : '[]', true);
@@ -3706,12 +4071,12 @@ function sieve_render_rules($rules, $is_admin_tier = false) {
 		$body[] = '# rule:[' . str_replace(array("\r", "\n", ']'), '', (string)$r['name']) . ']';
 
 		if (!$tests) {
-			$body[] = 'if ' . $disabled_prefix . 'true {';
+			$body[] = 'if ' . $disabled_prefix . 'true' . $open;
 		} else if (count($tests) === 1) {
-			$body[] = 'if ' . $disabled_prefix . $tests[0] . ' {';
+			$body[] = 'if ' . $disabled_prefix . $tests[0] . $open;
 		} else {
 			$join = (isset($r['match_type']) && $r['match_type'] === 'any') ? 'anyof' : 'allof';
-			$body[] = 'if ' . $disabled_prefix . $join . ' (' . implode(', ', $tests) . ') {';
+			$body[] = 'if ' . $disabled_prefix . $join . ' (' . implode(', ', $tests) . ')' . $open;
 		}
 		foreach ($lines as $l)
 			$body[] = $l;
@@ -3767,6 +4132,16 @@ function sieve_write_system($db, $scope, $target = '') {
 function sieve_user_get($email) {
 	$rc = 0;
 	$out = ef_helper(array('user-get', strtolower($email)), null, $rc);
+	return ($rc === 0) ? $out : '';
+}
+
+/* The same, read from the mailbox's home without doveadm (ef-helper
+   user-read); falls back to sieve_user_get() when the userdb has no home. */
+function sieve_user_read($email) {
+	$rc = 0;
+	$out = ef_helper(array('user-read', strtolower($email)), null, $rc);
+	if ($rc === 3)
+		return sieve_user_get($email);
 	return ($rc === 0) ? $out : '';
 }
 
@@ -5261,130 +5636,39 @@ function ef_valid_action_type($t) {
 		'setflag', 'removeflag', 'pipe'), true);
 }
 
-/* Build one rule row from $_POST. Returns the row, or false with $errmsg set. */
+/* Build one rule row from $_POST. Returns the row, or false with $errmsg set.
+   The checks are email_filter_rule()'s (app/functions/email_tools.php), shared
+   with the API. */
 function ef_rule_from_post(&$errmsg) {
-	$name = trim(isset($_POST['name']) ? $_POST['name'] : '');
-	if ($name === '' || strlen($name) > 120) {
-		$errmsg = 'Error: filter name must be 1-120 characters.';
-		return false;
-	}
-	/* The name is emitted inside a `# rule:[...]` header comment, so a newline
-	   or a ] would corrupt the script and break Roundcube's parser. */
-	if (strpbrk($name, "\r\n]") !== false) {
-		$errmsg = 'Error: filter name cannot contain a newline or a "]" character.';
-		return false;
-	}
-
-	$fields = isset($_POST['cond_field']) ? (array)$_POST['cond_field'] : array();
-	$ops    = isset($_POST['cond_op'])    ? (array)$_POST['cond_op']    : array();
-	$vals   = isset($_POST['cond_value']) ? (array)$_POST['cond_value'] : array();
-
+	$rows = function ($a, $b) {
+		$x = isset($_POST[$a]) ? (array)$_POST[$a] : array();
+		$y = isset($_POST[$b]) ? (array)$_POST[$b] : array();
+		return array($x, $y);
+	};
+	list($fields, $ops) = $rows('cond_field', 'cond_op');
+	$vals = isset($_POST['cond_value']) ? (array)$_POST['cond_value'] : array();
 	$conds = array();
-	for ($i = 0; $i < count($fields); $i++) {
-		$f = trim($fields[$i]);
-		$o = isset($ops[$i])  ? trim($ops[$i])  : '';
-		$v = isset($vals[$i]) ? (string)$vals[$i] : '';
-		if ($f === '' && $v === '')
-			continue;                       /* blank row the user left behind */
-		if (!ef_valid_field($f)) {
-			$errmsg = 'Error: "' . htmlspecialchars($f) . '" is not a valid header name.';
-			return false;
-		}
-		if (!ef_valid_op($o)) {
-			$errmsg = 'Error: unknown condition operator.';
-			return false;
-		}
-		if ($f === 'size') {
-			if (!ctype_digit(trim($v))) {
-				$errmsg = 'Error: a size condition needs a whole number of bytes.';
-				return false;
-			}
-			$v = trim($v);
-			if ($o !== 'over' && $o !== 'under')
-				$o = 'over';
-		} else if ($v === '') {
-			$errmsg = 'Error: condition on "' . htmlspecialchars($f) . '" has no value.';
-			return false;
-		}
-		if (strlen($v) > 1000) {
-			$errmsg = 'Error: condition value is too long (max 1000 characters).';
-			return false;
-		}
-		if ($o === 'regex' || $o === 'not-regex') {
-			/* Reject a pattern Sieve would refuse at compile time anyway, but do
-			   it here so the user gets a field-level message instead of a
-			   compiler dump. @ is not a delimiter that can appear unescaped. */
-			if (@preg_match('/' . str_replace('/', '\/', $v) . '/', '') === false) {
-				$errmsg = 'Error: that regular expression is not valid.';
-				return false;
-			}
-		}
-		$conds[] = array('field' => $f, 'op' => $o, 'value' => $v);
-	}
-
-	$atypes = isset($_POST['act_type'])  ? (array)$_POST['act_type']  : array();
-	$avals  = isset($_POST['act_value']) ? (array)$_POST['act_value'] : array();
-
+	for ($i = 0; $i < count($fields); $i++)
+		$conds[] = array('field' => trim((string)$fields[$i]), 'op' => isset($ops[$i]) ? trim((string)$ops[$i]) : '',
+		                 'value' => isset($vals[$i]) ? (string)$vals[$i] : '');
+	list($types, $avals) = $rows('act_type', 'act_value');
 	$acts = array();
-	for ($i = 0; $i < count($atypes); $i++) {
-		$t = trim($atypes[$i]);
-		$v = isset($avals[$i]) ? trim((string)$avals[$i]) : '';
-		if (!ef_valid_action_type($t)) {
-			$errmsg = 'Error: unknown action.';
-			return false;
-		}
-		if ($t === 'fileinto') {
-			if ($v === '') { $errmsg = 'Error: choose a folder to file into.'; return false; }
-			if (strpbrk($v, "\r\n") !== false || strlen($v) > 255) {
-				$errmsg = 'Error: folder name is not valid.'; return false;
-			}
-		} else if ($t === 'redirect') {
-			if (!valid_email_address(strtolower($v))) {
-				$errmsg = 'Error: redirect needs a valid email address.'; return false;
-			}
-			$v = strtolower($v);
-		} else if ($t === 'reject') {
-			if ($v === '') { $errmsg = 'Error: a reject action needs a message.'; return false; }
-			if (strlen($v) > 500) { $errmsg = 'Error: reject message is too long.'; return false; }
-		} else if ($t === 'pipe') {
-			/* Admin tiers only. Dovecot enables vnd.dovecot.pipe through
-			   sieve_global_extensions, which refuses it in a mailbox's own script;
-			   catching it here gives a sentence instead of a compiler dump. */
-			if (isset($_POST['scope']) && $_POST['scope'] === 'account') {
-				$errmsg = 'Error: piping to a program is only available on the server-wide and '
-				        . 'per-domain filters, not in a mailbox\'s own script.';
-				return false;
-			}
-			/* Only a program that is actually installed may be named. The check is
-			   against the directory listing, not the string, so no path, no `..`
-			   and no missing program can reach the generated script. */
-			if (!in_array($v, ef_pipe_programs(), true)) {
-				$errmsg = 'Error: "' . htmlspecialchars($v) . '" is not an installed program. '
-				        . 'Programs live in ' . EF_PIPE_BIN_DIR . ' and are added by the server administrator.';
-				return false;
-			}
-		} else if ($t === 'addflag' || $t === 'setflag' || $t === 'removeflag') {
-			if ($v === '') { $errmsg = 'Error: an IMAP flag is required.'; return false; }
-			if (strpbrk($v, "\r\n\"") !== false) { $errmsg = 'Error: flag name is not valid.'; return false; }
-		} else {
-			$v = '';
-		}
-		$acts[] = array('type' => $t, 'value' => $v);
-	}
-	if (!$acts) {
-		$errmsg = 'Error: a filter needs at least one action.';
+	for ($i = 0; $i < count($types); $i++)
+		$acts[] = array('type' => trim((string)$types[$i]), 'value' => isset($avals[$i]) ? (string)$avals[$i] : '');
+	list($rule, $e) = email_filter_rule(array(
+		'name'       => isset($_POST['name']) ? (string)$_POST['name'] : '',
+		'enabled'    => !(isset($_POST['enabled']) && $_POST['enabled'] === '0'),
+		'priority'   => isset($_POST['priority']) ? (int)$_POST['priority'] : 10,
+		'match'      => isset($_POST['match_type']) && $_POST['match_type'] === 'any' ? 'any' : 'all',
+		'stop'       => !empty($_POST['stop']),
+		'conditions' => $conds,
+		'actions'    => $acts,
+	), null, !(isset($_POST['scope']) && $_POST['scope'] === 'account'));
+	if ($e !== '') {
+		$errmsg = 'Error: '.htmlspecialchars($e);
 		return false;
 	}
-
-	return array(
-		'name'       => $name,
-		'enabled'    => (isset($_POST['enabled']) && $_POST['enabled'] === '0') ? 0 : 1,
-		'priority'   => isset($_POST['priority']) ? max(0, min(9999, (int)$_POST['priority'])) : 10,
-		'match_type' => (isset($_POST['match_type']) && $_POST['match_type'] === 'any') ? 'any' : 'all',
-		'stop'       => !empty($_POST['stop']) ? 1 : 0,
-		'conditions' => json_encode($conds),
-		'actions'    => json_encode($acts),
-	);
+	return $rule;
 }
 
 /* Resolve and validate scope/target from $_POST for the filter modules.
@@ -5813,6 +6097,19 @@ function mailbox_hash($email) {
 	return isset($f[1]) ? $f[1] : '';
 }
 
+/* The extra fields of $email's line in /etc/dovecot/users (field 8 onward:
+   "userdb_mail=maildir:~/" and whatever else is there, e.g. a mailbox size
+   the Hosting Pro add-on wrote), '' if not found. A rewrite of the line must
+   keep them. */
+function mailbox_extra_fields($email) {
+	foreach (explode("\n", (string)shell_exec('sudo cat /etc/dovecot/users 2>/dev/null')) as $line) {
+		$f = explode(':', trim($line), 8);
+		if (count($f) === 8 && strtolower($f[0]) === strtolower($email))
+			return trim($f[7]);
+	}
+	return '';
+}
+
 function mailbox_usage_list($db) {
 	$out    = shell_exec('sudo cat /etc/dovecot/users 2>/dev/null');
 	$fresh  = mailbox_usage_cached($db);
@@ -5873,6 +6170,17 @@ function mailbox_usage_refresh_all($db) {
 /* Return the certificate file configured in the domain's live vhost, or ''
    when the domain has no vhost or no ssl_certificate/SSLCertificateFile line.
    Checked in order: panel vhost (hostname), nginx, apache. */
+/* Call after every certbot run that installs a certificate. certbot's Apache
+   plugin puts the https vhost of a site that had none into a new file
+   <site>-le-ssl.conf; Reqad reads and edits only <site>.conf, so the script
+   moves the https vhost in there (no-op on nginx, or when there is none). */
+function le_ssl_vhost_merge($domain) {
+	if (!valid_domain($domain) || web_front() !== 'httpd')
+		return;
+	shell_exec('sudo -n '._PATH.'/scripts/update/merge_le_ssl_vhosts.sh --quiet --domain='.escapeshellarg($domain)
+	          .' >> '._PATH.'/log/debug_log 2>&1');
+}
+
 function local_ssl_cert_file($domain) {
 	if(!valid_domain($domain)) return '';
 
@@ -5880,6 +6188,9 @@ function local_ssl_cert_file($domain) {
 		'/etc/reqad/conf.d/'.$domain.'.conf',
 		'/etc/nginx/conf.d/'.$domain.'.conf',
 		'/etc/httpd/conf.d/'.$domain.'.conf',
+		/* certbot's own https copy of an Apache vhost that had no :443 block
+		   (scripts/update/merge_le_ssl_vhosts.sh moves it into the site's file) */
+		'/etc/httpd/conf.d/'.$domain.'-le-ssl.conf',
 	);
 	foreach($files as $file) {
 		/* the trailing [[:space:]] keeps ssl_certificate_key out of the match */
@@ -6186,6 +6497,7 @@ function spamassassin_summary() {
 		'score_in_file'  => false,
 		'use_bayes'      => true,
 		'rules_age'      => 'unknown',
+		'rules_ts'       => 0,
 	);
 	if (!is_executable('/usr/bin/spamassassin')) return $out;
 	$out['installed'] = true;
@@ -6203,6 +6515,7 @@ function spamassassin_summary() {
 	/* sa-update rewrites this directory; its mtime is the last successful run.
 	   Rules that stopped updating are a silent failure -- spam just gets past. */
 	$mt = (int)trim((string)shell_exec("sudo find /var/lib/spamassassin -maxdepth 2 -name updates_spamassassin_org -printf '%T@\n' 2>/dev/null | cut -d. -f1 | sort -n | tail -1"));
+	$out['rules_ts'] = $mt;
 	if ($mt > 0) $out['rules_age'] = human_duration(time() - $mt).' ago';
 	else         $out['rules_age'] = 'never';
 
@@ -6328,9 +6641,9 @@ function dovecot_fts_info() {
 		             'badge' => 'bg-green-lt');
 	if (!$backends)
 		return array('state' => 'no-backend', 'backends' => array(),
-		             'label' => 'No backend installed', 'badge' => 'bg-yellow-lt');
+		             'label' => 'No backend', 'badge' => 'bg-yellow-lt');
 	return array('state' => 'not-enabled', 'backends' => $backends,
-	             'label' => 'Installed, not enabled ('.implode(', ', $backends).')',
+	             'label' => 'Not enabled ('.implode(', ', $backends).')',
 	             'badge' => 'bg-yellow-lt');
 }
 
@@ -7955,8 +8268,15 @@ function webmail_tickets_purge($ttl = WEBMAIL_TICKET_TTL) {
 }
 
 /* Mint a single-use ticket for $email. Returns the token, or '' if the address
-   is not a real mailbox. */
-function webmail_ticket_create($email) {
+   is not a real mailbox.
+
+   The ticket carries the panel session that asked for it (db/1046.sql), and the
+   Roundcube plugin keeps the mailbox logged in only while that session lives:
+   logging out of the panel, or the session being revoked or timing out, logs
+   the webmail out too. Basic-auth mode has no panel sessions, so it stays ''.
+   $session_id: the session to bind it to instead of this request's own (the
+   account panel on 2083 passes its account session). */
+function webmail_ticket_create($email, $session_id = null) {
 	global $db;
 	$email = strtolower(trim((string)$email));
 	if (!valid_email_address($email)) return '';
@@ -7965,10 +8285,20 @@ function webmail_ticket_create($email) {
 	webmail_tickets_purge(300);        // opportunistic prune, no cron needed
 
 	$token = bin2hex(random_bytes(16));
-	$stmt = $db->prepare('INSERT INTO webmail_tickets (token, email, created) VALUES (:t, :e, :c)');
+	if ($session_id !== null) {
+		$sid = (string)$session_id;
+		if (!preg_match('/^[0-9a-f]{64}$/', $sid)) return '';
+	} else {
+		$sid = (function_exists('auth_web_enabled') && auth_web_enabled() && ($s = auth_session_current())) ? (string)$s['id'] : '';
+		if (function_exists('auth_web_enabled') && auth_web_enabled() && $sid === '') return '';
+	}
+
+	$stmt = $db->prepare('INSERT INTO webmail_tickets (token, email, created, session_id) VALUES (:t, :e, :c, :s)');
+	if (!$stmt) return '';             // migration 1046 not applied yet
 	$stmt->bindValue(':t', $token, SQLITE3_TEXT);
 	$stmt->bindValue(':e', $email, SQLITE3_TEXT);
 	$stmt->bindValue(':c', time(), SQLITE3_INTEGER);
+	$stmt->bindValue(':s', $sid, SQLITE3_TEXT);
 	return $stmt->execute() ? $token : '';
 }
 
@@ -8002,12 +8332,8 @@ function webmail_ticket_consume($token) {
    enough — /etc/{nginx,httpd}/conf.d is world-readable — but every write goes
    through sudo, like the rest of the panel. */
 
-function addon_is_apache($ini) {
-	return (substr(trim($ini['template'] ?? ''), 0, 7) == 'apache_');
-}
-
 function addon_vhost_dir($ini) {
-	return addon_is_apache($ini) ? '/etc/httpd/conf.d' : '/etc/nginx/conf.d';
+	return web_server(web_front($ini))['dir'];
 }
 
 function addon_vhost_path($ini, $domain) {
@@ -8056,7 +8382,7 @@ function addon_domain_php($ini, $domain) {
 	}
 	return array(
 		'version' => $ini['php'],
-		'handler' => addon_is_apache($ini) ? 'mod_php' : 'none',
+		'handler' => php_mode($ini) === 'modphp' ? 'mod_php' : 'none',
 		'pool'    => null,
 	);
 }
@@ -8117,23 +8443,23 @@ function addon_domain_get($ini, $domain) {
 /* php-fpm pool file contents for an addon domain (same shape as the pool the
    account templates write, with the per-domain socket). */
 function addon_fpm_pool_content($ini, $domain, $user) {
-	$group  = addon_is_apache($ini) ? 'apache' : 'nginx';
+	$group  = web_group($ini);
 	$socket = addon_socket($user, $domain);
 	return '['.$domain.']
 user = '.$user.'
-group = '.$group.'
+group = '.$user.'
 listen = '.$socket.'
 listen.owner = '.$user.'
 listen.group = '.$group.'
 listen.allowed_clients = 127.0.0.1
 
-pm = dynamic
-pm.max_children = 200
-pm.start_servers = 10
-pm.min_spare_servers = 5
-pm.max_spare_servers = 50
-pm.process_idle_timeout = 1s;
-pm.max_requests = 1000
+; workers start with the first request and stop after 10 s idle, so a quiet
+; site holds no memory; 20 at once per site, a stuck script is killed at 300 s
+pm = ondemand
+pm.max_children = 20
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+request_terminate_timeout = 300s
 
 ping.path = /ping
 slowlog = /var/log/php-fpm/'.$domain.'-slow.log
@@ -8150,6 +8476,78 @@ php_value[session.save_handler] = files
 php_value[session.save_path] = "/home/'.$user.'/tmp"
 php_value[soap.wsdl_cache_dir]  = /var/lib/php/wsdlcache
 ';
+}
+
+/* Change the PHP version / handler of an addon domain (created with
+   scripts/adddomain): the same mechanics as account_switch_php() in
+   app/functions/accounts.php - move/create/delete the pool file, restart the
+   affected php-fpm services - except the pool is named after the addon domain
+   and listens on its own per-domain socket. $handler 'fpm', or 'mod_php' on
+   Apache (default PHP only). Used by modules/edit_addon_domain.php (2087) and
+   php_version_set() (the API, the account panel). result_ok / result_error. */
+function addon_domain_php_set($domain, $new_version, $new_handler = 'fpm') {
+	global $ini;
+	$modphp       = (php_mode($ini) === 'modphp');
+	$php_versions = array_map('trim', explode(',', $ini['php_versions']));
+
+	/* addon_domain_get() returns null for anything that is not an addon vhost, so a
+	   crafted request cannot aim this at a main account domain. */
+	$addon = addon_domain_get($ini, $domain);
+	if ($addon === null)
+		return result_error("'".$domain."' is not an addon domain on this server.");
+	if (!in_array($new_version, $php_versions, true))
+		return result_error("PHP ".$new_version." is not installed on this server.");
+	if (!in_array($new_handler, array('fpm', 'mod_php'), true))
+		return result_error("Unknown PHP handler.");
+	if (!$modphp && $new_handler != 'fpm')
+		return result_error("nginx cannot run mod_php.");
+	/* mod_php is the apache module - it only ever runs the server's default PHP. */
+	if ($new_handler == 'mod_php' && $new_version != $ini['php'])
+		return result_error("mod_php is only available for PHP ".$ini['php'].". Use php-fpm for PHP ".$new_version.".");
+
+	$user            = $addon['user'];
+	$old_version     = $addon['version'];
+	$old_handler     = $addon['handler'];
+	$handler_changed = ($new_handler != $old_handler);
+	$label = "PHP ".$new_version.($modphp ? " (".($new_handler == 'fpm' ? 'php-fpm' : 'mod_php').")" : "");
+	if ($new_version == $old_version && !$handler_changed)
+		return result_ok("Addon domain ".$domain." already runs ".$label.".", array('domain' => $domain, 'changed' => false));
+
+	route_log("edit addon domain $domain: PHP $old_version/$old_handler -> $new_version/$new_handler");
+	$old_pool = ($old_handler == 'fpm') ? $addon['pool'] : null;
+	$new_pool = ($new_handler == 'fpm') ? addon_pool_path($ini, $domain, $new_version) : null;
+	$restart  = '';
+
+	/* apache: the vhost decides who runs PHP - with the SetHandler block it
+	   goes to the pool socket, without it mod_php handles the request. */
+	if ($modphp && $handler_changed) {
+		addon_vhost_set_fpm($ini, $domain, $user, ($new_handler == 'fpm'));
+		/* mod_php writes the account's tmp/ and logs/ as apache */
+		shell_exec('sudo '._PATH.'/scripts/update/harden_account_perms.sh --apply --quiet --user='.escapeshellarg($user).' >/dev/null 2>&1');
+	}
+
+	if ($old_pool === null && $new_pool !== null) {
+		addon_write_root_file($new_pool, addon_fpm_pool_content($ini, $domain, $user));
+	} elseif ($old_pool !== null && $new_pool === null) {
+		shell_exec('sudo rm -f '.escapeshellarg($old_pool));
+	} elseif ($old_pool !== null && $new_pool !== null && $old_pool !== $new_pool) {
+		/* different PHP version: the pool just moves to the other version's
+		   php-fpm.d - the socket path (and so the vhost) is unchanged */
+		shell_exec('sudo mv '.escapeshellarg($old_pool).' '.escapeshellarg(dirname($new_pool).'/'));
+	}
+
+	if ($old_pool !== null)
+		$restart .= addon_fpm_service($ini, $old_version).' ';
+	if ($new_pool !== null && $new_pool !== $old_pool)
+		$restart .= addon_fpm_service($ini, $new_version).' ';
+	/* apache needs a restart whenever the vhost changed; nginx keeps the same
+	   upstream socket, so it only needs one when nothing else did. */
+	if ($modphp && $handler_changed)
+		$restart .= 'httpd.service';
+	$restart = trim($restart);
+	if ($restart != '')
+		shell_exec('sudo '._PATH.'/scripts/restart_services.sh '.$restart.' 2>/dev/null >/dev/null &');
+	return result_ok("Addon domain ".$domain." now runs ".$label.".", array('domain' => $domain, 'changed' => true));
 }
 
 /* Write $content over a root-owned file through sudo (tempfile + sudo cp). */
@@ -8328,7 +8726,7 @@ function smtp_errors_trim($max = SMTP_ERRORS_MAX) {
 function route_log($message) {
 	if (isset($_SERVER['REMOTE_ADDR'])) {
 		$remote = $_SERVER['REMOTE_ADDR'];
-		$who    = isset($_SERVER['USER']) ? $_SERVER['USER'] : '-';
+		$who    = function_exists('auth_user') ? auth_user() : (isset($_SERVER['USER']) ? $_SERVER['USER'] : '-');
 	} else {
 		$remote = 'cli';
 		$pw     = function_exists('posix_getpwuid') ? posix_getpwuid(posix_geteuid()) : false;
@@ -8358,6 +8756,120 @@ function dns_provider_load($db) {
 		$prov = 'none';
 	include_once(__DIR__.'/api_'.$prov.'.php');
 	return $prov;
+}
+
+/* Record sets, provider-neutral. Every api_<provider>.php has
+     dns_rrset_get($name, $type)          the values at $name (full name, no
+                                          trailing dot): array of strings, TXT
+                                          values unquoted and joined; null when
+                                          no managed zone holds $name
+     dns_rrset_set($name, $type, $values) make the values exactly these (an
+                                          empty array removes the set); '' or
+                                          'Error: ...'
+   for A, AAAA and TXT. Values already there are left as they are (TTL,
+   Cloudflare's proxy), so a set call only touches what changes. Other types
+   (MX) only for removing the whole set: dns_rrset_set($name, 'MX', array())
+   (their values are not in the same form at every provider). */
+
+/* The longest zone in $zones (name => ...) that holds $name, '' when none. */
+function dns_zone_for($name, $zones) {
+	$name = strtolower(rtrim(trim((string)$name), '.'));
+	$zone = '';
+	if (is_array($zones))
+		foreach ($zones as $zname => $z)
+			if (($name === $zname || substr('.'.$name, -strlen('.'.$zname)) === '.'.$zname) && strlen($zname) > strlen($zone))
+				$zone = (string)$zname;
+	return $zone;
+}
+
+/* A TXT record's text from its zone-file form ("abc" "def" -> abcdef). */
+function dns_txt_decode($content) {
+	$content = trim((string)$content);
+	if (preg_match_all('/"((?:[^"\\\\]|\\\\.)*)"/', $content, $m) && $m[1])
+		return implode('', array_map(function ($s) { return str_replace(array('\\"', '\\\\'), array('"', '\\'), $s); }, $m[1]));
+	return $content;
+}
+
+/* Text -> 255-byte chunks, unquoted. */
+function dns_txt_chunks($value) {
+	$value = (string)$value;
+	return $value === '' ? array('') : str_split($value, 255);
+}
+
+/* Text -> zone-file form: quoted, escaped, in 255-byte chunks. */
+function dns_txt_encode($value) {
+	return implode(' ', array_map(function ($c) { return '"'.str_replace(array('\\', '"'), array('\\\\', '\\"'), $c).'"'; }, dns_txt_chunks($value)));
+}
+
+/* Whole zones, provider-neutral (the DNS zone editor: app/functions/dns.php).
+   Every api_<provider>.php has
+     dns_zone_rrsets($zone)   every record set of the zone: list of {name
+                              (full, no trailing dot), type, ttl, values,
+                              proxied (Cloudflare true/false, else null)};
+                              null when no managed zone is $zone
+     dns_zone_put($zone, $name, $type, $ttl, $values)
+                              make the set at $name exactly these values with
+                              this TTL (an empty array removes it); '' or
+                              'Error: ...'
+   for A, AAAA, CNAME, MX, TXT, SRV and CAA (SOA and NS are only read). A
+   value has one form at every provider:
+     A, AAAA  the address          MX   "10 mail.example.com"
+     CNAME    the host name        SRV  "10 5 5060 sip.example.com"
+     TXT      the text, unquoted   CAA  '0 issue "letsencrypt.org"'
+   host names lowercase, without the trailing dot ("." = none, RFC 7505). */
+
+/* "Mail.Example.com." -> "mail.example.com"; "." stays "." */
+function dns_host_canon($host) {
+	$host = strtolower(trim((string)$host));
+	return $host === '.' ? '.' : rtrim($host, '.');
+}
+
+/* A value's fields: MX [priority, host], SRV [priority, weight, port, target],
+   CAA [flags, tag, value], others [value]; null when it does not parse. */
+function dns_value_parts($type, $value) {
+	$value = trim((string)$value);
+	if ($type === 'MX')
+		return preg_match('/^(\d{1,5})\s+(\S+)$/', $value, $m) ? array((int)$m[1], dns_host_canon($m[2])) : null;
+	if ($type === 'SRV')
+		return preg_match('/^(\d{1,5})\s+(\d{1,5})\s+(\d{1,5})\s+(\S+)$/', $value, $m) ? array((int)$m[1], (int)$m[2], (int)$m[3], dns_host_canon($m[4])) : null;
+	if ($type === 'CAA')
+		return preg_match('/^(\d{1,3})\s+([A-Za-z0-9]+)\s+(.*)$/s', $value, $m) ? array((int)$m[1], strtolower($m[2]), dns_txt_decode($m[3])) : null;
+	return array($value);
+}
+
+/* Zone-file content (PowerDNS's form, also Cloudflare's for most types) -> the value. */
+function dns_value_from_zone($type, $content) {
+	$content = trim((string)$content);
+	switch ($type) {
+	case 'TXT':   return dns_txt_decode($content);
+	case 'CNAME': case 'NS': case 'PTR': return dns_host_canon($content);
+	case 'AAAA':  $b = @inet_pton($content); return $b !== false ? inet_ntop($b) : strtolower($content);
+	case 'MX': case 'SRV': case 'CAA':
+		$p = dns_value_parts($type, $content);
+		return $p === null ? $content : dns_value_join($type, $p);
+	}
+	return $content;
+}
+
+/* The fields -> the value (dns_value_parts() undone). */
+function dns_value_join($type, array $p) {
+	if ($type === 'CAA')
+		return (int)$p[0].' '.$p[1].' "'.str_replace(array('\\', '"'), array('\\\\', '\\"'), (string)$p[2]).'"';
+	return implode(' ', $p);
+}
+
+/* The value -> zone-file content (host names absolute, with the dot). */
+function dns_value_to_zone($type, $value) {
+	$dot = function ($h) { return $h === '.' ? '.' : $h.'.'; };
+	$p = dns_value_parts($type, $value);
+	switch ($type) {
+	case 'TXT':   return dns_txt_encode($value);
+	case 'CNAME': case 'NS': case 'PTR': return $dot(dns_host_canon($value));
+	case 'MX':    return $p ? $p[0].' '.$dot($p[1]) : $value;
+	case 'SRV':   return $p ? $p[0].' '.$p[1].' '.$p[2].' '.$dot($p[3]) : $value;
+	case 'CAA':   return $p ? dns_value_join('CAA', $p) : $value;
+	}
+	return $value;
 }
 
 /* Uniform return value of the app/functions/ operations.

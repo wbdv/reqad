@@ -7,7 +7,24 @@
 	$addons      = addon_domain_list($ini);
 	$nb_addons   = count($addons);
 	$php_versions = array_map('trim', explode(',', $ini['php_versions']));
-	$is_apache   = addon_is_apache($ini);
+	$modphp      = (php_mode($ini) === 'modphp');   // handler choice: mod_php or php-fpm
+	/* email per site: on / off (chosen) / missing (should have it, has none)
+	   / '' (the account has no email); see domain_mail_wanted() */
+	$mail_col    = feature_enabled($ini, 'email');
+	$mail_state  = array();
+	if ($mail_col && $nb_addons) {
+		$ud = email_userdomains();
+		$mprefs = domain_mail_prefs();
+		$mhad = domain_mail_had();
+		$acct_mail = array();
+		foreach ($addons as $d => $a) {
+			$u = $a['user'];
+			if (!isset($acct_mail[$u]))
+				$acct_mail[$u] = domain_mail_available($u) === '' ? domain_account_names($u) : false;
+			$mail_state[$d] = $acct_mail[$u] === false ? '' : (($ud[$d] ?? '') === $u ? 'on'
+				: (domain_mail_wanted($d, domain_parent_of($u, $d, $acct_mail[$u]), $mprefs, $mhad) ? 'missing' : 'off'));
+		}
+	}
 	$php_version_colors = [
 		'7.2' => '#4299e1',
 		'7.4' => '#2da6b4',
@@ -18,6 +35,12 @@
 		'8.4' => '#33cf14',
 		'8.5' => '#64cf0c',
 	];
+
+	/* accounts for the Add modal */
+	$add_accounts = array();
+	$rs = $db->query('SELECT user, domain, has_email FROM accounts ORDER BY domain');
+	while ($rs && ($r = $rs->fetchArray(SQLITE3_ASSOC)))
+		$add_accounts[] = $r;
 
 	if(!isset($errmsg))
 		$errmsg = '';
@@ -35,17 +58,23 @@
                   Addon Domains
                 </h2>
               </div>
+			<? if($add_accounts): ?>
+              <div class="col-auto ms-auto d-print-none">
+                <div class="btn-list">
+                  <a href="#" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modal-add-addon">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                    Add <span class="d-none d-sm-inline">&nbsp;an&nbsp;</span> addon domain
+                  </a>
+                </div>
+              </div>
+			<? endif; ?>
             </div>
           </div>
 
 <?php msg_render(); /* flash message (PRG) */ ?>
 
 <?	if($nb_addons == 0) { ?>
-		<p style="padding:14px;">There are no addon domains on this server.</p>
-		<p class="text-muted" style="padding:0 14px;">
-			Add one from the command line:<br>
-			<code>/usr/local/reqad/scripts/adddomain --user=&lt;account&gt; --domain=&lt;domain&gt; --php=<?=h($ini['php']);?><?=$is_apache?' --handler=fpm':'';?></code>
-		</p>
+		<p style="padding:14px;">There are no addon domains on this server.<?=$add_accounts ? '' : ' Create an account first.';?></p>
 <? 	} else { ?>
 
 		<div class="col-12">
@@ -57,9 +86,12 @@
                         <th class="w-1" style="background-color:#DEF;">ID</th>
                         <th style="background-color:#DEF;">Domain <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' width='16' height='16'><path fill='none' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' stroke-width='1' d='M5 10l3 -3l3 3'/></svg></th>
                         <th style="background-color:#DEF;">User</th>
+					<? if($mail_col): ?>
+                        <th style="background-color:#DEF;">Email</th>
+					<? endif; ?>
                         <th style="background-color:#DEF;">Document Root</th>
                         <th style="background-color:#DEF;">PHP Version</th>
-					<? if($is_apache): ?>
+					<? if($modphp): ?>
                         <th style="background-color:#DEF;">Handler</th>
 					<? endif; ?>
                         <th style="background-color:#DEF;">Created At</th>
@@ -74,7 +106,7 @@
                             <button id="addon-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
                           </div>
 						</td>
-                        <td colspan="<?=5 + ($is_apache ? 1 : 0);?>" style="padding:4px 8px;"></td>
+                        <td colspan="<?=5 + ($modphp ? 1 : 0) + ($mail_col ? 1 : 0);?>" style="padding:4px 8px;"></td>
                       </tr>
 					<? } ?>
                     </thead>
@@ -114,6 +146,23 @@
                             </div>
                           </div>
                         </td>
+					<? if($mail_col): $ms = $mail_state[$domain] ?? ''; ?>
+                        <td data-label="Email">
+						<? if($ms === ''): ?>
+							<span class="text-muted" style="font-size:0.85em;" title="Email is off for the whole account (Accounts &gt; Edit)">account off</span>
+						<? elseif($ms === 'on'): ?>
+							<span class="badge bg-green-lt">on</span>
+							<a href="#" class="addon-mail-btn text-muted ms-1" style="font-size:0.85em;" data-domain="<?=h($domain);?>" data-state="off">turn off</a>
+						<? elseif($ms === 'off'): ?>
+							<span class="badge bg-secondary-lt">off</span>
+							<a href="#" class="addon-mail-btn ms-1" style="font-size:0.85em;" data-domain="<?=h($domain);?>" data-state="on">turn on</a>
+						<? else: ?>
+							<span class="badge bg-red-lt" title="The rest of the account has email, but this site has none: mail to it is refused">not set up</span>
+							<a href="#" class="addon-mail-btn ms-1" style="font-size:0.85em;" data-domain="<?=h($domain);?>" data-state="on">fix</a>
+							<a href="#" class="addon-mail-btn text-muted ms-1" style="font-size:0.85em;" data-domain="<?=h($domain);?>" data-state="off">turn off</a>
+						<? endif; ?>
+                        </td>
+					<? endif; ?>
                         <td class="text-muted" data-label="Document Root">
                           <span style="font-family:monospace;white-space:nowrap;"><?=h($row["docroot"]);?></span>
                         </td>
@@ -125,7 +174,7 @@
 							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($row["version"]);?></span>
 							<? } ?>
                         </td>
-					<? if($is_apache): ?>
+					<? if($modphp): ?>
                         <td class="text-muted" data-label="Handler">
 							<span class="text-muted" style="font-size:0.85em;"><?=$row["handler"] == 'fpm' ? 'php-fpm' : $row["handler"];?></span>
                         </td>
@@ -159,10 +208,6 @@
 				<? endif; ?>
 				</div>
             </div>
-			<p class="text-muted" style="padding:18px 14px;font-size:0.9em;">
-				<b>Note:</b> Addon domains are created from the command line:
-				<code>/usr/local/reqad/scripts/adddomain --user=&lt;account&gt; --domain=&lt;domain&gt; --php=<?=h($ini['php']);?><?=$is_apache?' --handler=fpm':'';?></code>
-			</p>
 			<?  } ?>
 
             </div>
@@ -170,6 +215,69 @@
         </div>
       </div>
     </div>
+
+	<form method="post" action="/" id="add-addon" class="needs-validation" novalidate>
+    <input type="hidden" name="action" value="add-addon-domain">
+    <div class="modal modal-blur fade" id="modal-add-addon" tabindex="-1" role="dialog" aria-hidden="true">
+      <div class="modal-dialog modal-lg" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Add an addon domain</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <p>A new site of an account, with its own folder, web server settings and PHP pool (the same PHP version as the account's main site).</p>
+            <div class="row">
+              <div class="col-lg-6">
+                <div class="mb-3">
+                  <label class="form-label required">Account</label>
+                  <select name="account" id="add-addon-account" class="form-select" required>
+                  <? foreach ($add_accounts as $a): ?>
+                    <option value="<?=h($a['user']);?>" data-domain="<?=h($a['domain']);?>" data-email="<?=$a['has_email'] ? '1' : '0';?>"><?=h($a['domain']);?> (<?=h($a['user']);?>)</option>
+                  <? endforeach; ?>
+                  </select>
+                </div>
+              </div>
+              <div class="col-lg-6">
+                <div class="mb-3">
+                  <label class="form-label required">Domain name</label>
+                  <input type="text" name="domain" id="add-addon-domain" class="form-control" placeholder="example.com or shop.example.com" pattern="^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,}\.?$" autocomplete="off" required>
+                  <div class="invalid-feedback">Please enter a domain name, such as example.com.</div>
+                </div>
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Folder</label>
+              <div class="input-group">
+                <span class="input-group-text" id="add-addon-home">/home/<?=h($add_accounts[0]['user'] ?? '');?>/</span>
+                <input type="text" name="folder" id="add-addon-folder" class="form-control" placeholder="" autocomplete="off">
+              </div>
+              <small class="form-hint">Empty = a folder named after the domain, right in the home folder. Or a folder inside public_html, such as <code>public_html/shop</code>. It is made when it does not exist.</small>
+            </div>
+            <div class="mb-1">
+              <label class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" name="www" id="add-addon-www" checked>
+                <span class="form-check-label">Also serve <span id="add-addon-www-name">www.&lt;domain&gt;</span></span>
+              </label>
+              <? if($mail_col): ?>
+              <label class="form-check form-switch" id="add-addon-mail-row">
+                <input class="form-check-input" type="checkbox" name="mail" id="add-addon-mail" checked>
+                <span class="form-check-label">Email for this domain</span>
+              </label>
+              <small class="form-hint" id="add-addon-mail-off" style="display:none;">This account has email turned off (Accounts &gt; Edit), so the domain gets no email for now.</small>
+              <? endif; ?>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <a href="#" class="btn btn-link link-secondary" data-bs-dismiss="modal">
+              Cancel
+            </a>
+            <button id="addon-submit-add" class="btn btn-primary" type="submit"><svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg> Add domain</button>
+          </div>
+        </div>
+      </div>
+    </div>
+</form>
 
 	<form method="post" action="/" id="edit-addon" class="needs-validation" novalidate>
     <input type="hidden" name="action" value="edit-addon-domain">
@@ -196,7 +304,7 @@
                 <div class="mb-3">
           			<label class="form-label">PHP version:</label>
 		            <select name="phpversion" id="addon-phpversion" class="form-select">
-					<? if($is_apache): ?>
+					<? if($modphp): ?>
 						<option value="<?=$ini['php'];?>:mod_php">PHP <?=$ini['php'];?> (mod_php)</option>
 						<option value="<?=$ini['php'];?>:fpm">PHP <?=$ini['php'];?> (php-fpm)</option>
 						<? foreach ($php_versions as $pv): if($pv == $ini['php']) continue; ?>
@@ -224,6 +332,12 @@
         </div>
       </div>
     </div>
+</form>
+
+<form method="post" action="/" id="addon-mail">
+    <input type="hidden" name="action" value="addon-domain-mail">
+    <input type="hidden" name="domain" id="addon-mail-domain" value="">
+    <input type="hidden" name="state" id="addon-mail-state" value="">
 </form>
 
 <form method="post" action="/" id="delete-addon" class="needs-validation" novalidate>
@@ -328,6 +442,48 @@ jQuery(document).ready(function () {
 		showAddonPage(addonStart);
 	});
 
+	/* Add an addon domain: a subdomain of the account's main domain gets
+	   no www and no email by default (as domain_addon_add() would choose) */
+	var addTouched = {www: false, mail: false};
+	function addAddonRefresh() {
+		var opt = $('#add-addon-account option:selected');
+		var main = String(opt.data('domain') || '').toLowerCase();
+		var d = $('#add-addon-domain').val().toLowerCase().trim().replace(/\.$/, '');
+		var sub = main !== '' && d.length > main.length && d.slice(-main.length - 1) === '.' + main;
+		$('#add-addon-home').text('/home/' + opt.val() + '/');
+		$('#add-addon-folder').attr('placeholder', d !== '' ? d : 'example.com');
+		$('#add-addon-www-name').text('www.' + (d !== '' ? d : '<domain>'));
+		if (!addTouched.www) $('#add-addon-www').prop('checked', !sub);
+		if (!addTouched.mail) $('#add-addon-mail').prop('checked', !sub);
+		var mailOn = String(opt.data('email')) === '1';
+		$('#add-addon-mail').prop('disabled', !mailOn);
+		$('#add-addon-mail-off').toggle(!mailOn);
+	}
+	$('#add-addon-account').on('change', addAddonRefresh);
+	$('#add-addon-domain').on('input', addAddonRefresh);
+	$('#add-addon-www').on('change', function () { addTouched.www = true; });
+	$('#add-addon-mail').on('change', function () { addTouched.mail = true; });
+	$('#modal-add-addon').on('show.bs.modal', function () {
+		addTouched = {www: false, mail: false};
+		$('#add-addon').removeClass('was-validated');
+		addAddonRefresh();
+	}).on('shown.bs.modal', function () {
+		$('#add-addon-domain').trigger('focus');
+	});
+	$('#add-addon').submit(function (event) {
+		var f = $('#add-addon')[0];
+		$('#add-addon-domain').val($('#add-addon-domain').val().trim());
+		if (f.checkValidity() === false) {
+			event.preventDefault();
+			event.stopPropagation();
+			$('#add-addon').addClass('was-validated');
+			return;
+		}
+		$('#add-addon-mail').prop('disabled', false);
+		$('#addon-submit-add').prop('disabled', true).html('Adding domain …');
+		$('#add-addon').unbind('submit').submit();
+	});
+
 	$('#edit-addon').on('show.bs.modal', function (event) {
 		var button = event.relatedTarget;
 		var domain = button.getAttribute('data-bs-domain');
@@ -337,7 +493,7 @@ jQuery(document).ready(function () {
 		$('#addon-domain-edit').val(domain);
 		$('#addon-domain-title').html(domain);
 		$('#addon-user-title').html(user);
-	<?php if($is_apache): ?>
+	<?php if($modphp): ?>
 		$('#addon-phpversion').val(phpversion + ':' + (phphandler === 'fpm' ? 'fpm' : 'mod_php'));
 	<?php else: ?>
 		$('#addon-phpversion').val(phpversion);
@@ -358,6 +514,18 @@ jQuery(document).ready(function () {
 		$('#addon-docroot-title').text(docroot);
 		$('#addon-delete-docroot').prop('checked', false);
   	});
+
+	/* email on / off for a site */
+	$('.addon-mail-btn').on('click', function (e) {
+		e.preventDefault();
+		var d = $(this).data('domain'), st = $(this).data('state');
+		if (st === 'off' && !confirm('Turn off email for ' + d + '?\n\nRefused while it has mailboxes. Its forwarders and autoresponders are deleted, and when its DNS is at the DNS provider its MX and DKIM records go and SPF says it sends no mail.'))
+			return;
+		$('#addon-mail-domain').val(d);
+		$('#addon-mail-state').val(st);
+		$(this).replaceWith('<span class="text-muted" style="font-size:0.85em;">working…</span>');
+		$('#addon-mail').submit();
+	});
 
 	$('#delete-addon').submit(function(event) {
 		$('#addon-submit-delete').prop('disabled', true);

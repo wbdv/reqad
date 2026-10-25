@@ -89,7 +89,7 @@
                   <div class="d-flex align-items-center">
                     <div class="subheader">Messages in queue</div>
                   </div>
-                  <div class="h1 mb-3"><a href="/email/#queue" class="text-reset text-decoration-none"><?=($queue_count < 0 ? '?' : $queue_count);?></a></div>
+                  <div class="h1 mb-3"><a href="/email/#queue" class="text-reset text-decoration-none" id="mq-card-count"><?=($queue_count < 0 ? '?' : $queue_count);?></a></div>
                 </div>
               </div>
             </div>
@@ -115,7 +115,7 @@
                       <?php if ($svc['active']) { ?>
                         <span class="badge bg-success sm">running</span>
                       <?php } else { ?>
-                        <span class="badge bg-error sm">stopped</span>
+                        <span class="badge bg-error sm">stopped</span><?=doc_hint('email#stopped', 'How to start it again');?>
                       <?php } ?>
                     </span>
                   </div>
@@ -140,11 +140,14 @@
                           else                                 { $dl = 'unknown';         $db_ = 'bg-red-lt'; }
                     ?>
                     <dt>Local delivery</dt>
-                    <dd><span class="badge <?=h($db_);?>" title="<?=h($tr !== '' ? 'virtual_user transport = '.$tr : 'virtual_user router has no transport');?>"><?=h($dl);?></span></dd>
+                    <dd><span class="badge <?=h($db_);?>" title="<?=h($tr !== '' ? 'virtual_user transport = '.$tr : 'virtual_user router has no transport');?>"><?=h($dl);?></span><?php
+                      if ($tr === 'virtual_users_trans') echo doc_hint('email#lmtp', 'How to switch to Dovecot LMTP');
+                      else if ($tr !== 'dovecot_lmtp')   echo doc_hint('email#delivery', 'How to fix local delivery');
+                    ?></dd>
                     <?php } ?>
                     <?php if ($svc['which'] == 'dovecot') { ?>
                     <dt>Full-text search</dt>
-                    <dd><span class="badge <?=h($fts['badge']);?>"><?=h($fts['label']);?></span></dd>
+                    <dd><span class="badge <?=h($fts['badge']);?>"><?=h($fts['label']);?></span><?php if ($fts['state'] !== 'enabled') echo doc_hint('email-search#enable', 'How to turn on full-text search');?></dd>
                     <?php } ?>
                   </dl>
                 </div>
@@ -169,11 +172,11 @@
                     <h3 class="card-title m-0">SpamAssassin</h3>
                     <span class="ms-auto">
                       <?php if (!$sa['installed']) { ?>
-                        <span class="badge bg-red-lt">not installed</span>
+                        <span class="badge bg-red-lt">not installed</span><?=doc_hint('email#spamassassin', 'How to install SpamAssassin');?>
                       <?php } elseif ($spamd['active']) { ?>
                         <span class="badge bg-success sm" title="Port: <?=h($spamd['ports']);?>">running</span>
                       <?php } else { ?>
-                        <span class="badge bg-error sm">stopped</span>
+                        <span class="badge bg-error sm">stopped</span><?=doc_hint('email#stopped', 'How to start it again');?>
                       <?php } ?>
                     </span>
                   </div>
@@ -186,7 +189,12 @@
                     <dt>Running for</dt>
                     <dd title="<?=h($spamd['since']);?>"><?=h(mailstack_uptime($spamd));?></dd>
                     <dt>Rules updated</dt>
-                    <dd><?=h($sa['rules_age']);?></dd>
+                    <dd><?=h($sa['rules_age']);?><?php
+                      /* rule sets are published every few days to weeks, so only
+                         flag a server that has clearly stopped fetching them */
+                      if ($sa['rules_ts'] <= 0 || time() - $sa['rules_ts'] > 60 * 86400)
+                        echo doc_hint('email#sa-rules', 'How to update the rules');
+                    ?></dd>
                     <dt>Bayes</dt>
                     <dd><span class="badge <?=($sa['use_bayes'] ? 'bg-green-lt' : 'bg-yellow-lt');?>"><?=($sa['use_bayes'] ? 'Enabled' : 'Disabled');?></span></dd>
                   </dl>
@@ -217,11 +225,11 @@
                     <h3 class="card-title m-0">ClamAV</h3>
                     <span class="ms-auto">
                       <?php if (!$clam['installed']) { ?>
-                        <span class="badge bg-red-lt">not installed</span>
+                        <span class="badge bg-red-lt">not installed</span><?=doc_hint('email#clamav', 'How to install ClamAV');?>
                       <?php } elseif ($clamd['active']) { ?>
                         <span class="badge bg-success sm">running</span>
                       <?php } else { ?>
-                        <span class="badge bg-error sm">stopped</span>
+                        <span class="badge bg-error sm">stopped</span><?=doc_hint('email#stopped', 'How to start it again');?>
                       <?php } ?>
                     </span>
                   </div>
@@ -232,13 +240,18 @@
                     <dt>Signatures</dt>
                     <dd><?=($clam['signatures'] > 0 ? number_format($clam['signatures']) : 'unknown');?></dd>
                     <dt>Updated</dt>
-                    <dd><?=h($clam['db_age']);?></dd>
+                    <dd><?=h($clam['db_age']);?><?php
+                      /* freshclam fetches several times a day; days without
+                         an update mean it has stopped */
+                      if ($clam['db_ts'] <= 0 || time() - $clam['db_ts'] > 3 * 86400)
+                        echo doc_hint('email#clamav-sigs', 'How to update the signatures');
+                    ?></dd>
                     <dt>Scanning</dt>
                     <dd><?php
                       if      ($clam['exim_mode'] === 'deny') { $vbadge = 'bg-green-lt';  $vlabel = 'rejecting infected'; }
                       else if ($clam['exim_mode'] === 'tag')  { $vbadge = 'bg-blue-lt';   $vlabel = 'tagging only'; }
                       else                                    { $vbadge = 'bg-yellow-lt'; $vlabel = 'not wired into exim'; }
-                    ?><span class="badge <?=$vbadge;?>"><?=$vlabel;?></span></dd>
+                    ?><span class="badge <?=$vbadge;?>"><?=$vlabel;?></span><?php if ($clam['exim_mode'] === 'disabled') echo doc_hint('email#clamav-scanning', 'What the scanning modes do');?></dd>
                     <dt>Extra databases</dt>
                     <dd><?php if ($clam['third_party'] === 0) { ?><span class="badge bg-yellow-lt ms-1">official only</span><?php } else { ?><span class="badge bg-green-lt ms-1" title="<?php foreach ($clam['feeds'] as $f) echo h($f['name']).' ';?>">Yes</span><?php } ?></dd>
                   </dl>
@@ -292,7 +305,7 @@
                         <?php /* a plugin listed in config.inc.php whose directory is gone
                                  stops Roundcube from starting, so flag it rather than
                                  listing it as though it were fine */ ?>
-                        <span class="badge <?=($p['present'] ? 'bg-blue-lt' : 'bg-red-lt');?> me-1 mb-1"><?=h($p['name']);?><?=($p['present'] ? '' : ' — missing');?></span>
+                        <span class="badge <?=($p['present'] ? 'bg-blue-lt' : 'bg-red-lt');?> me-1 mb-1"><?=h($p['name']);?><?=($p['present'] ? '' : ' — missing');?></span><?php if (!$p['present']) echo doc_hint('email#roundcube-plugin', 'How to fix a missing plugin');?>
                       <?php } ?>
                     </div>
                     <?php } ?>
@@ -525,6 +538,12 @@ jQuery(function ($) {
 	}
 	function clearNotice() { $('#mq-notice').addClass('d-none').empty(); }
 
+	// The "Messages in queue" card is rendered once with the page; every answer
+	// that carries the real queue depth refreshes it.
+	function setQueueCard(n) {
+		if (typeof n === 'number' && n >= 0) $('#mq-card-count').text(n);
+	}
+
 	// exim -bp prints a bare byte count for small messages but an abbreviated
 	// size for larger ones ("30K", "2M"). parseInt on "30K" yields 30, which
 	// would render a 30 KB message as "30 B" -- so pass the suffixed form
@@ -614,6 +633,7 @@ jQuery(function ($) {
 
 		mqPost('ajax-mq-list', { filter: mq.filter, q: mq.q, start: mq.start }, function (res) {
 			mq.loading = false;
+			setQueueCard(res.queue);
 			mq.total = res.total;
 			mq.start = res.start;
 			mq.items = res.items;
@@ -633,6 +653,7 @@ jQuery(function ($) {
 	// page, so offer the tools that still work instead.
 	function tooBig() {
 		mqPost('ajax-mq-count', {}, function (c) {
+			setQueueCard(c.total);
 			$('#mq-notice').removeClass('d-none').html(
 				'<div class="alert alert-warning m-3">' +
 				'<h4 class="alert-title">' + esc(c.total) + ' messages in the queue</h4>' +
@@ -803,14 +824,45 @@ jQuery(function ($) {
 	});
 
 	// whole-queue buttons: these stay usable when the queue is too large to list
+	/* A forced queue run happens in the background on the server (a big queue
+	   outlasts any web request), so the page only starts it and then polls
+	   until it ends. Closing the log window or leaving the page does not stop it. */
+	var RUNQ_POLL_MS = 5000;
+	var runqTimer = null;
+
+	function runqButton(running) {
+		$('#mq-runq').prop('disabled', running).text(running ? 'Queue running…' : 'Run queue');
+	}
+	function runqPoll() {
+		clearTimeout(runqTimer);
+		runqTimer = setTimeout(function () {
+			mqPost('ajax-mq-runq-status', {}, function (st) {
+				setQueueCard(st.total);
+				if (st.running) {
+					$('#mq-log-progress').text('Running… ' + st.total + ' message' + (st.total !== 1 ? 's' : '') + ' still in the queue.');
+					runqPoll();
+					return;
+				}
+				runqButton(false);
+				$('#mq-log-progress').text('Queue run finished.');
+				appendLog('Finished. ' + st.total + ' message' + (st.total !== 1 ? 's' : '') + ' left in the queue' +
+					(st.total ? ' (deferred by the receiving server, or failed again). See the exim main log for details.' : '.') + '\n');
+				mqBoot();
+			}, function () { runqPoll(); });
+		}, RUNQ_POLL_MS);
+	}
+
 	$('#mq-runq').on('click', function () {
-		var $b = $(this).prop('disabled', true);
+		runqButton(true);
 		mqPost('ajax-mq-runq', {}, function (res) {
-			$b.prop('disabled', false);
 			openLog('Queue run');
-			appendLog(res.log || 'Queue run started.');
-			mqLoad(1);
-		}, function (msg) { $b.prop('disabled', false); notice(msg); });
+			appendLog(res.started
+				? 'Queue run started in the background with ' + res.runners + ' parallel runner' + (res.runners !== 1 ? 's' : '') + '.\n'
+				: 'A queue run is already in progress.\n');
+			appendLog('You can close this window; the run continues on the server.\n\n');
+			$('#mq-log-progress').text('Running…');
+			runqPoll();
+		}, function (msg) { runqButton(false); notice(msg); });
 	});
 	$('#mq-purge-frozen').on('click', function () {
 		showConfirm('Delete all frozen messages',
@@ -844,10 +896,21 @@ jQuery(function ($) {
 
 	// Ask for the depth first: on a runaway queue this is the only cheap answer,
 	// and it decides whether a listing is even attempted.
-	mqPost('ajax-mq-count', {}, function (c) {
-		mq.items = c.items;
-		if (c.total > c.max) { tooBig(); $('#mq-footer').html('<p class="m-0 text-muted">' + esc(c.total) + ' messages queued.</p>'); return; }
-		mqLoad(1);
-	}, function (msg) { notice(msg); });
+	function mqBoot() {
+		mqPost('ajax-mq-count', {}, function (c) {
+			setQueueCard(c.total);
+			mq.items = c.items;
+			if (c.total > c.max) { tooBig(); $('#mq-footer').html('<p class="m-0 text-muted">' + esc(c.total) + ' messages queued.</p>'); return; }
+			mqLoad(1);
+		}, function (msg) { notice(msg); });
+	}
+	mqBoot();
+
+	// pick up a queue run started earlier (or from another tab)
+	mqPost('ajax-mq-runq-status', {}, function (st) {
+		if (!st.running) return;
+		runqButton(true);
+		runqPoll();
+	}, function () {});
 });
 </script>

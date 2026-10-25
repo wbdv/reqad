@@ -23,5 +23,22 @@ if [ "$user" = "root" ]; then
 	exec bash -l
 fi
 
-# hosting accounts often have /sbin/nologin as their shell
+# Shell access (Accounts > Manage): jailed accounts get their sandbox, SFTP-only
+# accounts no terminal. Anything else gets bash - hosting accounts often have
+# /sbin/nologin as their shell - unless full shell access is off on this
+# server (root_access=0): then the sandbox.
+login_shell=$(getent passwd "$user" | cut -d: -f7)
+root_access=$(grep -E '^[[:space:]]*root_access[[:space:]]*=' /usr/local/reqad/etc/server-software.ini 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+if [ -n "$root_access" ] && [ "$root_access" != 1 ] && [ "$login_shell" != /usr/local/bin/reqad-sftponly ]; then
+	exec su -s /usr/local/bin/reqad-jailshell - "$user"
+fi
+case "$login_shell" in
+	/usr/local/bin/reqad-jailshell)
+		exec su -s /usr/local/bin/reqad-jailshell - "$user" ;;
+	/usr/local/bin/reqad-sftponly)
+		echo "$user has no shell access (SFTP only), so no terminal."
+		echo "Change it in Accounts > Manage > Shell access."
+		sleep 8
+		exit 1 ;;
+esac
 exec su -s /bin/bash - "$user"

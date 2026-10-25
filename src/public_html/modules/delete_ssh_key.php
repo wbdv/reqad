@@ -6,6 +6,28 @@ $ssh_pubkey = trim($_POST["pubkey"] ?? '');
 $errmsg     = '';
 $successmsg = '';
 
+// An account's keys: as the account (app/functions/ssh.php), by the key itself.
+if ($ssh_user !== 'root') {
+    $valid_users = array();
+    $q = $db->query('SELECT user FROM accounts');
+    while ($row = $q->fetchArray())
+        $valid_users[] = $row["user"];
+    $l = ssh_key_line($ssh_pubkey);
+    $i = $l ? ssh_key_info($l[1], $l[2]) : null;
+    if (!in_array($ssh_user, $valid_users, true)) {
+        $errmsg = "Error: Invalid user selected.";
+    } elseif (!$i) {
+        $errmsg = "Error: Key not found in authorized_keys for user $ssh_user.";
+    } else {
+        $r = ssh_key_delete($ssh_user, $i['id']);
+        if ($r['ok'])
+            $successmsg = "SSH key successfully removed for user $ssh_user.";
+        else
+            $errmsg = 'Error: '.$r['error'];
+    }
+    return;
+}
+
 // Block root key deletion if root_access is disabled
 $root_access = isset($ini['root_access']) ? (int)$ini['root_access'] : 1;
 if ($ssh_user === 'root' && !$root_access) {
@@ -52,7 +74,7 @@ if ($errmsg == '') {
         $errmsg = "Error: Key could not be removed.";
     } else {
         $successmsg = "SSH key successfully removed for user $ssh_user.";
-        error_log(date("Y-m-d H:i:s") . substr((string) microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . $_SERVER['USER'] . " delete ssh key for $ssh_user\n", 3, '../log/route_log');
+        error_log(date("Y-m-d H:i:s") . substr((string) microtime(), 1, 8) . " " . $_SERVER["REMOTE_ADDR"] . " " . auth_user() . " delete ssh key for $ssh_user\n", 3, '../log/route_log');
     }
 }
 ?>

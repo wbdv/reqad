@@ -12,6 +12,10 @@ $content   = (string)($_POST['content'] ?? '');
 $errmsg = '';
 $successmsg = '';
 
+/* root access in disguise (see account_config_editable()) */
+if(!account_config_editable($ini))
+	$errmsg = 'Error: editing config files needs root access (root_access=1 in server-software.ini).';
+
 $acct = false;
 if($acct_user !== '') {
 	$res = $db->query('SELECT domain FROM accounts WHERE user="'.$db->escapeString($acct_user).'"');

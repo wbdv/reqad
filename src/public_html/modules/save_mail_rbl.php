@@ -22,7 +22,7 @@ foreach (preg_split('/[\s:,;]+/', $raw) as $h) {
 
 $r = exim_dnslists_apply($idx, $hosts);
 
-error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.$_SERVER['USER']
+error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.auth_user()
         .' save mail rbl ['.$idx.'] '.($r['error'] === '' ? 'ok' : 'FAILED')."\n", 3, '../log/route_log');
 
 msg_redirect('/email-config/exim/',

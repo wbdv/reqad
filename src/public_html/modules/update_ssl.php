@@ -7,7 +7,6 @@ $privkey   	 = trim($_POST["privkey"]);
 $errmsg 	= '';
 $successmsg = '';
 
-$TEMPLATE = shell_exec("grep -e '^template=' ../etc/server-software.ini | awk -F= {'print \$2'}");
 #sleep(5);
 #echo '<pre>'; print_r($_POST); exit;
 
@@ -18,10 +17,9 @@ if(valid_domain($domain)) {
 		if($ssltype == 'letsencrypt') {
 			#shell_exec('sudo certbot --non-interactive --nginx -d '.$domain.',www.'.$domain.' >> '.__DIR__.'/../../log/debug_log 2>&1');
 
-		    if(substr($TEMPLATE,0,7)=='apache_')
-				shell_exec('sudo certbot --non-interactive --apache -d '.$domain.' >> '.__DIR__.'/../../log/debug_log 2>&1');
-			else
-				shell_exec('sudo certbot --non-interactive --nginx -d '.$domain.' >> '.__DIR__.'/../../log/debug_log 2>&1');
+			/* the front server answers the challenge and holds the certificate */
+			shell_exec('sudo certbot --non-interactive --'.web_server(web_front($ini))['certbot'].' -d '.escapeshellarg($domain).' >> '.__DIR__.'/../../log/debug_log 2>&1');
+			le_ssl_vhost_merge($domain);
 			shell_exec('sudo /usr/local/reqad/scripts/update_email_sni >> '.__DIR__.'/../../log/debug_log 2>&1 &');
 		} else if($ssltype == 'own' && substr($newcert,0,27)=='-----BEGIN CERTIFICATE-----' && (substr($privkey,0,27)=='-----BEGIN PRIVATE KEY-----' || substr($privkey,0,31)=='-----BEGIN RSA PRIVATE KEY-----')) {
 			$x = trim(shell_exec("echo '".$newcert."' | openssl x509 -in /dev/stdin -noout -text| grep -E 'Issuer:|Not Before:|Not After :|Subject:|DNS:'"));	
@@ -74,7 +72,7 @@ if(valid_domain($domain)) {
 } else {
     $errmsg =  "Error: Domain name is wrong, please check what you typed.";
 }
-//    	error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER'].'INSERT INTO accounts VALUES ('.$uid.', "'.$user.'", "'.$domain.'", 0, '.$disk_quota.', '.($has_email?'true':'false').', active, datetime("now"))'."\n", 3, '../log/route_log');
+//    	error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user().'INSERT INTO accounts VALUES ('.$uid.', "'.$user.'", "'.$domain.'", 0, '.$disk_quota.', '.($has_email?'true':'false').', active, datetime("now"))'."\n", 3, '../log/route_log');
 
 if($errmsg == '') {
 	$successmsg =  "Certificate successfully installed.";

@@ -80,7 +80,11 @@ add_key_if_missing "reqad" "root_access" "1"
 add_key_if_missing "reqad" "wptoolkit"   "1"
 add_key_if_missing "reqad" "transfer"    "0"
 add_key_if_missing "reqad" "filemanager" "1"
+add_key_if_missing "reqad" "filemanager_compression" "1"   # file manager: Compress and download
 add_key_if_missing "reqad" "addon_domains" "0"
+add_key_if_missing "reqad" "deployments" "0"   # Git deployments + Node.js / Python apps
+add_key_if_missing "reqad" "api"         "0"   # REST API (Settings > API access)
+add_key_if_missing "reqad" "mcp"         "0"   # AI assistants over MCP (Settings > AI access)
 
 # ── [systemd] list entries ────────────────────────────────────────────────────
 

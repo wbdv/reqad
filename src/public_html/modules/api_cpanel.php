@@ -480,3 +480,176 @@ function import_zone_records($domain, $records, &$error = null) {
 	}
 	return true;
 }
+
+/* ---- record sets (dns_rrset_get / dns_rrset_set, see functions.php) -------
+   Read with parse_dns_zone: its line_index is the one mass_edit_dns_zone
+   wants (dumpzone's positions are not). One change per mass_edit call, the
+   zone read again before each, since a removal renumbers the lines below. */
+function cpanel_rrset_records($name, $type, &$zone = null, &$serial = null) {
+	global $api_server;
+	$name  = strtolower(rtrim(trim($name), '.'));
+	$zone  = dns_zone_for($name, get_zones());
+	if ($zone === '')
+		return null;
+	$json = cpanel_whm_api('https://'.$api_server.':2087/json-api/parse_dns_zone?api.version=1&zone='.rawurlencode($zone), true);
+	if (!isset($json['data']['payload']) || !is_array($json['data']['payload']))
+		return null;
+	$serial = '';
+	$out = array();
+	foreach ($json['data']['payload'] as $e) {
+		if (($e['type'] ?? '') !== 'record')
+			continue;
+		$data = array_map('base64_decode', (array)($e['data_b64'] ?? array()));
+		if ($e['record_type'] === 'SOA') {
+			$serial = trim((string)($data[2] ?? ''));
+			continue;
+		}
+		if ($e['record_type'] !== $type)
+			continue;
+		$dn = isset($e['dname_b64']) ? base64_decode($e['dname_b64']) : (string)($e['dname_raw'] ?? '');
+		$dn = strtolower(trim($dn));
+		$fq = ($dn === '' || $dn === '@') ? $zone : (substr($dn, -1) === '.' ? rtrim($dn, '.') : $dn.'.'.$zone);
+		if ($fq !== $name)
+			continue;
+		$out[] = array('line' => (int)$e['line_index'], 'ttl' => (int)($e['ttl'] ?? 14400),
+			'value' => $type === 'TXT' ? implode('', $data) : strtolower((string)($data[0] ?? '')));
+	}
+	return $serial === '' ? null : $out;
+}
+
+function dns_rrset_get($name, $type) {
+	$recs = cpanel_rrset_records($name, $type);
+	return $recs === null ? null : array_column($recs, 'value');
+}
+
+function dns_rrset_set($name, $type, $values) {
+	global $api_server;
+	$name = strtolower(rtrim(trim($name), '.'));
+	$values = array_values(array_unique(array_map('strval', $values)));
+	for ($step = 0; $step < 20; $step++) {
+		$recs = cpanel_rrset_records($name, $type, $zone, $serial);
+		if ($recs === null)
+			return 'Error: DNS API: no managed zone holds '.$name.'.';
+		$gone = array_values(array_filter($recs, function ($r) use ($values) { return !in_array($r['value'], $values, true); }));
+		$new  = array_values(array_diff($values, array_column($recs, 'value')));
+		if (!$gone && !$new)
+			return '';
+		$rec = array('dname' => $name.'.', 'ttl' => $gone ? $gone[0]['ttl'] : 14400, 'record_type' => $type,
+			'data' => $new ? ($type === 'TXT' ? dns_txt_chunks($new[0]) : array($new[0])) : array());
+		if ($gone && $new)
+			$op = 'edit='.rawurlencode(json_encode($rec + array('line_index' => $gone[0]['line'])));
+		elseif ($new)
+			$op = 'add='.rawurlencode(json_encode($rec));
+		else
+			$op = 'remove='.$gone[0]['line'];
+		$json = cpanel_whm_api('https://'.$api_server.':2087/json-api/mass_edit_dns_zone?api.version=1&zone='.rawurlencode($zone).'&serial='.rawurlencode($serial).'&'.$op, true);
+		if (!isset($json['metadata']['result']) || (int)$json['metadata']['result'] == 0)
+			return 'Error: DNS API: '.trim($json['metadata']['reason'] ?? "$type $name failed").'.';
+	}
+	return 'Error: DNS API: '.$type.' '.$name.' did not settle.';
+}
+
+/* ---- whole zones (dns_zone_rrsets / dns_zone_put, see functions.php) ------
+   parse_dns_zone again (its line_index is what mass_edit_dns_zone wants),
+   one change per mass_edit call and the zone read again before each. */
+function cpanel_host_fq($host, $zone) {
+	$host = strtolower(trim((string)$host));
+	if ($host === '' || $host === '@')
+		return $zone;
+	if ($host === '.')
+		return '.';
+	return substr($host, -1) === '.' ? rtrim($host, '.') : $host.'.'.$zone;
+}
+
+/* Every record of the zone (not SOA): {line, name, type, ttl, value}; null when it is not here. */
+function cpanel_zone_entries($zone, &$serial = null) {
+	global $api_server;
+	$zone = strtolower(rtrim(trim($zone), '.'));
+	if (!array_key_exists($zone, get_zones()))
+		return null;
+	$json = cpanel_whm_api('https://'.$api_server.':2087/json-api/parse_dns_zone?api.version=1&zone='.rawurlencode($zone), true);
+	if (!isset($json['data']['payload']) || !is_array($json['data']['payload']))
+		return null;
+	$serial = '';
+	$out = array();
+	foreach ($json['data']['payload'] as $e) {
+		if (($e['type'] ?? '') !== 'record')
+			continue;
+		$t = (string)$e['record_type'];
+		$data = array_map('base64_decode', (array)($e['data_b64'] ?? array()));
+		if ($t === 'SOA') {
+			$serial = trim((string)($data[2] ?? ''));
+			continue;
+		}
+		$dn = isset($e['dname_b64']) ? base64_decode($e['dname_b64']) : (string)($e['dname_raw'] ?? '');
+		switch ($t) {
+		case 'TXT':   $v = implode('', $data); break;
+		case 'CNAME': case 'NS': case 'PTR': $v = cpanel_host_fq($data[0] ?? '', $zone); break;
+		case 'MX':    $v = (int)($data[0] ?? 0).' '.cpanel_host_fq($data[1] ?? '', $zone); break;
+		case 'SRV':   $v = (int)($data[0] ?? 0).' '.(int)($data[1] ?? 0).' '.(int)($data[2] ?? 0).' '.cpanel_host_fq($data[3] ?? '', $zone); break;
+		case 'CAA':   $v = dns_value_join('CAA', array((int)($data[0] ?? 0), strtolower((string)($data[1] ?? '')), dns_txt_decode((string)($data[2] ?? '')))); break;
+		default:      $v = dns_value_from_zone($t, implode(' ', $data));
+		}
+		$out[] = array('line' => (int)$e['line_index'], 'name' => cpanel_host_fq($dn, $zone), 'type' => $t, 'ttl' => (int)($e['ttl'] ?? 14400), 'value' => $v);
+	}
+	return $serial === '' ? null : $out;
+}
+
+/* A value -> mass_edit_dns_zone's data fields. */
+function cpanel_record_data($type, $value) {
+	$dot = function ($h) { return $h === '.' ? '.' : $h.'.'; };
+	$p = dns_value_parts($type, $value);
+	switch ($type) {
+	case 'TXT':   return dns_txt_chunks($value);
+	case 'CNAME': return array($dot(dns_host_canon($value)));
+	case 'MX':    return array((int)$p[0], $dot($p[1]));
+	case 'SRV':   return array((int)$p[0], (int)$p[1], (int)$p[2], $dot($p[3]));
+	case 'CAA':   return array((int)$p[0], $p[1], (string)$p[2]);
+	}
+	return array($value);
+}
+
+function dns_zone_rrsets($zone) {
+	$entries = cpanel_zone_entries($zone);
+	if ($entries === null)
+		return null;
+	$sets = array();
+	foreach ($entries as $e) {
+		$k = $e['type'].' '.$e['name'];
+		if (!isset($sets[$k]))
+			$sets[$k] = array('name' => $e['name'], 'type' => $e['type'], 'ttl' => $e['ttl'], 'values' => array(), 'proxied' => null);
+		$sets[$k]['values'][] = $e['value'];
+	}
+	return array_values($sets);
+}
+
+function dns_zone_put($zone, $name, $type, $ttl, $values) {
+	global $api_server;
+	$zone = strtolower(rtrim(trim($zone), '.'));
+	$name = strtolower(rtrim(trim($name), '.'));
+	$values = array_values(array_unique(array_map('strval', $values)));
+	for ($step = 0; $step < 40; $step++) {
+		$entries = cpanel_zone_entries($zone, $serial);
+		if ($entries === null)
+			return 'Error: DNS API: no managed zone '.$zone.'.';
+		$recs = array_values(array_filter($entries, function ($e) use ($name, $type) { return $e['name'] === $name && $e['type'] === $type; }));
+		$gone  = array_values(array_filter($recs, function ($r) use ($values) { return !in_array($r['value'], $values, true); }));
+		$stale = array_values(array_filter($recs, function ($r) use ($values, $ttl) { return in_array($r['value'], $values, true) && $r['ttl'] !== (int)$ttl; }));
+		$new   = array_values(array_diff($values, array_column($recs, 'value')));
+		$rec = array('dname' => $name.'.', 'ttl' => (int)$ttl, 'record_type' => $type);
+		if ($gone && $new)
+			$op = 'edit='.rawurlencode(json_encode($rec + array('data' => cpanel_record_data($type, $new[0]), 'line_index' => $gone[0]['line'])));
+		elseif ($new)
+			$op = 'add='.rawurlencode(json_encode($rec + array('data' => cpanel_record_data($type, $new[0]))));
+		elseif ($gone)
+			$op = 'remove='.$gone[0]['line'];
+		elseif ($stale)
+			$op = 'edit='.rawurlencode(json_encode($rec + array('data' => cpanel_record_data($type, $stale[0]['value']), 'line_index' => $stale[0]['line'])));
+		else
+			return '';
+		$json = cpanel_whm_api('https://'.$api_server.':2087/json-api/mass_edit_dns_zone?api.version=1&zone='.rawurlencode($zone).'&serial='.rawurlencode($serial).'&'.$op, true);
+		if (!isset($json['metadata']['result']) || (int)$json['metadata']['result'] == 0)
+			return 'Error: DNS API: '.trim($json['metadata']['reason'] ?? "$type $name failed").'.';
+	}
+	return 'Error: DNS API: '.$type.' '.$name.' did not settle.';
+}

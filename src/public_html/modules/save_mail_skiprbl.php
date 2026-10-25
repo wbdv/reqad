@@ -68,7 +68,7 @@ if ($op === 'providers') {
 	$r = array('error' => 'Unknown skip-RBL operation.', 'success' => '');
 }
 
-error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.$_SERVER['USER']
+error_log(date('Y-m-d H:i:s').' '.$_SERVER['REMOTE_ADDR'].' '.auth_user()
         .' save mail skiprbl ['.$op.'] '.($r['error'] === '' ? 'ok' : 'FAILED')."\n", 3, '../log/route_log');
 
 msg_redirect('/email-config/exim/?tab=blocklists',

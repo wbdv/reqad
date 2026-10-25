@@ -168,6 +168,10 @@
 		.text-grey {
 			color:#DDD !important;
 		}
+		/* grey "nothing happening" badge text: .badge.bg-grey-lt.badge-muted */
+		.badge-muted {
+			color:#888 !important;
+		}
 		.term-container {
 		  background: #222;
 		  color: #ddd;
@@ -183,9 +187,10 @@
 			background: #22222222;
 			height: 5px;
 		}
-		.progress .progress-bar {
+		/* .progress .progress-bar {
+		.progress .bg-success {
 			background: #206bc4EE !important;
-		}
+		} */
 		</style>
     <script>
       // Generate a password string
@@ -285,6 +290,19 @@
                       <li><a class="dropdown-item <?php if($route=='addon-domains') echo 'active'; ?>" href="/addon-domains/">Addon Domains</a>
                     <? } ?>
                       <li><a class="dropdown-item <?php if($route=='ssh-keys') echo 'active'; ?>" href="/ssh-keys/">SSH Keys</a>
+                      <li><a class="dropdown-item <?php if($route=='bandwidth') echo 'active'; ?>" href="/bandwidth/">Bandwidth Usage</a>
+                      <li><a class="dropdown-item <?php if($route=='resources') echo 'active'; ?>" href="/resources/">Resource Usage</a>
+                    <? if(shelllog_enabled()) { ?>
+                      <li><a class="dropdown-item <?php if($route=='shell-activity') echo 'active'; ?>" href="/shell-activity/">Shell Activity</a>
+                    <? } ?>
+                    <? if(feature_enabled($ini, 'deployments')) { ?>
+                      <li><a class="dropdown-item <?php if($route=='deployments') echo 'active'; ?>" href="/deployments/">Deployments</a>
+                    <? } ?>
+<?php foreach((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl):
+          if(($pl['menu_parent'] ?? '') !== 'accounts') continue;
+          if(!empty($pl['feature']) && !(isset($ini[$pl['feature']]) && $ini[$pl['feature']]==1)) continue; ?>
+                      <li><a class="dropdown-item <?=($route==$pl['route']?'active':'');?>" href="/<?=htmlspecialchars($pl['route'])?>/"><?=htmlspecialchars($pl['title'])?></a>
+<?php endforeach; ?>
                     </ul>
                 </div>
               </li>
@@ -435,6 +453,7 @@
               <!-- Add-on modules: plugins/*/plugin.php, gated by each plugin's feature flag -->
 <?php $__plugins = isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array();
       foreach($__plugins as $pl):
+          if(!empty($pl['menu_parent'])) continue;   /* listed in that submenu */
           if(!empty($pl['feature']) && !(isset($ini[$pl['feature']]) && $ini[$pl['feature']]==1)) continue; ?>
               <li class="nav-item">
                 <a class="nav-link <?=($route==$pl['route']?'active':'');?>" href="<?=htmlspecialchars($pl['route'])?>/">
@@ -454,8 +473,19 @@
                 </a>
                 <div class="collapse show" id="menu-settings">
                     <ul class="btn-toggle-nav list-unstyled fw-normal pb-1 small">
-                      <li><a class="dropdown-item <?php if($route=='dns-settings') echo 'active'; ?>" href="/dns-settings/">DNS Settings</a>
+                      <li><a class="dropdown-item <?php if(in_array($route, array('dns-settings', 'dns-cluster', 'dns-keys'))) echo 'active'; ?>" href="/dns-settings/">DNS Settings</a>
                       <li><a class="dropdown-item <?php if($route=='php-settings') echo 'active'; ?>" href="/php-settings/">PHP Settings</a>
+                      <li><a class="dropdown-item <?php if($route=='security') echo 'active'; ?>" href="/security/">Security</a>
+<? if(feature_enabled($ini, 'api')) { ?>
+                      <li><a class="dropdown-item <?php if($route=='api-access') echo 'active'; ?>" href="/api-access/">API Access</a>
+<? } if(feature_enabled($ini, 'mcp')) { ?>
+                      <li><a class="dropdown-item <?php if($route=='ai-access') echo 'active'; ?>" href="/ai-access/">AI Access</a>
+<? } ?>
+<?php foreach((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl):
+          if(($pl['menu_parent'] ?? '') !== 'settings') continue;
+          if(!empty($pl['feature']) && !(isset($ini[$pl['feature']]) && $ini[$pl['feature']]==1)) continue; ?>
+                      <li><a class="dropdown-item <?=($route==$pl['route']?'active':'');?>" href="/<?=htmlspecialchars($pl['route'])?>/"><?=htmlspecialchars($pl['title'])?></a>
+<?php endforeach; ?>
                     </ul>
                 </div>
               </li>
@@ -525,6 +555,16 @@
                   </span>
                 </a>
               </li>
+<?php if(function_exists('auth_web_enabled') && auth_web_enabled()): ?>
+              <li class="nav-item">
+                <form method="post" action="/logout/" class="m-0">
+                  <button type="submit" class="nav-link border-0 bg-transparent w-100 text-start">
+                    <span class="nav-link-icon d-md-none d-lg-inline-block"><svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M14 8v-2a2 2 0 0 0 -2 -2h-7a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2 -2v-2" /><path d="M9 12h12l-3 -3" /><path d="M18 15l3 -3" /></svg></span>
+                    <span class="nav-link-title">Log out <span class="text-muted small">(<?=h(auth_user())?>)</span></span>
+                  </button>
+                </form>
+              </li>
+<?php endif; ?>
             </ul>
             <script>
             /* Sidebar menu live-filter: hides menu rows that don't match the

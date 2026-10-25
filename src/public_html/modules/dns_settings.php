@@ -1,6 +1,7 @@
 <?php
 $errmsg 	= '';
 $successmsg = '';
+$fw_note    = '';
 
 #echo '<pre>'; print_r($_POST); exit;
 
@@ -68,9 +69,31 @@ if($_POST["dns-provider"]=='powerdns') {
 	setting_put('powerdns-api-key',      $_POST["powerdns-api-key"]);
 	setting_put('powerdns-mode',         $_POST["powerdns-mode"]);
 	setting_put('powerdns-insecure-tls', isset($_POST['powerdns-insecure-tls']) ? '1' : '0');
+	/* the zones' name servers, in either mode (new zones name them; DNS Zones checks them) */
+	foreach(array('powerdns-ns1', 'powerdns-ns2') as $nsk) {
+		$nsv = strtolower(rtrim(trim((string)($_POST[$nsk] ?? '')), '.'));
+		if($nsv !== '' && !valid_domain($nsv))
+			$errmsg = 'The name server '.$nsv.' is not a host name, such as ns1.example.com.';
+		else
+			setting_put($nsk, $nsv);
+	}
+	/* A DNS server on another port (another Reqad server's DNS API is
+	   https://<host>:2087/pdns): csf drops outgoing traffic to ports missing
+	   from TCP_OUT, which looks like a DNS server that does not answer, so
+	   the port is opened here (no-op when it already is, or without csf). */
+	$pdns_u = parse_url(trim((string)$_POST["powerdns-server"]));
+	$pdns_port = isset($pdns_u['port']) ? (int)$pdns_u['port'] : 0;
+	if($pdns_port > 0 && !in_array($pdns_port, array(80, 443), true)
+	   && !in_array(strtolower(trim((string)($pdns_u['host'] ?? ''), '[]')), array('', 'localhost', '127.0.0.1', '::1'), true)) {
+		$fw = csf_open_tcp_out($pdns_port);
+		if($fw === 'updated')
+			$fw_note = ' Outgoing port '.$pdns_port.' opened in the csf firewall.';
+		elseif($fw === 'error')
+			$fw_note = ' Outgoing port '.$pdns_port.' could not be opened in the csf firewall (TCP_OUT in /etc/csf/csf.conf).';
+		if($fw_note !== '')
+			route_log('dns settings: csf TCP_OUT '.$pdns_port.' '.$fw);
+	}
 	if($_POST["powerdns-mode"]=='hidden-master') {
-		setting_put('powerdns-ns1',         $_POST["powerdns-ns1"]);
-		setting_put('powerdns-ns2',         $_POST["powerdns-ns2"]);
 		setting_put('powerdns-agent-url',   $_POST["powerdns-agent-url"]);
 		setting_put('powerdns-agent-token', $_POST["powerdns-agent-token"]);
 	}
@@ -97,8 +120,14 @@ if($_POST["dns-provider"]=='powerdns') {
 
 if($errmsg == '' && $successmsg == '') {
     // All ok
-    #error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER']." create forwarder $email -> $forward\n", 3, '../log/route_log');
+    #error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user()." create forwarder $email -> $forward\n", 3, '../log/route_log');
 	#shell_exec('echo "'.$user.": ".$forward.'" | sudo tee --append /etc/exim/forwards/'.$domain);
 	$successmsg =  "DNS Settings saved.";
+}
+if($fw_note !== '') {
+	if($errmsg != '')
+		$errmsg .= $fw_note;
+	else
+		$successmsg .= $fw_note;
 }
 ?>

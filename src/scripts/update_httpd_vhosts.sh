@@ -1,6 +1,7 @@
 #!/bin/bash
 # Update existing Apache vhost configs in /etc/httpd/conf.d/ to:
-#   - Add mail.<domain> to ServerAlias in the :80 VirtualHost only
+#   - Add mail.<domain> to ServerAlias in every VirtualHost (accounts with email):
+#     :80 and :443 must answer to the same names, or certbot cannot pair them
 #   - Add "Require all granted" inside <Directory public_html> blocks if missing
 #   - Add PHP open_basedir, error_log, and security settings to :443 block if missing
 # Safe to run multiple times — skips files already up to date.
@@ -12,6 +13,9 @@ fi
 
 DB="/usr/local/reqad/db/reqad.db"
 CONF_DIR="/etc/httpd/conf.d"
+# the php_admin_* lines need mod_php; on a php-fpm-only template the pool has them
+. /usr/local/reqad/scripts/web_caps.sh
+web_caps
 changed=0
 
 for conf in "$CONF_DIR"/*.conf; do
@@ -29,11 +33,10 @@ for conf in "$CONF_DIR"/*.conf; do
 
     checksum_before=$(md5sum "$conf")
 
-    # 1. Add mail.<domain> to ServerAlias inside the :80 VirtualHost block only
-    if ! grep -qE "^\s*ServerAlias\s+.*mail\.${domain}" "$conf"; then
-        sed -i "/^<VirtualHost[[:space:]][^>]*:80>/,/^<\/VirtualHost>/ {
-            /^\s*ServerAlias\s/ s/$/ mail.${domain}/
-        }" "$conf"
+    # 1. Add mail.<domain> to every ServerAlias line that lacks it (both blocks)
+    has_email=$(/usr/bin/sqlite3 -init /dev/null -batch -noheader -list "$DB" "SELECT has_email FROM accounts WHERE domain='${domain}' LIMIT 1;" 2>/dev/null)
+    if [ "$has_email" = 1 ]; then
+        sed -i "/^\s*ServerAlias\s/ { / mail\.${domain//./\\.}\( \|\$\)/! s/\$/ mail.${domain}/ }" "$conf"
     fi
 
     # 2. Add "Require all granted" inside <Directory .../public_html> blocks if missing
@@ -45,7 +48,7 @@ for conf in "$CONF_DIR"/*.conf; do
 
     # 3. Add PHP settings if open_basedir is missing
     #    Insert before </VirtualHost> in the :443 block (or the only block for plain HTTP)
-    if ! grep -q "open_basedir" "$conf"; then
+    if [ "$PHP_MODE" = modphp ] && ! grep -q "open_basedir" "$conf"; then
         php_block="    php_admin_value open_basedir          /home/${user}
     php_admin_value disable_functions     show_source,system,shell_exec,passthru,exec,popen,proc_open
     php_admin_value error_log             /home/${user}/logs/${domain}-error.log

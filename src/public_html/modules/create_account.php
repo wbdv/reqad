@@ -16,6 +16,9 @@ $r = account_create($db, array(
 	'letsencrypt'   => $on('letsencrypt'),
 	'email'         => $on('email'),
 	'www'           => $on('www_alias'),
+	'php'           => trim($_POST['phpversion'] ?? ''),   // '' = server default
+	'shell'         => trim($_POST['shell'] ?? ''),        // '' = Settings > Security default
+	'package'       => trim($_POST['package'] ?? ''),      // hosting package (plugin), '' = its default
 	'ssl_msg_token' => $sslmsgtoken,
 ));
 

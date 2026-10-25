@@ -14,7 +14,7 @@ if ($addon === null)
 	$errmsg = "Error: '".$domain."' is not an addon domain on this server.";
 
 if ($errmsg == '') {
-	error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".$_SERVER['USER'].
+	error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ".auth_user().
 	          " delete addon domain $domain".($del_docroot ? ' (with document root)' : '')."\n", 3, '../log/route_log');
 
 	$cmd = 'sudo '.__DIR__.'/../../scripts/deldomain --domain='.escapeshellarg($domain);
@@ -24,8 +24,12 @@ if ($errmsg == '') {
 
 	if (is_file(addon_vhost_path($ini, $domain)))
 		$errmsg = "Error: Addon domain ".$domain." could not be removed: ".trim((string)$output);
-	else
+	else {
+		domain_mail_forget($domain);
+		wp_cache_rules_forget($domain);
+		plugin_hook('addon.deleted', array('account' => $addon['user'], 'domain' => $domain, 'files' => $del_docroot));
 		$successmsg = "Addon domain ".$domain." was removed".($del_docroot ? ", together with its document root." : ". Its files in ".$addon['docroot']." were kept.");
+	}
 }
 
 /* Post/Redirect/Get: carry the message via the queue and 302 to the GET page

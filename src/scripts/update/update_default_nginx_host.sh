@@ -28,6 +28,10 @@ else
     SSL_KEY="ssl_certificate_key /etc/ssl/certs/${HOSTNAME}.key;"
 fi
 
+# setup_error_pages.sh runs later on a first install and adds the include itself
+ERROR_PAGES='    # (error pages: setup_error_pages.sh adds them)'
+[ -f /etc/nginx/reqad-error-pages.conf ] && ERROR_PAGES='    include /etc/nginx/reqad-error-pages.conf;'
+
 cat > "$CONF" << EOF
 upstream php-fpm-nginx {
     server unix:/run/php-fpm-nginx.sock;
@@ -52,7 +56,9 @@ server {
 
     root /var/www/html;
     index index.php index.html index.htm;
-    include /etc/nginx/reqad-error-pages.conf;
+${ERROR_PAGES}
+    # Git deploy webhooks (scripts/update/setup_deploy_webhook.sh)
+    include /etc/nginx/reqad-deploy-hook*.conf;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$args;

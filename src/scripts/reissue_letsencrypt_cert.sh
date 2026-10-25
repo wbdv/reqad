@@ -13,8 +13,13 @@ MAIN="${DOMAINS%%,*}"      # first domain = lineage name
 
 # brief settle time for freshly-created alias DNS records to be answerable
 sleep 15
-sudo certbot --non-interactive --nginx --expand --cert-name "$MAIN" -d "$DOMAINS" >> /usr/local/reqad/log/debug_log 2>&1
+# certbot plugin = the front web server of the template
+. /usr/local/reqad/scripts/web_caps.sh
+web_caps
+PLUGIN=nginx; [ "$WEB_FRONT" = httpd ] && PLUGIN=apache
+sudo certbot --non-interactive --"$PLUGIN" --expand --cert-name "$MAIN" -d "$DOMAINS" >> /usr/local/reqad/log/debug_log 2>&1
 RC=$?
+[ "$PLUGIN" = apache ] && sudo /usr/local/reqad/scripts/update/merge_le_ssl_vhosts.sh --quiet --domain="$MAIN" >> /usr/local/reqad/log/debug_log 2>&1
 
 # Refresh Dovecot/exim SNI certs in case mail.<domain> coverage changed.
 sudo /usr/local/reqad/scripts/update_email_sni >> /usr/local/reqad/log/debug_log 2>&1

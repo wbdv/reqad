@@ -47,6 +47,12 @@
         }
         $('form').each(function () { addToken(this); });
         $(document).on('submit', 'form', function () { addToken(this); });
+        // Web login: an AJAX call answered 401 means the session ended - go to
+        // the login page and come back here afterwards.
+        $(document).ajaxError(function (e, xhr) {
+            if (xhr.status === 401)
+                window.location.href = '/login/?next=' + window.location.pathname + window.location.search;
+        });
     });
     </script>
     <script>

@@ -443,7 +443,9 @@ function wordpress_copy_run(array $row, array $o) {
 
 	/* a certificate browsers trust, when the name points here already */
 	$pt = domain_points(array($domain), $user);
-	if (!empty($pt[$domain]['here'])) {
+	if (($free = ssl_free_error($user)) !== '')
+		$warn[] = $free.' The copy has a self-signed certificate, so browsers warn.';
+	elseif (!empty($pt[$domain]['here'])) {
 		$r = ssl_site_issue($user, $domain);
 		$log[] = '# certificate: '.($r['ok'] ? $r['message'] : $r['error']);
 		if (!$r['ok'])

@@ -86,6 +86,7 @@ Commands:
   resources        CPU, memory and processes of each account, the limits it reached
   shelllog         Commands run by hosting accounts (SSH, terminal, cron, sites): on/off, list
   dns              DNS cluster health, and the zones this server's sites need (dns zones)
+  transfer         cPanel transfers: the history, their logs, the IP map and restoring its addresses
   mcp              AI assistants (MCP): turn on or off, tokens, the server they connect to
 {$addons}
 Run '{$prog} <command> --help' for the command's own options.
@@ -209,6 +210,7 @@ Usage: {$prog} email list   [--domain=DOMAIN]
        {$prog} email delete <address> [--yes]
        {$prog} email sites  <account>
        {$prog} email site   <domain> on|off [--no-cert]
+       {$prog} email webmail-links [--remove]
 
 edit:
   --password        Set a new password (prompt, or --password-stdin)
@@ -231,6 +233,10 @@ site              Turn email on or off for an addon domain or subdomain (the mai
                   its mail came here, its MX and DKIM records go and SPF says it
                   sends no mail. A Let's Encrypt certificate is issued again to
                   add or drop mail.<domain> (--no-cert: leave it as it is).
+webmail-links     Every site of an account with email sends /webmail to
+                  https://<hostname>:2087/webmail/ (Settings > Webmail address,
+                  on by default; runs every hour). --remove takes it out of
+                  every site.
 
 HELP);
     usage_common();
@@ -264,7 +270,8 @@ firewall off    Open port 2087 to every address again when the panel's IP allowl
                 (Settings > Security) keeps you out. The saved list is kept.
 email-code off  Stop asking new devices for the emailed login code - when the code
                 does not arrive. It is asked for when 2FA is off and the panel can
-                send email (Settings > Security > New devices); 'on' restores that.
+                send email and its switch (Settings > Security > New devices) is
+                on; 'on' turns it back on.
 passkeys        List the passkeys that can log in as <user>; --remove-all deletes
                 them (a lost or stolen device). The password keeps working.
 
@@ -452,6 +459,37 @@ collect         Read the audit log since the last time. Cron runs it every minut
 Programs are logged by the kernel, also inside the jailed shell; shell
 builtins (cd, echo > file) start no program and are not seen. The same command
 again within the hour adds to one line (x N).
+
+HELP);
+}
+
+function usage_transfer($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} transfer list
+       {$prog} transfer show       <transfer>
+       {$prog} transfer log        <transfer> [<account>]
+       {$prog} transfer ip-map     <transfer>
+       {$prog} transfer ip-restore <transfer>|<file> [--apply]
+
+Transfers from cPanel are made on the panel's Transfer tool page; each one is
+kept with its logs in /usr/local/reqad/transfers/. <transfer> is the id that
+'list' shows (or 'latest').
+
+list            Every transfer, newest first: when, from where, its accounts, how it ended.
+show            One transfer: each account's state and its own log.
+log             The whole log of a transfer (its own, then each account's), or one
+                account's.
+ip-map          The IP map of a transfer: the address each site had on the cPanel
+                server and the address its mail went out from, one line per site.
+                Save it ('> file') to keep it; lines can be edited or removed.
+ip-restore      What restoring an IP map would do, and with --apply do it: once the
+                cPanel server's addresses are on this server (Settings > IP
+                addresses), each account gets back the address that was its own on
+                cPanel, and domains whose mail went out from another address get an
+                outgoing mail rule for it, so DNS can stay as it is. Addresses
+                shared by several accounts are not given to one: every site answers
+                on every address of this server. Needs Hosting Pro. Logged in
+                /usr/local/reqad/transfers/ip-restores.log.
 
 HELP);
 }
@@ -1085,6 +1123,13 @@ function cli_spec() {
             'stop'      => array('opts' => array('start'),                                                          'arg' => 'account'),
             'collect'   => array('opts' => array('quiet'),                                                          'arg' => ''),
         ),
+        'transfer' => array(
+            'list'       => array('opts' => array(),                                                                'arg' => ''),
+            'show'       => array('opts' => array(),                                                                'arg' => ''),
+            'log'        => array('opts' => array(),                                                                'arg' => ''),
+            'ip-map'     => array('opts' => array(),                                                                'arg' => ''),
+            'ip-restore' => array('opts' => array('apply'),                                                         'arg' => ''),
+        ),
         'dns' => array(
             'status'   => array('opts' => array(),                                                                  'arg' => ''),
             'check'    => array('opts' => array('wait', 'registry', 'quiet'),                                       'arg' => ''),
@@ -1114,6 +1159,7 @@ function cli_spec() {
             'delete' => array('opts' => array('yes'),                                                                     'arg' => 'mailbox'),
             'sites'  => array('opts' => array(),                                                                          'arg' => 'account'),
             'site'   => array('opts' => array('no-cert'),                                                                 'arg' => ''),
+            'webmail-links' => array('opts' => array('remove'),                                                           'arg' => ''),
         ),
     );
 }
@@ -1708,6 +1754,119 @@ function cmd_shelllog($prog, $sub, array $pos, array $opts) {
         usage_shelllog($prog);
         exit(2);
     }
+}
+
+/* ---- transfer ------------------------------------------------------------ */
+
+function cmd_transfer($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('transfer', $sub));
+    $json = !empty($opts['json']);
+    $job_id = function ($x) use ($opts) {
+        if ($x === 'latest') {
+            $l = transfer_job_list();
+            if (!$l)
+                cli_result(result_error('No transfers yet.'), $opts);
+            return $l[0]['id'];
+        }
+        if (!transfer_job_get($x))
+            cli_result(result_error("No transfer '$x'. 'reqad transfer list' shows them."), $opts);
+        return $x;
+    };
+    $when = function ($t) { return $t ? date('Y-m-d H:i', $t) : '-'; };
+    switch ($sub) {
+    case 'list':
+        cli_need($pos, 0, '');
+        $l = transfer_job_list();
+        if ($json)
+            cli_result(result_ok('', $l), $opts);
+        if (!$l)
+            cli_result(result_ok('No transfers yet.'), $opts);
+        printf("%-16s  %-16s  %-28s  %-9s  %-24s  %s\n", 'TRANSFER', 'STARTED', 'FROM', 'STATUS', 'RESULT', 'ACCOUNTS');
+        foreach ($l as $j)
+            printf("%-16s  %-16s  %-28s  %-9s  %-24s  %s\n", $j['id'], $when($j['created']), $j['server'], $j['active'] ? 'running' : $j['status'],
+                   ($j['done'] + $j['warn']).'/'.$j['accounts'].' done'.($j['warn'] ? ", {$j['warn']} to check" : '').($j['failed'] ? ", {$j['failed']} failed" : ''),
+                   implode(' ', $j['users']));
+        exit(0);
+    case 'show':
+        cli_need($pos, 1, '<transfer>');
+        $r = transfer_job_status($job_id($pos[0]));
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        $d = $r['data'];
+        echo "Transfer:  {$d['id']} from {$d['server']}\n";
+        echo 'Started:   '.$when($d['created']).($d['by'] !== '' ? " by {$d['by']}" : '')."\n";
+        echo 'Status:    '.($d['active'] ? 'running' : $d['status'])."\n";
+        echo 'Parts:     '.implode(', ', array_keys(array_filter($d['parts'])))."\n";
+        echo 'IP map:    '.($d['ips'] ? "yes ('$prog transfer ip-map {$d['id']}')" : 'no')."\n\n";
+        printf("%-16s  %-30s  %-8s  %-8s  %s\n", 'ACCOUNT', 'DOMAIN', 'STATUS', 'TO CHECK', 'STEP');
+        foreach ($d['accounts'] as $a)
+            printf("%-16s  %-30s  %-8s  %-8s  %s\n", $a['user'], $a['domain'], $a['status'], $a['warnings'] ?: '-', $a['step']);
+        if ($d['joblog'] !== '')
+            echo "\n".$d['joblog'];
+        exit(0);
+    case 'log':
+        cli_need($pos, 1, '<transfer> [<account>]');
+        $r = transfer_job_log_text($job_id($pos[0]), $pos[1] ?? '');
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        echo $r['data']['text'];
+        exit(0);
+    case 'ip-map':
+        cli_need($pos, 1, '<transfer>');
+        $r = transfer_ip_map_get($job_id($pos[0]));
+        if ($json || !$r['ok'])
+            cli_result($r, $opts);
+        echo $r['data']['text'];
+        exit(0);
+    case 'ip-restore':
+        cli_need($pos, 1, '<transfer>|<file>');
+        $x = $pos[0];
+        if ($x === 'latest' || transfer_job_valid_id($x)) {
+            $m = transfer_ip_map_get($job_id($x));
+            if (!$m['ok'])
+                cli_result($m, $opts);
+            $text = $m['data']['text'];
+            $source = 'transfer '.$job_id($x);
+        } else {
+            if (!is_file($x) || !is_readable($x))
+                cli_result(result_error("No transfer or readable file '$x'."), $opts);
+            if (filesize($x) > 2097152)
+                cli_result(result_error("$x is too big for an IP map (2 MB at most)."), $opts);
+            $text = (string)file_get_contents($x);
+            $source = 'file '.basename($x);
+        }
+        list($rows, $errors) = transfer_ip_map_parse($text);
+        foreach ($errors as $e)
+            fwrite(STDERR, "left out: $e\n");
+        if (!$rows)
+            cli_result(result_error('No usable lines in the IP map.'), $opts);
+        if (!empty($opts['apply'])) {
+            $r = transfer_ip_restore($rows, $source);
+            if ($json)
+                cli_result($r, $opts);
+            foreach ((array)($r['data']['results'] ?? array()) as $res)
+                echo ($res['ok'] ? 'ok    ' : 'FAIL  ').$res['what'].': '.$res['text']."\n";
+            cli_result($r, $opts);
+        }
+        $p = transfer_ip_plan($rows)['data'];
+        if ($json)
+            cli_result(result_ok('', $p + array('errors' => $errors)), $opts);
+        if (!$p['hosting'])
+            fwrite(STDERR, "Giving accounts their own addresses needs Reqad Hosting Pro: this only shows what the map holds.\n");
+        $label = array('done' => 'as on cPanel', 'ready' => 'to restore', 'missing' => 'not here yet', 'taken' => 'taken', 'warn' => 'look', 'skip' => 'left out');
+        foreach ($p['accounts'] as $a) {
+            echo "{$a['account']} ({$a['domain']})\n";
+            foreach ($a['items'] as $it)
+                printf("  %-12s  %-24s  %-39s  %s\n", $label[$it['state']] ?? $it['state'], mb_strimwidth($it['what'], 0, 24, '…'), $it['address'], $it['text']);
+        }
+        $c = $p['counts'];
+        echo "\n{$c['ready']} to restore, {$c['done']} as on cPanel already, {$c['missing']} not on this server yet"
+            .($c['taken'] ? ", {$c['taken']} given to another account" : '').($c['warn'] ? ", {$c['warn']} to look at" : '').'.'
+            .($c['ready'] && $p['hosting'] ? " Run again with --apply to restore." : '')."\n";
+        exit(0);
+    }
+    usage_transfer($prog);
+    exit(2);
 }
 
 function cmd_dns($prog, $sub, array $pos, array $opts) {
@@ -2414,6 +2573,18 @@ function cmd_db($prog, $sub, array $pos, array $opts) {
 
 function cmd_email($prog, $sub, array $pos, array $opts) {
     global $db, $ini;
+    /* before the email check: with email off it takes the links out */
+    if ($sub === 'webmail-links') {
+        cli_allow($opts, cli_opts('email', 'webmail-links'));
+        cli_need($pos, 0, '');
+        $remove = !empty($opts['remove']);
+        $warn = webmail_links_sync_all($remove);
+        $on = !$remove && webmail_link_enabled();
+        cli_result(result_ok(!$on ? 'No site sends /webmail here'.($remove ? ' now.' : ' (email is off, or the setting webmail-link is 0).')
+                                  : (webmail_link_host() === '' ? 'The server has no usable hostname (hostname -f), so no site sends /webmail here.'
+                                                                : 'Every site of an account with email sends /webmail to https://'.webmail_link_host().':2087/webmail/.'),
+            array('on' => $on), $warn), $opts);
+    }
     if (!feature_enabled($ini, 'email'))
         cli_result(result_error("Email is disabled on this server (email=0 in etc/server-software.ini)."), $opts);
     switch ($sub) {
@@ -3616,6 +3787,7 @@ switch ($arg) {
     case 'resources':
     case 'shelllog':
     case 'dns':
+    case 'transfer':
         break;
 
     default:

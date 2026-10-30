@@ -1776,32 +1776,6 @@
 		exit;
 	}
 
-	// Transfer tool: run generated commands as reqad user
-	if (isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-run') {
-		header('Content-Type: application/json');
-		$commands = trim($_POST["commands"] ?? '');
-		if(empty($commands)) {
-			echo json_encode(['error' => 'No commands provided.']); exit;
-		}
-		$job_id      = bin2hex(random_bytes(8));
-		$transfers_dir = _PATH . "/transfers";
-		if (!is_dir($transfers_dir)) { mkdir($transfers_dir, 0750, true); }
-		$log_file    = $transfers_dir . "/reqad_transfer_{$job_id}.log";
-		$sh_file     = $transfers_dir . "/reqad_transfer_{$job_id}.sh";
-
-		$script  = "#!/bin/bash\nEXIT=0\n";
-		$script .= "exec >> " . escapeshellarg($log_file) . " 2>&1\n";
-		$script .= "trap 'echo \"###DONE:\$EXIT###\"' EXIT\n";
-		$script .= $commands . "\n";
-
-		file_put_contents($sh_file, $script);
-		chmod($sh_file, 0755);
-		shell_exec("bash " . escapeshellarg($sh_file) . " </dev/null >/dev/null 2>&1 &");
-
-		echo json_encode(['job_id' => $job_id]);
-		exit;
-	}
-
 	// PHP Modules: poll background job status
 	if (isset($_POST["action"]) && $_POST["action"] == 'ajax-php-modules-status') {
 		header('Content-Type: application/json');
@@ -1813,9 +1787,6 @@
 		$log_file = "/tmp/reqad_job_{$job_id}.log";
 		if (!is_file($log_file)) {
 			$log_file = _PATH . "/log/reqad_update_{$job_id}.log";
-		}
-		if (!is_file($log_file)) {
-			$log_file = _PATH . "/transfers/reqad_transfer_{$job_id}.log";
 		}
 
 		if (!is_file($log_file)) {
@@ -1842,123 +1813,208 @@
 		exit;
 	}
 
-	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-check') {
-		$server   = trim($_POST["server"] ?? '');
-		$port     = (int)(trim($_POST["port"] ?? 1422));
-		$ruser    = trim($_POST["ruser"] ?? 'root');
-		$raccount = trim($_POST["raccount"] ?? '');
+	// Transfer tool: every account on the cPanel server, for the pick list
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-accounts') {
+		header('Content-Type: application/json');
+		$server = trim($_POST["server"] ?? '');
+		$port   = (int)($_POST["port"] ?? 22);
+		$ruser  = trim($_POST["ruser"] ?? 'root');
+		$ssh = transfer_ssh($server, $port, $ruser, $err);
+		if($err !== '') { echo json_encode(['error' => $err]); exit; }
 
-		if(!preg_match('/^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,253}$/', $server)) {
-			echo json_encode(['error' => 'Invalid server address.']); exit;
-		}
-		if(!preg_match('/^[a-z_][a-z0-9_\-]{0,31}$/', $ruser)) {
-			echo json_encode(['error' => 'Invalid SSH username.']); exit;
-		}
-		if(!preg_match('/^[a-z][a-z0-9]{0,31}$/', $raccount)) {
-			echo json_encode(['error' => 'Invalid cPanel account name (lowercase letters and digits only).']); exit;
-		}
-		if($port < 1 || $port > 65535) $port = 22;
-
-		// Check if host is already in known_hosts (warn if new, but still connect)
 		$known_hosts_file = '/usr/local/reqad/.ssh/known_hosts';
 		$keyscan_host = ($port != 22) ? "[{$server}]:{$port}" : $server;
-		$keyscan = shell_exec("ssh-keygen -F " . escapeshellarg($keyscan_host) . " -f " . escapeshellarg($known_hosts_file) . " 2>/dev/null");
-		$host_known = (trim($keyscan) !== '');
+		$host_known = trim((string)shell_exec("ssh-keygen -F ".escapeshellarg($keyscan_host)." -f ".escapeshellarg($known_hosts_file)." 2>/dev/null")) !== '';
 
-		$ssh = "ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p {$port} {$ruser}@{$server}";
+		$test = trim((string)shell_exec("{$ssh} echo ok 2>&1"));
+		if($test !== 'ok') { echo json_encode(['error' => 'SSH connection failed: '.$test]); exit; }
 
-		$test = trim(shell_exec("{$ssh} echo ok 2>&1"));
-		if($test !== 'ok') {
-			echo json_encode(['error' => 'SSH connection failed: '.htmlspecialchars($test)]); exit;
+		list($acct_data, $res_data) = transfer_whmapi($ssh, [
+			'listaccts want=user,domain,owner,plan,ip,ipv6,suspended,diskused,startdate',
+			'listresellers',
+		]);
+		if($acct_data === null) {
+			echo json_encode(['error' => 'Connected, but whmapi1 did not answer. Is this a cPanel server, and is the SSH user root?']); exit;
 		}
+		$resellers = array_values(array_filter((array)($res_data['reseller'] ?? []), 'is_string'));
 
-		// Get main domain via whmapi1 accountsummary
-		$acct_raw = shell_exec("{$ssh} " . escapeshellarg("whmapi1 --output=json accountsummary user={$raccount}") . " 2>&1");
-		$acct = @json_decode($acct_raw, true);
-		$main_domain = '';
-		if($acct && !empty($acct['data']['acct'][0]['domain'])) {
-			$main_domain = $acct['data']['acct'][0]['domain'];
+		// what is here already: an account with the same user, or a site with the same domain
+		$local_users = []; $local_domains = [];
+		$_res = $db->query('SELECT user, domain FROM accounts');
+		while($_row = $_res->fetchArray(SQLITE3_ASSOC)) {
+			$local_users[$_row['user']] = true;
+			$local_domains[strtolower($_row['domain'])] = $_row['user'];
 		}
-		if(!$main_domain) {
-			echo json_encode(['error' => "Account '{$raccount}' not found on remote server."]); exit;
-		}
+		foreach(addon_domain_list($ini) as $_d => $_a) $local_domains[strtolower($_d)] = $_a['user'];
 
-		// Get all domains for this user from /etc/userdomains
-		$dom_raw = shell_exec("{$ssh} " . escapeshellarg("grep \": {$raccount}\$\" /etc/userdomains 2>/dev/null | cut -d: -f1 | tr -d ' '") . " 2>&1");
-		$domain_list = array_values(array_filter(array_map('trim', explode("\n", $dom_raw))));
-		if(!in_array($main_domain, $domain_list)) array_unshift($domain_list, $main_domain);
-
-		// Get PHP version per domain for this account
-		$php_raw = shell_exec("{$ssh} " . escapeshellarg("whmapi1 --output=json php_get_vhost_versions api.filter.enable=1 api.filter.a.field=account api.filter.a.arg0={$raccount} 2>/dev/null") . " 2>&1");
-		$php_data = @json_decode($php_raw, true);
-		$php_map = [];
-		if($php_data && !empty($php_data['data']['versions'])) {
-			foreach($php_data['data']['versions'] as $vhost) {
-				if(!empty($vhost['vhost']) && !empty($vhost['version'])) {
-					$php_map[$vhost['vhost']] = [
-						'php_version'  => $vhost['version'],
-						'documentroot' => $vhost['documentroot'] ?? '',
-					];
-				}
-			}
-		}
-		$domains = [];
-		foreach($domain_list as $dom) {
-			$domains[] = [
-				'domain'       => $dom,
-				'php_version'  => $php_map[$dom]['php_version']  ?? 'unknown',
-				'documentroot' => $php_map[$dom]['documentroot'] ?? '',
+		$accounts = [];
+		foreach((array)($acct_data['acct'] ?? []) as $a) {
+			$u = (string)($a['user'] ?? '');
+			if(!preg_match('/^[a-z0-9][a-z0-9_.\-]{0,31}$/', $u)) continue;
+			$dom = strtolower((string)($a['domain'] ?? ''));
+			$accounts[] = [
+				'user'        => $u,
+				'domain'      => $dom,
+				'owner'       => (string)($a['owner'] ?? ''),
+				'plan'        => (string)($a['plan'] ?? ''),
+				'ip'          => (string)($a['ip'] ?? ''),
+				'ipv6'        => implode(', ', array_filter((array)($a['ipv6'] ?? []), 'is_string')),
+				'suspended'   => (int)($a['suspended'] ?? 0),
+				'diskused'    => (string)($a['diskused'] ?? ''),
+				'is_reseller' => in_array($u, $resellers, true),
+				'user_here'   => isset($local_users[$u]),
+				'domain_here' => $local_domains[$dom] ?? '',
 			];
 		}
-
-		// Get databases via whmapi1 (handles truncated prefixes for long usernames)
-		$db_raw = shell_exec("{$ssh} " . escapeshellarg("whmapi1 --output=json list_mysql_databases_and_users user={$raccount}") . " 2>&1");
-		$db_data = @json_decode($db_raw, true);
-		$databases = [];
-		$db_users  = [];
-		$db_prefix = $raccount . '_';
-		if($db_data && !empty($db_data['data']['mysql_databases'])) {
-			$databases = array_keys($db_data['data']['mysql_databases']);
-			foreach($db_data['data']['mysql_databases'] as $dbname => $users) {
-				$db_users[$dbname] = !empty($users[0]) ? $users[0] : $dbname;
-			}
-			if(!empty($databases)) {
-				$pos = strpos($databases[0], '_');
-				if($pos !== false) $db_prefix = substr($databases[0], 0, $pos + 1);
-			}
-		}
-
-		// Get email account and forwarder counts per domain (cPanel stores these under ~/etc/DOMAIN/)
-		$check_lines = [];
-		foreach($domain_list as $dom) {
-			$check_lines[] = 'e=0; f=0'
-				. '; [ -f /home/'.$raccount.'/etc/'.$dom.'/passwd ] && e=$(grep -vc "^#" /home/'.$raccount.'/etc/'.$dom.'/passwd 2>/dev/null) || true'
-				. '; [ -f /etc/valiases/'.$dom.' ] && f=$(grep -vc "^#" /etc/valiases/'.$dom.' 2>/dev/null) || true'
-				. '; echo "'.$dom.'|$e|$f"';
-		}
-		$bash_script = implode("\n", $check_lines);
-		$email_raw = shell_exec($ssh . " bash << 'EMAILEOF'\n" . $bash_script . "\nEMAILEOF 2>/dev/null");
-		$email_map = [];
-		foreach(array_filter(explode("\n", $email_raw ?? '')) as $line) {
-			$parts = explode('|', trim($line));
-			if(count($parts) === 3) {
-				$email_map[$parts[0]] = ['email_count' => (int)$parts[1], 'fwd_count' => (int)$parts[2]];
-			}
-		}
+		usort($accounts, function($x, $y) { return strcmp($x['domain'], $y['domain']); });
 
 		echo json_encode([
-			'domains'     => $domains,
-			'databases'   => $databases,
-			'db_prefix'   => $db_prefix,
-			'db_users'    => $db_users,
-			'email_map'   => $email_map,
-			'main_domain' => $main_domain,
-			'raccount'    => $raccount,
-			'server'      => $server,
-			'port'        => $port,
-			'ruser'       => $ruser,
-			'warning'     => $host_known ? '' : "Host '{$server}' was not in known_hosts and has been added automatically. Verify the server fingerprint if this is the first connection.",
+			'accounts'  => $accounts,
+			'resellers' => $resellers,
+			'server'    => $server,
+			'port'      => $port,
+			'ruser'     => $ruser,
+			'warning'   => $host_known ? '' : "Host '{$server}' was not in known_hosts and has been added automatically. Verify the server fingerprint if this is the first connection.",
 		]);
+		exit;
+	}
+
+	// Transfer tool: the PHP version of each site of the chosen accounts, and
+	// whether this server has it
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-php') {
+		header('Content-Type: application/json');
+		$ssh = transfer_ssh(trim($_POST["server"] ?? ''), (int)($_POST["port"] ?? 22), trim($_POST["ruser"] ?? 'root'), $err);
+		if($err !== '') { echo json_encode(['error' => $err]); exit; }
+		$want = [];
+		foreach((array)($_POST['accounts'] ?? []) as $u) {
+			$u = (string)$u;
+			if(preg_match('/^[a-z0-9][a-z0-9_.\-]{0,31}$/', $u)) $want[$u] = true;
+		}
+		if(!$want) { echo json_encode(['error' => 'Select at least one account.']); exit; }
+
+		$r = transfer_sites($ssh, array_keys($want));
+		if($r['error'] !== '') { echo json_encode(['error' => $r['error']]); exit; }
+		unset($r['error']);
+		echo json_encode($r);
+		exit;
+	}
+
+	// Transfer tool: the pre-transfer check - part=server once, then part=account
+	// for each chosen account (one request each, so a big server shows progress)
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-precheck') {
+		header('Content-Type: application/json');
+		@set_time_limit(600);
+		$ssh = transfer_ssh(trim($_POST["server"] ?? ''), (int)($_POST["port"] ?? 22), trim($_POST["ruser"] ?? 'root'), $err);
+		if($err !== '') { echo json_encode(['error' => $err]); exit; }
+		// the versions chosen for the ones this server does not have (PHP step)
+		transfer_php_map((array)json_decode((string)($_POST['php_map'] ?? '{}'), true));
+		if(($_POST['part'] ?? '') === 'server') {
+			list($items, $ctx) = transfer_precheck_server($ssh, (array)($_POST['pkgs'] ?? []));
+			echo json_encode(['items' => $items, 'ctx' => $ctx]);
+			exit;
+		}
+		$user = (string)($_POST['user'] ?? '');
+		if(!preg_match('/^[a-z0-9][a-z0-9_.\-]{0,31}$/', $user)) { echo json_encode(['error' => 'Invalid account name.']); exit; }
+		$sites = [];
+		foreach((array)json_decode((string)($_POST['sites'] ?? '[]'), true) as $s) {
+			$d = strtolower((string)($s['domain'] ?? ''));
+			$t = (string)($s['type'] ?? '');
+			if(!valid_domain($d) || !in_array($t, ['main', 'addon', 'sub', 'parked'], true)) continue;
+			$v = (string)($s['version'] ?? '');
+			$sites[] = ['domain' => $d, 'type' => $t, 'version' => preg_match('/^\d\.\d{1,2}$/', $v) ? $v : ''];
+		}
+		$in = (array)json_decode((string)($_POST['ctx'] ?? '{}'), true);
+		$ctx = ['ips' => [], 'ns' => [], 'free' => (float)($in['free'] ?? 0), 'scan' => !empty($in['scan']) ? 1 : 0, 'scan_for' => [],
+		        'maxemail' => preg_match('/^\d+$/', (string)($in['maxemail'] ?? '')) ? (string)$in['maxemail'] : ''];
+		foreach(array_merge((array)($in['ips'] ?? []), [(string)($_POST['ip'] ?? '')]) as $ip)
+			if(is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP)) $ctx['ips'][] = strtolower($ip);
+		foreach((array)($in['ns'] ?? []) as $n)
+			if(is_string($n) && valid_domain($n)) $ctx['ns'][] = $n;
+		foreach((array)($in['scan_for'] ?? []) as $v => $l)
+			if(preg_match('/^\d\.\d{1,2}$/', (string)$v)) $ctx['scan_for'][$v] = array_values(array_intersect((array)$l, ['ioncube', 'sourceguardian']));
+		$ctx['ips'] = array_values(array_unique($ctx['ips']));
+		echo json_encode(['user' => $user, 'items' => transfer_precheck_account($ssh, $user, $sites, $ctx)]);
+		exit;
+	}
+
+	// Transfer tool: start a transfer of the checked accounts (a background job)
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-start') {
+		header('Content-Type: application/json');
+		$accounts = [];
+		foreach((array)json_decode((string)($_POST['accounts'] ?? '[]'), true) as $a)
+			if(is_array($a)) $accounts[] = ['user' => (string)($a['user'] ?? ''), 'domain' => (string)($a['domain'] ?? ''), 'diskused' => (string)($a['diskused'] ?? '')];
+		$r = transfer_job_start(['server' => trim($_POST['server'] ?? ''), 'port' => (int)($_POST['port'] ?? 22), 'ruser' => trim($_POST['ruser'] ?? 'root')],
+		                        $accounts, array_map('strval', (array)($_POST['parts'] ?? [])),
+		                        (array)json_decode((string)($_POST['php_map'] ?? '{}'), true));
+		echo json_encode($r['ok'] ? ['id' => $r['data']['id']] : ['error' => $r['error']]);
+		exit;
+	}
+
+	// Transfer tool: progress of a transfer (id = '' -> the newest one, if any)
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-status') {
+		header('Content-Type: application/json');
+		$id = (string)($_POST['id'] ?? '');
+		if($id === '') {
+			$latest = transfer_job_latest();
+			if(!$latest) { echo json_encode(['none' => true]); exit; }
+			$id = $latest['id'];
+		}
+		$offsets = [];
+		foreach((array)json_decode((string)($_POST['offsets'] ?? '{}'), true) as $k => $v)
+			if(is_string($k) && valid_username($k)) $offsets[$k] = (int)$v;
+		$r = transfer_job_status($id, $offsets);
+		echo json_encode($r['ok'] ? $r['data'] : ['error' => $r['error']]);
+		exit;
+	}
+
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-stop') {
+		header('Content-Type: application/json');
+		$r = transfer_job_stop((string)($_POST['id'] ?? ''));
+		echo json_encode($r['ok'] ? ['message' => $r['message']] : ['error' => $r['error']]);
+		exit;
+	}
+
+	// Transfer tool: every transfer so far (newest first) and the latest IP restores
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-history') {
+		header('Content-Type: application/json');
+		echo json_encode(['jobs' => transfer_job_list(), 'restores' => transfer_ip_restore_log(16384)]);
+		exit;
+	}
+
+	// Transfer tool: a transfer's log (kind=log, user = one account or all) or
+	// its IP map (kind=ips), as text the page saves as a file
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-file') {
+		header('Content-Type: application/json');
+		$id = (string)($_POST['id'] ?? '');
+		$user = (string)($_POST['user'] ?? '');
+		$r = ($_POST['kind'] ?? '') === 'ips' ? transfer_ip_map_get($id) : transfer_job_log_text($id, $user);
+		echo json_encode($r['ok'] ? $r['data'] : ['error' => $r['error']]);
+		exit;
+	}
+
+	// Transfer tool: restore IP addresses from a map - a transfer's (id) or a
+	// file's text (text, name); apply=1 makes the changes, else only the check
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-ips') {
+		header('Content-Type: application/json');
+		$id = (string)($_POST['id'] ?? '');
+		if($id !== '') {
+			$m = transfer_ip_map_get($id);
+			if(!$m['ok']) { echo json_encode(['error' => $m['error']]); exit; }
+			$text = $m['data']['text'];
+			$source = 'transfer '.$id;
+		} else {
+			$text = (string)($_POST['text'] ?? '');
+			if(strlen($text) > 2097152) { echo json_encode(['error' => 'The file is too big for an IP map (2 MB at most).']); exit; }
+			$source = 'file '.basename((string)($_POST['name'] ?? 'uploaded'));
+		}
+		list($rows, $errors) = transfer_ip_map_parse($text);
+		if(!$rows) { echo json_encode(['error' => 'No usable lines in the IP map.'.($errors ? ' '.implode('; ', array_slice($errors, 0, 5)) : '')]); exit; }
+		if(($_POST['apply'] ?? '') === '1') {
+			$r = transfer_ip_restore($rows, $source);
+			echo json_encode(['ok' => $r['ok'], 'message' => $r['ok'] ? $r['message'] : $r['error'], 'warnings' => $r['warnings'],
+			                  'results' => $r['data']['results'] ?? [], 'plan' => $r['data']['plan'] ?? null, 'errors' => $errors, 'source' => $source]);
+		} else
+			echo json_encode(['plan' => transfer_ip_plan($rows)['data'], 'errors' => $errors, 'source' => $source]);
 		exit;
 	}
 

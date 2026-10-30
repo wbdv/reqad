@@ -193,12 +193,13 @@ function security_action($action) {
 }
 
 /*
- * New-device checks (op = code-on | alert-on | alert-off | address | test |
- * verify | resend | cancel).
+ * New-device checks (op = code-on | code-off | alert-on | alert-off | address |
+ * test | verify | resend | cancel).
  *
- * The emailed code needs no switch: it is asked for whenever 2FA is off and
- * the panel can send email (auth_email_code_state). Only the command line
- * turns it off (break-glass); code-on undoes that. Login alerts are a switch.
+ * The emailed code is asked for whenever 2FA is off, the panel can send email
+ * (auth_email_code_state) and its switch is on (setting auth-email-code, on by
+ * default; also `reqad auth email-code off`, the break-glass). Turning it off
+ * needs sudo mode. Login alerts are a switch too.
  *
  * A new address is used once it has proved it receives mail from this
  * server: changing it (with a sending method set up), or turning on alerts,
@@ -231,11 +232,19 @@ function security_email_action(array $p, $back, $current) {
 	$verified = auth_setting('auth-email-verified', '');
 
 	switch ($op) {
-	case 'code-on':     // undo `reqad auth email-code off`
+	case 'code-on':     // also undoes `reqad auth email-code off`
 		auth_q("DELETE FROM settings WHERE name = 'auth-email-code'");
 		auth_log_event('email_code_on', '', (int)$p['id'], $p['username']);
 		auth_device_seen($p);
 		msg_redirect($back, 'The email code is back on for new devices. This browser is already known.', 'success');
+
+	case 'code-off':
+		security_need_sudo($back);
+		auth_setting_put('auth-email-code', '0');
+		auth_log_event('email_code_off', 'from Settings > Security', (int)$p['id'], $p['username']);
+		msg_redirect($back, (int)$p['totp_enabled'] === 1
+			? 'The email code is off. Two-factor authentication is on, so new devices still need its code.'
+			: 'The email code is off. New devices log in with the password only.', 'warning');
 
 	case 'alert-on':
 		if ($p['email'] === '' || $p['email'] !== $verified)

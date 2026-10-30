@@ -121,6 +121,22 @@
 				</div>
 			</div>
 
+<?php if (feature_enabled($ini, 'email')): ?>
+			<!-- ─── webmail address ───────────────────────────────────── -->
+			<div class="row set-row">
+				<div class="col-md-3 set-label">Webmail address</div>
+				<div class="col-md-9">
+					<input type="hidden" name="webmail_link_row" value="1">
+					<label class="form-check form-switch d-inline-flex align-items-center mb-0" style="cursor:pointer">
+						<input class="form-check-input" type="checkbox" name="webmail_link" <?=setting_get('webmail-link', '1') !== '0' ? 'checked' : '';?>>
+						<span class="form-check-label">Open webmail from every site's <code>/webmail</code> address</span>
+					</label>
+<?php $s_wm_host = webmail_link_host(); ?>
+					<small class="set-hint under-switch"><code>https://example.com/webmail</code> goes to <code>https://<?=h($s_wm_host !== '' ? $s_wm_host : '<hostname>');?>:2087/webmail/</code>, on the sites of accounts with email.</small>
+				</div>
+			</div>
+<?php endif; ?>
+
 			<!-- ─── automatic updates ─────────────────────────────────────
 			     Both switches are saved with the main form, and only acted on
 			     when they change. The Reqad update time has its own modal. -->

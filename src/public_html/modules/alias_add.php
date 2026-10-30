@@ -71,7 +71,9 @@ if($errmsg === '') {
 	if($errmsg === '') {
 		$he = $db->querySingle('SELECT has_email FROM accounts WHERE user="'.$db->escapeString($acct_user).'"');
 		$rc = reissue_letsencrypt_cert($db, $acct['domain'], !empty($he));
-		if($rc === 'no-dns' && (substr($alias, 0, 2) === '*.'))
+		if($rc === 'not-free')
+			$errmsg = 'Notice: alias added. '.ssl_free_error($acct['user']).' Its certificate was not extended to cover it.';
+		else if($rc === 'no-dns' && (substr($alias, 0, 2) === '*.'))
 			$errmsg = 'Notice: wildcard alias added, but wildcard SSL needs a DNS provider (configure one in DNS Settings).';
 	}
 

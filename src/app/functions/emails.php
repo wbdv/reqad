@@ -653,3 +653,103 @@ function autoresponder_delete($key) {
 	plugin_hook('autoresponder.deleted', array('email' => $old['email']));
 	return result_ok("Autoresponder for {$old['email']} deleted.", array('email' => $old['email']), $e !== '' ? array("Its script could not be removed: $e") : array());
 }
+
+/* ---- http(s)://<site>/webmail opens webmail ----------------------------------------- */
+
+/*
+ * Every site of an account with email sends /webmail (and /webmail/) to
+ * https://<hostname>:2087/webmail/, the server's Roundcube, so mailbox owners
+ * can use the address they know from other hosts. Like the account panel's
+ * /cpanel link, it is a marker block "reqad-webmail-link" at the top of each
+ * server of the account's vhosts (account_vhost_marker()): a rewrite there
+ * runs before the site's own locations and its http -> https redirect. Server
+ * switch: setting `webmail-link` (default on, Settings > Webmail address).
+ * Written when an account or site is made, when its email is turned on or off,
+ * after a certificate or a PHP change (core_hooks() in functions.php), and
+ * every hour by `reqad email webmail-links` (cron), which also follows a new
+ * hostname and vhosts written without an event. `--remove` takes it out of
+ * every site.
+ */
+define('WEBMAIL_LINK_MARKER', 'webmail-link');
+
+function webmail_link_enabled() {
+	global $ini;
+	return feature_enabled($ini, 'email') && setting_get('webmail-link', '1') !== '0';
+}
+
+/* The name the panel on 2087 answers to (hostname -f, as the account panel's
+   link), '' when the server has no usable one. */
+function webmail_link_host() {
+	static $h = null;
+	if ($h === null) {
+		$h = strtolower(trim((string)shell_exec('hostname -f 2>/dev/null')));
+		if ($h === '')
+			$h = strtolower((string)gethostname());
+		if (!valid_domain($h))
+			$h = '';
+	}
+	return $h;
+}
+
+/* array(nginx lines, Apache lines); nulls when there is no usable hostname. */
+function webmail_link_lines() {
+	$h = webmail_link_host();
+	if ($h === '')
+		return array(null, null);
+	$to = 'https://'.$h.':2087/webmail/';
+	return array("rewrite ^/webmail/?\$ $to? redirect;", "RedirectMatch 302 ^/webmail/?\$ $to");
+}
+
+/* Should the account's sites carry the link? $acc = its accounts row when at hand. */
+function webmail_link_wanted($user, $acc = null) {
+	global $db;
+	if (!webmail_link_enabled())
+		return false;
+	if ($acc === null)
+		$acc = account_get($db, $user);
+	return $acc && ($acc['has_email'] === true || $acc['has_email'] === 'true' || $acc['has_email'] == 1);
+}
+
+/* Put the block in one account's vhosts or take it out ($on null = as
+   webmail_link_wanted() says). '' or the error. */
+function webmail_link_sync($user, $on = null) {
+	if ($on === null)
+		$on = webmail_link_wanted($user);
+	list($ng, $ap) = $on ? webmail_link_lines() : array(null, null);
+	return account_vhost_marker($user, WEBMAIL_LINK_MARKER, $ng, $ap);
+}
+
+/* Every account ($remove: taken out everywhere). Only changed files are
+   written, and the web server is tested and reloaded once; when that test
+   fails, the accounts are tried one by one so one broken vhost does not hold
+   the others back. Returns the warnings. */
+function webmail_links_sync_all($remove = false) {
+	global $db;
+	$warn = $per = array();
+	list($ng, $ap) = webmail_link_lines();
+	foreach (account_list($db) as $a) {
+		$on = !$remove && webmail_link_wanted($a['user'], $a);
+		list($ch, $e) = account_vhost_marker_changes($a['user'], WEBMAIL_LINK_MARKER, $on ? $ng : null, $on ? $ap : null);
+		if ($e !== '')
+			$warn[] = $a['user'].': '.$e;
+		elseif ($ch)
+			$per[$a['user']] = $ch;
+	}
+	if (!$per)
+		return $warn;
+	if (account_vhost_files_apply(array_merge(...array_values($per))) === '')
+		return $warn;
+	foreach ($per as $user => $ch)
+		if (($e = account_vhost_files_apply($ch)) !== '')
+			$warn[] = "$user: $e";
+	return $warn;
+}
+
+/* core_hooks(): a new account or site gets the block, an account whose email
+   was turned on or off gets it added or taken out, and a certificate or a PHP
+   change may have written a vhost anew. */
+function webmail_link_on_event(array $d) {
+	$user = (string)($d['user'] ?? $d['account'] ?? '');
+	if ($user !== '' && valid_username($user) && ($e = webmail_link_sync($user)) !== '')
+		log_debug("[webmail link] /webmail address of $user: $e");
+}

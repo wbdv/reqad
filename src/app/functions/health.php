@@ -74,6 +74,7 @@ function health_checks() {
 		'dns_keys'   => array('label' => 'DNS API keys that expire or hold zones while revoked', 'scope' => 'server', 'run' => 'health_check_dns_keys'),
 		'apps'       => array('label' => 'Webmail and phpMyAdmin versions','scope' => 'server',  'run' => 'health_check_apps'),
 		'reqad'      => array('label' => 'Reqad updates',                  'scope' => 'server',  'run' => 'health_check_reqad_update'),
+		'premium_repo' => array('label' => 'Premium repository: updates of the add-ons', 'scope' => 'server', 'run' => 'health_check_premium_repo'),
 	);
 	$checks = plugin_filter('health.checks', $checks);
 	return is_array($checks) ? $checks : array();
@@ -310,6 +311,9 @@ function health_check_ssl() {
 			                       'It expired on '.date('j M Y', (int)$c['validTo_time_t']).'; browsers refuse the site.',
 			                       '/ssl/', 'SSL');
 		} elseif (ssl_is_self_signed($c)) {
+			/* no free certificates in its package: self-signed is allowed there */
+			if ($user !== '' && ssl_free_error($user) !== '')
+				continue;
 			$items[] = health_item('ssl', $user, $domain, 'warning', "Self-signed certificate on $what",
 			                       "Browsers warn on https://$domain/. A Let's Encrypt certificate needs the domain to point at this server.",
 			                       '/ssl/', 'SSL');
@@ -484,7 +488,7 @@ function health_check_php_eol() {
 		if ($v !== 'off') $sites[$a['domain']] = array($a['user'], $v);
 	}
 	foreach (addon_domain_list($ini) as $d => $ad)
-		if (($ad['handler'] ?? '') !== 'none') $sites[$d] = array($ad['user'], $ad['version']);
+		if (!in_array($ad['handler'] ?? '', array('none', 'off'), true)) $sites[$d] = array($ad['user'], $ad['version']);
 	foreach ($sites as $d => $s) {
 		if (!$old($s[1])) continue;
 		$items[] = health_item('php_eol', $s[0], $d, 'info', "$d runs PHP {$s[1]}",
@@ -1058,3 +1062,45 @@ function health_check_reqad_update() {
 	return array(health_item('reqad', '', 'update', 'info', 'Reqad update available'.($ver !== '' ? " ($ver)" : ''),
 	                         'Update from the dashboard or with: dnf update reqad', '/', 'Dashboard', false));
 }
+
+/* The premium repository answers only the IP addresses marked Premium on the
+   owner's reqad.com account. When it refuses this server (subscription or trial
+   ended, IP switched to Open Source) the add-ons keep running without updates,
+   and - unless [reqad-premium] has skip_if_unavailable=1 (reqad-repo 1.0.4+) -
+   dnf stops with an error for every package, OS updates included. Only looked
+   at while the repository is switched on. */
+function health_premium_repo_conf() {
+	$f = '/etc/yum.repos.d/reqad.repo';
+	$ini = is_readable($f) ? @parse_ini_file($f, true, INI_SCANNER_RAW) : false;
+	$sec = is_array($ini) && isset($ini['reqad-premium']) ? $ini['reqad-premium'] : null;
+	if (!is_array($sec))
+		return null;
+	$on = function ($v) { return in_array(strtolower(trim((string)$v)), array('1', 'yes', 'true', 'on'), true); };
+	return array('enabled' => $on($sec['enabled'] ?? '0'), 'skip' => $on($sec['skip_if_unavailable'] ?? '0'));
+}
+
+function health_check_premium_repo() {
+	$conf = health_premium_repo_conf();
+	if ($conf === null || !$conf['enabled'])
+		return array();
+	$el = '';
+	if (preg_match('/^VERSION_ID="?(\d+)/m', (string)@file_get_contents('/etc/os-release'), $m))
+		$el = $m[1];
+	if ($el === '')
+		return array();
+	$url  = 'https://repo.reqad.net/premium/el'.$el.'/RPMS/x86_64/repodata/repomd.xml';
+	$code = trim((string)shell_exec('curl -s -o /dev/null -w "%{http_code}" --max-time 15 -A reqad-health '.escapeshellarg($url).' 2>/dev/null'));
+	if ($code !== '401' && $code !== '403')
+		return array();   /* 200 = fine; offline or another error: not this check's business */
+	$detail = 'repo.reqad.net refused this server (HTTP '.$code.'): its Premium subscription or trial has ended, or its IP address is not marked Premium on your reqad.com account page. '
+	        . 'The add-ons keep running, but they get no more updates.';
+	if (!$conf['skip'])
+		$detail .= ' Until you renew or switch the premium repository off, dnf stops with an error, so this server gets no system or Reqad updates either. '
+		         . 'To switch it off: dnf config-manager --set-disabled reqad-premium';
+	else
+		$detail .= ' Other updates go on as usual. To stop dnf trying it: dnf config-manager --set-disabled reqad-premium';
+	return array(health_item('premium_repo', '', 'refused', $conf['skip'] ? 'warning' : 'critical',
+	                         'Premium updates stopped on this server', $detail,
+	                         'https://reqad.com/account', 'Open your reqad.com account'));
+}
+

@@ -5,7 +5,8 @@
 #
 # Handles: hostnamectl / /etc/hosts, nginx vhost, reqad panel vhost, apache
 # vhost, log files, monit, exim primary_hostname, exim+dovecot SNI, certbot
-# certificate for the new name, motd.
+# certificate for the new name, the 2083 account panel (its server block and
+# the /cpanel links), Git deploy webhooks, the Pure-FTPd certificate, motd.
 #
 # Every file it touches is copied to /root/reqad-hostname-rename-<timestamp>/ first.
 
@@ -244,12 +245,12 @@ reload_service() {
 
 # --- 1. hostname ------------------------------------------------------------
 
-echo "  [1/10] Setting system hostname..."
+echo "  [1/11] Setting system hostname..."
 backup /etc/hostname
 run hostnamectl set-hostname "$NEW"
 [ $DRY -eq 0 ] && echo "    hostname is now $(hostname -f 2>/dev/null || hostname)"
 
-echo "  [2/10] Updating /etc/hosts..."
+echo "  [2/11] Updating /etc/hosts..."
 if grep -q "$OLD_RE" /etc/hosts 2>/dev/null; then
     substitute /etc/hosts
 else
@@ -258,19 +259,19 @@ fi
 
 # --- 3. web server vhosts ---------------------------------------------------
 
-echo "  [3/10] Renaming web server config files..."
+echo "  [3/11] Renaming web server config files..."
 rename_conf /etc/nginx/conf.d "nginx"
 rename_conf /etc/reqad/conf.d "reqad panel"
 rename_conf /etc/httpd/conf.d "apache"
 
-echo "  [4/10] Renaming log files..."
+echo "  [4/11] Renaming log files..."
 rename_logs /var/log/nginx
 rename_logs /var/log/reqad
 rename_logs /var/log/httpd
 
 # --- 5. certificate ---------------------------------------------------------
 
-echo "  [5/10] Sorting out the SSL certificate for ${NEW}..."
+echo "  [5/11] Sorting out the SSL certificate for ${NEW}..."
 
 NGINX_CONF="/etc/nginx/conf.d/${NEW}.conf"
 REQAD_CONF="/etc/reqad/conf.d/${NEW}.conf"
@@ -313,7 +314,7 @@ fi
 
 # --- 6. test and reload web servers ----------------------------------------
 
-echo "  [6/10] Testing and reloading web servers..."
+echo "  [6/11] Testing and reloading web servers..."
 if command -v nginx >/dev/null 2>&1; then
     if [ $DRY -eq 1 ]; then
         echo "    [dry-run] nginx -t && systemctl reload nginx"
@@ -348,7 +349,7 @@ fi
 
 # --- 7. obtain a real certificate ------------------------------------------
 
-echo "  [7/10] Let's Encrypt certificate..."
+echo "  [7/11] Let's Encrypt certificate..."
 if [ $DO_CERT -eq 0 ]; then
     echo "    --no-cert given, skipping"
 elif [ "${NEED_LE}" -eq 0 ]; then
@@ -403,7 +404,7 @@ fi
 
 # --- 8. mail ----------------------------------------------------------------
 
-echo "  [8/10] Mail (exim / dovecot)..."
+echo "  [8/11] Mail (exim / dovecot)..."
 
 # primary_hostname / qualify_domain, only when explicitly set to the old name
 if [ -f /etc/exim/exim.conf ]; then
@@ -432,9 +433,59 @@ if service_active dovecot; then
     run systemctl restart dovecot && [ $DRY -eq 0 ] && echo "    dovecot restarted"
 fi
 
+# --- 9. parts that copied the old name or its certificate -------------------
+
+echo "  [9/11] Account panel, deploy webhooks, FTP..."
+
+# Run a setup script again; its output indented. Never fatal.
+rerun() {
+    local label="$1"; shift
+    if [ $DRY -eq 1 ]; then
+        echo "    [dry-run] $*"
+        return 0
+    fi
+    "$@" 2>&1 | sed 's/^/    /'
+    if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+        echo "    ${label} updated"
+    else
+        echo "    WARNING: ${label} was not updated - run by hand: $*"
+    fi
+}
+
+# 2083 account panel: its server block holds the hostname and the path of the
+# 2087 panel's certificate, written at setup time. The setup also puts the
+# /cpanel address (https://<hostname>:2083/) back in every account's sites.
+# --no-firewall: keep csf as the admin left it.
+ACCT_SETUP=/usr/local/reqad-account/setup/reqad-account-setup.sh
+ACCT_CONF=/etc/reqad/conf.d/reqad-account.conf
+if [ -f "$ACCT_CONF" ] && [ -x "$ACCT_SETUP" ]; then
+    backup "$ACCT_CONF"
+    rerun "account panel (2083)" "$ACCT_SETUP" --no-firewall
+else
+    echo "    account panel (2083) not installed, skipping"
+fi
+
+# Git deploy webhooks: the location passes Host / SNI = the hostname.
+HOOK_SETUP=/usr/local/reqad/scripts/update/setup_deploy_webhook.sh
+HOOK_CONF=/etc/nginx/reqad-deploy-hook.conf
+if [ -f "$HOOK_CONF" ] && [ -x "$HOOK_SETUP" ]; then
+    backup "$HOOK_CONF"
+    rerun "deploy webhooks" "$HOOK_SETUP"
+else
+    echo "    deploy webhooks not set up, skipping"
+fi
+
+# Pure-FTPd add-on: keeps its own copy of the hostname certificate.
+FTP_HELPER=/usr/local/reqad/scripts/pureftpd/ftp-helper.sh
+if [ -f /etc/pure-ftpd/pure-ftpd.conf ] && [ -x "$FTP_HELPER" ]; then
+    rerun "Pure-FTPd certificate" "$FTP_HELPER" cert-sync
+else
+    echo "    Pure-FTPd add-on not installed, skipping"
+fi
+
 # --- 9. monit + motd --------------------------------------------------------
 
-echo "  [9/10] monit and motd..."
+echo "  [10/11] monit and motd..."
 if [ -d /etc/monit.d ]; then
     for f in /etc/monit.d/*; do
         [ -f "$f" ] || continue
@@ -460,7 +511,7 @@ fi
 
 # --- 10. leftovers ----------------------------------------------------------
 
-echo "  [10/10] Scanning for leftover references to ${OLD}..."
+echo "  [11/11] Scanning for leftover references to ${OLD}..."
 if [ $DRY -eq 1 ]; then
     echo "    skipped — nothing was changed, so everything would still match"
     LEFTOVERS=""

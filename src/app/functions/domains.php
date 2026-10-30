@@ -874,6 +874,8 @@ function domain_alias_add($account, $alias, $dns = true) {
 	$cert = reissue_letsencrypt_cert($db, $acct['domain'], $acct['has_email'] === 'true' || $acct['has_email'] == 1);
 	if ($cert === '')
 		$msg .= ' The certificate is being extended to cover it.';
+	elseif ($cert === 'not-free')
+		$warn[] = ssl_free_error($account).' Its certificate was not extended to cover it.';
 	elseif ($cert === 'no-dns' && $wild)
 		$warn[] = 'A certificate for a wildcard alias needs the domain\'s DNS at this server\'s DNS provider.';
 	return result_ok($msg, array('alias' => $alias, 'wildcard' => $wild, 'dns' => $rec, 'points' => $points, 'ip' => domain_site_ip($account)), $warn);
@@ -937,6 +939,17 @@ function ssl_sites($account, $check = false) {
 	return $out;
 }
 
+/* '' when $account may get free Let's Encrypt certificates, else why not
+   (filter ssl.free: Hosting Pro's packages can leave them out). Asked before
+   every Let's Encrypt request for an account: ssl_site_issue(),
+   reissue_letsencrypt_cert(), account_create() (there with its $o as $create:
+   the account does not exist yet) and 2087's SSL page. Bought and self-signed
+   certificates are never refused; ones already issued keep renewing. */
+function ssl_free_error($account, ?array $create = null) {
+	$e = plugin_filter('ssl.free', '', (string)$account, $create);
+	return is_string($e) ? $e : '';
+}
+
 /*
  * A free Let's Encrypt certificate for one of the account's sites, for its
  * names that point at this server (the domain itself must). Runs certbot
@@ -950,6 +963,8 @@ function ssl_site_issue($account, $domain) {
 	$site = domain_site($account, $domain);
 	if (!$site)
 		return result_error("$domain is not a site of $account.");
+	if (($e = ssl_free_error($account)) !== '')
+		return result_error($e);
 	list($names, $wild) = domain_site_cert_names($account, $site);
 	$p = domain_points($names, $account);
 	if (empty($p[$domain]['here'])) {

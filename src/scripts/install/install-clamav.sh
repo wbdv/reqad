@@ -58,27 +58,44 @@ if [ -x /usr/local/sbin/clamd ]; then
     have=$(rpm -q --qf '%{VERSION}' clamav 2>/dev/null || echo "unknown")
     step "ClamAV already present (${have}) — skipping engine install"
 else
-    URL="https://www.clamav.net/downloads/production/clamav-${CLAMAV_VERSION}.linux.x86_64.rpm"
+    # The copy on repo.reqad.net first (clamav.net is often too slow to give
+    # the 45 MB in time), then clamav.net itself. Both go through the same
+    # checksum, so the copy is trusted no more than the original. When you
+    # bump CLAMAV_VERSION, put the new rpm in /home/repo/public_html/clamav/.
+    REQAD_REPO="${REQAD_REPO:-https://repo.reqad.net}"
+    FILE="clamav-${CLAMAV_VERSION}.linux.x86_64.rpm"
     TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-    step "Downloading ClamAV ${CLAMAV_VERSION} (~45MB) from clamav.net"
-    curl -fsSL --max-time 300 -o "$TMP/clamav.rpm" "$URL" \
-        || die "download failed: $URL"
+    got_rpm=0
+    for URL in "${REQAD_REPO%/}/clamav/${FILE}" "https://www.clamav.net/downloads/production/${FILE}"; do
+        host=${URL#https://}; host=${host%%/*}
+        step "Downloading ClamAV ${CLAMAV_VERSION} (~45MB) from ${host}"
+        # give up on a stalled transfer, not on a slow but moving one
+        if ! curl -fsSL --connect-timeout 20 --speed-limit 5000 --speed-time 120 --max-time 1200 \
+                -o "$TMP/clamav.rpm" "$URL" >>"$LOG" 2>&1; then
+            warn "download failed: $URL"
+            continue
+        fi
 
-    # The clamav.net RPM is UNSIGNED, so a checksum is the only integrity check
-    # available. Pinned for the default version; pass CLAMAV_SHA256 when you
-    # bump CLAMAV_VERSION, or "none" to skip deliberately.
-    if [ "$CLAMAV_SHA256" = "none" ]; then
-        warn "checksum verification skipped (CLAMAV_SHA256=none)"
-    else
-        got=$(sha256sum "$TMP/clamav.rpm" | awk '{print $1}')
-        if [ "$got" != "$CLAMAV_SHA256" ]; then
-            die "checksum mismatch for clamav-${CLAMAV_VERSION}
+        # The clamav.net RPM is UNSIGNED, so a checksum is the only integrity
+        # check available. Pinned for the default version; pass CLAMAV_SHA256
+        # when you bump CLAMAV_VERSION, or "none" to skip deliberately.
+        if [ "$CLAMAV_SHA256" = "none" ]; then
+            warn "checksum verification skipped (CLAMAV_SHA256=none)"
+        else
+            got=$(sha256sum "$TMP/clamav.rpm" | awk '{print $1}')
+            if [ "$got" != "$CLAMAV_SHA256" ]; then
+                warn "checksum mismatch for ${FILE} from ${host}
    expected $CLAMAV_SHA256
    got      $got
  If you changed CLAMAV_VERSION, pass the matching CLAMAV_SHA256."
+                continue
+            fi
+            step "Checksum verified"
         fi
-        step "Checksum verified"
-    fi
+        got_rpm=1
+        break
+    done
+    [ "$got_rpm" -eq 1 ] || die "could not download ${FILE} (see $LOG)"
 
     step "Installing the ClamAV engine"
     # --nogpgcheck: upstream ships it unsigned; the sha256 above is the check.

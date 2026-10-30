@@ -278,6 +278,9 @@ function account_email_disable($domain, $user) {
  *   dns          bool  create the DNS zone at the configured provider
  *   letsencrypt  bool  request a certificate in the background
  *   email        bool  enable mail for the domain
+ *   mail_dns     bool  with email: write its MX / DKIM / SPF / DMARC records at
+ *                      the DNS provider (default true; false for an account
+ *                      moved from another server, whose DNS stays as it is)
  *   www          bool  add the www.<domain> alias
  *   php, shell   '' = the server defaults
  *   package      hosting package name (the Hosting Pro plugin); '' = its default
@@ -338,6 +341,14 @@ function account_create($db, array $o) {
 	if (($err = account_password_error($password)) !== '')
 		return result_error($err);
 
+	/* its package may give it no free certificates: the account is still made,
+	   without the Let's Encrypt request */
+	$le_off = $letsencrypt ? ssl_free_error($user, $o) : '';
+	if ($le_off !== '') {
+		$letsencrypt = false;
+		$sslmsgtoken = '';
+	}
+
 	/* PHP version (or 'off') and shell access, checked before anything is made;
 	   '' = the server defaults. The template sets up the default PHP; another
 	   choice is applied right after it, like Manage would. */
@@ -396,9 +407,11 @@ function account_create($db, array $o) {
 	$tpl_err     = account_vhost_template($domain, $user, $has_email, $letsencrypt, $account_aliases, $sslmsgtoken);
 	$warnings    = array($tpl_err);
 	$ssl_started = $letsencrypt && $tpl_err === '';
+	if ($le_off !== '')
+		$warnings[] = $le_off.' No certificate was requested.';
 
 	if ($has_email)
-		$warnings = array_merge($warnings, account_email_enable($domain, $user, false));
+		$warnings = array_merge($warnings, account_email_enable($domain, $user, false, !isset($o['mail_dns']) || !empty($o['mail_dns'])));
 
 	/* PHP: only when it differs from what the template set up */
 	if ($php !== '') {
@@ -728,8 +741,8 @@ function nginx_php_location($user, $extra = '', $location = 'location ~ \.php$')
    back matching what it matched before. */
 function nginx_php_off_location($location) {
 	return '# BEGIN reqad-php-disabled
-# PHP is disabled for this account (Accounts > Manage > PHP version). Choosing
-# a version there writes the PHP handler back in place of this block.
+# PHP is off for this site (its PHP version is "No PHP"). Choosing a version
+# writes the PHP handler back in place of this block.
 '.$location.' {
     if (!-f $request_filename) {
         return 404;
@@ -814,7 +827,8 @@ function nginx_php_handler_ranges($conf) {
    handlers passed to, and `php-fpm-<user>`, go too when nothing passes to
    them any more -- unless $used_elsewhere($name) says another file does
    (upstream names are global to nginx, so removing it would fail nginx -t).
-   Null only when the braces do not balance. */
+   $user is the upstream's name part: the account, or "<account>-<domain>" for
+   an addon domain (addon_socket()). Null only when the braces do not balance. */
 function nginx_vhost_php_off($conf, $user, $used_elsewhere = null) {
 	$ranges  = nginx_php_handler_ranges($conf);
 	$targets = array('php-fpm-'.$user);
@@ -921,8 +935,10 @@ function nginx_php_on_lines($conf) {
    the WP Toolkit FastCGI cache is on (its http-level block is still there), its
    directives go back into the first handler, as wp_nginx_cache_enable() puts them,
    and all the cache blocks are written again (an older http block lacks the
-   maps the current directives use). */
-function nginx_vhost_php_on($conf, $user, $domain = '') {
+   maps the current directives use). $sock: the upstream's name part when it is
+   not the account's (an addon domain: "<account>-<domain>"). */
+function nginx_vhost_php_on($conf, $user, $domain = '', $sock = null) {
+	$sock = $sock ?? $user;
 	$fcgi = '';
 	if (preg_match('/^# BEGIN reqad-nginx-cache[ \t]*$/m', $conf) && strpos($conf, '# BEGIN reqad-nginx-cache-fcgi') === false) {
 		/* the zone the vhost's cache block names (an account's other sites have their own) */
@@ -930,16 +946,16 @@ function nginx_vhost_php_on($conf, $user, $domain = '') {
 		$fcgi = preg_replace('/^[ \t]+/m', '', $frag['fcgi']);
 	}
 	$conf = preg_replace_callback('/^([ \t]*)# BEGIN reqad-php-disabled\b.*?# END reqad-php-disabled[^\n]*/ms',
-		function($m) use ($user, &$fcgi) {
+		function($m) use ($sock, &$fcgi) {
 			$location = preg_match('/^[ \t]*(location\b.*?)\s*\{[ \t]*$/m', $m[0], $l) ? $l[1] : 'location ~ \.php$';
-			$block = conf_indent(nginx_php_location($user, $fcgi, $location), $m[1]);
+			$block = conf_indent(nginx_php_location($sock, $fcgi, $location), $m[1]);
 			$fcgi  = '';
 			return $block;
 		}, $conf);
 	// upstream back where the template has it: right before the first server block
-	if (!preg_match('/^upstream[ \t]+php-fpm-'.preg_quote($user, '/').'[ \t]*\{/m', $conf)
+	if (!preg_match('/^upstream[ \t]+php-fpm-'.preg_quote($sock, '/').'[ \t]*\{/m', $conf)
 	    && preg_match('/^server[ \t]*\{/m', $conf, $sv, PREG_OFFSET_CAPTURE))
-		$conf = substr($conf, 0, $sv[0][1]).nginx_php_upstream($user)."\n".substr($conf, $sv[0][1]);
+		$conf = substr($conf, 0, $sv[0][1]).nginx_php_upstream($sock)."\n".substr($conf, $sv[0][1]);
 	$conf = nginx_php_on_lines($conf);
 	if ($domain !== '' && ($c = wp_nginx_cache_rewrite($conf, $domain)) !== null)
 		$conf = $c;
@@ -953,8 +969,8 @@ function nginx_vhost_php_on($conf, $user, $domain = '') {
    index.html; removing the block brings back the server-wide list. */
 function apache_php_off_block() {
 	return '# BEGIN reqad-php-disabled
-# PHP is disabled for this account (Accounts > Manage > PHP version). Choosing
-# a version there takes this block out and writes the PHP settings back.
+# PHP is off for this site (its PHP version is "No PHP"). Choosing a version
+# takes this block out and writes the PHP settings back.
 <IfModule php7_module>
     php_admin_flag engine off
 </IfModule>
@@ -977,14 +993,17 @@ function apache_php_directives($domain, $user) {
 }
 
 /* Apache vhost with PHP off: the php-fpm SetHandler and every php_* directive
-   removed, the PHP-off block added to each <VirtualHost>. Null when there is
-   no <VirtualHost> to put it in. */
+   removed, the PHP-off block added to each <VirtualHost>. $user is the
+   socket's name part (an addon domain: "<account>-<domain>"). Null when there
+   is no <VirtualHost> to put it in. */
 function apache_vhost_php_off($conf, $user) {
 	if (strpos($conf, '</VirtualHost>') === false) return null;
 	$conf = preg_replace('/\n[ \t]*<FilesMatch[^>]*>\s*SetHandler\s+"proxy:unix:\/run\/php-fpm-'.preg_quote($user, '/').'\.sock[^"]*"\s*<\/FilesMatch>/', '', $conf);
 	/* with the settings block of PHP settings (app/functions/php.php): PHP that comes back starts fresh */
 	$conf = preg_replace('/^[ \t]*# BEGIN reqad-php-settings[^\n]*\n.*?^[ \t]*# END reqad-php-settings[^\n]*\n/ms', '', $conf);
 	$conf = preg_replace('/^[ \t]*php_(admin_)?(value|flag)\b[^\n]*\n/m', '', $conf);
+	/* the <IfModule mod_php*.c> an addon domain's mod_php lines were in (scripts/adddomain) */
+	$conf = preg_replace('/^[ \t]*<IfModule mod_php[0-9]*\.c>\s*<\/IfModule>[ \t]*\n/m', '', $conf);
 	return preg_replace_callback('/^[ \t]*<\/VirtualHost>/m', function($m) {
 		return conf_indent(apache_php_off_block(), '    ')."\n".$m[0];
 	}, $conf);
@@ -992,8 +1011,9 @@ function apache_vhost_php_off($conf, $user) {
 
 /* Apache vhost with PHP back on: PHP-off blocks removed, the mod_php settings
    (and for $handler 'fpm' the SetHandler) added to the last <VirtualHost> --
-   the :443 one, where the template keeps them. */
-function apache_vhost_php_on($conf, $domain, $user, $handler) {
+   the :443 one, where the template keeps them. $sock: the socket's name part
+   when it is not the account's (an addon domain: "<account>-<domain>"). */
+function apache_vhost_php_on($conf, $domain, $user, $handler, $sock = null) {
 	$conf = preg_replace('/^[ \t]*# BEGIN reqad-php-disabled\b.*?# END reqad-php-disabled[^\n]*\n/ms', '', $conf);
 	$pos  = strrpos($conf, '</VirtualHost>');
 	if ($pos === false) return null;
@@ -1002,7 +1022,7 @@ function apache_vhost_php_on($conf, $domain, $user, $handler) {
 	/* mod_php settings only where mod_php exists; on php-fpm-only templates the pool has them */
 	$add  = php_mode() === 'modphp' ? "\n".apache_php_directives($domain, $user)."\n" : "\n";
 	if ($handler == 'fpm')
-		$add .= ltrim(apache_fpm_handler_block($user), "\n")."\n";
+		$add .= ltrim(apache_fpm_handler_block($sock ?? $user), "\n")."\n";
 	return substr($conf, 0, $ls).$add.substr($conf, $ls);
 }
 
@@ -1084,10 +1104,17 @@ function vhost_marker_edit($conf, $name, $lines, $server) {
  * addon domain) does not have it: callers re-apply. Returns '' or the error.
  */
 function account_vhost_marker($user, $name, $nginx, $apache) {
+	list($changed, $err) = account_vhost_marker_changes($user, $name, $nginx, $apache);
+	return $err !== '' ? $err : account_vhost_files_apply($changed);
+}
+
+/* What account_vhost_marker() would write, without writing it: array(file =>
+   array(old, new) for the files that change, '' or the error). For callers
+   that change many accounts at once and test + reload the web server once. */
+function account_vhost_marker_changes($user, $name, $nginx, $apache) {
 	if (!preg_match('/^[a-z][a-z0-9-]{1,30}$/', $name))
-		return "Bad marker name $name.";
+		return array(array(), "Bad marker name $name.");
 	$server = web_front();
-	$ws = web_server($server);
 	$lines = $server === 'httpd' ? $apache : $nginx;
 	$changed = array();
 	foreach (account_vhost_files($user) as $file) {
@@ -1095,12 +1122,12 @@ function account_vhost_marker($user, $name, $nginx, $apache) {
 		$new = vhost_marker_edit($orig, $name, $lines, $server);
 		if ($new === null) {
 			if ($lines === null) continue;
-			return "Could not read the server blocks of $file.";
+			return array(array(), "Could not read the server blocks of $file.");
 		}
 		if ($new !== $orig)
 			$changed[$file] = array($orig, $new);
 	}
-	return account_vhost_files_apply($changed);
+	return array($changed, '');
 }
 
 function account_vhost_file_read($file) {
@@ -1211,20 +1238,28 @@ function account_vhost_marker_missing($user, $name) {
 	return $missing;
 }
 
-/* Turn PHP off for an account's main domain. Returns '' or why nothing changed. */
-function account_php_disable($domain, $user) {
+/* Turn PHP off for an account's main domain, or with $addon for one of its
+   addon domains (same vhost and pool file names, its own socket
+   /run/php-fpm-<user>-<domain>.sock). Returns '' or why nothing changed. */
+function account_php_disable($domain, $user, $addon = false) {
 	global $ini;
+	$sock = $addon ? $user.'-'.$domain : $user;
 	$server = web_php_server();
 	$file = account_vhost_path($domain, $server);
 	$orig = account_vhost_read($domain, $server);
 	if (trim($orig) === '')
 		return "Vhost $file not found.";
-	$new = $server === 'httpd' ? apache_vhost_php_off($orig, $user)
-	                           : nginx_vhost_php_off($orig, $user, function($name) use ($file) { return nginx_upstream_used_elsewhere($name, $file); });
+	$new = $server === 'httpd' ? apache_vhost_php_off($orig, $sock)
+	                           : nginx_vhost_php_off($orig, $sock, function($name) use ($file) { return nginx_upstream_used_elsewhere($name, $file); });
 	if ($new === null)
 		return $server === 'httpd' ? "No <VirtualHost> found in $file." : "Could not read the block structure of $file (unbalanced braces, or no server block).";
 	if (($err = account_vhost_apply($file, $new, $orig, $server)) !== '')
 		return $err;
+	/* with Apache behind nginx the nginx page cache would go on serving the
+	   site's pages without PHP: empty it (its zone is in the nginx vhost) */
+	if ($server !== 'nginx' && web_front() === 'nginx'
+	    && preg_match('/keys_zone=([a-z0-9_]+):/', account_vhost_read($domain, 'nginx'), $zm))
+		wp_nginx_cache_purge_all($zm[1]);
 
 	// The vhost no longer points at it, so the pool can go
 	$restart = array();
@@ -1240,16 +1275,18 @@ function account_php_disable($domain, $user) {
 	return '';
 }
 
-/* Turn PHP back on for an account's main domain, on $version run by $handler
-   ('fpm', or 'mod_php' on Apache). Returns '' or why nothing changed. */
-function account_php_enable($domain, $user, $version, $handler) {
+/* Turn PHP back on for an account's main domain (or with $addon an addon
+   domain), on $version run by $handler ('fpm', or 'mod_php' on Apache).
+   Returns '' or why nothing changed. */
+function account_php_enable($domain, $user, $version, $handler, $addon = false) {
 	global $ini;
+	$sock = $addon ? $user.'-'.$domain : $user;
 	$server = web_php_server();
 	$file = account_vhost_path($domain, $server);
 	$orig = account_vhost_read($domain, $server);
 	if (trim($orig) === '')
 		return "Vhost $file not found.";
-	$new = $server === 'httpd' ? apache_vhost_php_on($orig, $domain, $user, $handler) : nginx_vhost_php_on($orig, $user, $domain);
+	$new = $server === 'httpd' ? apache_vhost_php_on($orig, $domain, $user, $handler, $sock) : nginx_vhost_php_on($orig, $user, $domain, $sock);
 	if ($new === null || $new === $orig)
 		return "No PHP-disabled block found in $file.";
 
@@ -1258,7 +1295,7 @@ function account_php_enable($domain, $user, $version, $handler) {
 	if ($handler == 'fpm') {
 		list($pool, $service) = account_fpm_pool_target($domain, $version);
 		$tmp = tempnam('/tmp', 'reqad');
-		file_put_contents($tmp, account_fpm_pool($domain, $user, web_group()));
+		file_put_contents($tmp, $addon ? addon_fpm_pool_content($ini, $domain, $user) : account_fpm_pool($domain, $user, web_group()));
 		shell_exec('sudo cp '.escapeshellarg($tmp).' '.escapeshellarg($pool));
 		unlink($tmp);
 		if (!is_file($pool))
@@ -1271,7 +1308,8 @@ function account_php_enable($domain, $user, $version, $handler) {
 	}
 	if ($pool !== null)
 		shell_exec('sudo '._PATH.'/scripts/restart_services.sh '.$service.' 2>/dev/null >/dev/null &');
-	account_bashrc_php($user, $version);
+	if (!$addon)
+		account_bashrc_php($user, $version);
 	return '';
 }
 

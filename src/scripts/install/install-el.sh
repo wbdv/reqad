@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.1.2 - Oct 17, 2026'
+VERSION='0.1.3 - Oct 30, 2026'
 
 # Merged from install-el8.sh (0.0.27) + install-el9.sh (0.0.30). One script for
 # every Enterprise Linux release; EL-specific bits are switched on ${EL} below.
@@ -49,10 +49,10 @@ case "$(echo "${WITH_EMAIL}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 IP=`ip address show | grep 'scope global' | grep 'inet ' | head -n 1 | awk {'print $2'} | awk -F/ {'print $1'}`
-#HOSTNAME=`hostname`
 HOSTNAME=`hostnamectl status | grep 'Static hostname:' | awk {'print $3'}`
-#REVERSE=`hostname -i`
-#REVERSE=$(dig +short A ${HOSTNAME})
+# No static hostname: EL9 prints "(unset)", EL8 leaves the line out
+case "${HOSTNAME}" in ''|'(unset)') HOSTNAME=$(hostname) ;; esac
+# The name reverse DNS gives this server's addresses (empty when there is none)
 REVERSE=$(hostname -A | awk {'print $1'})
 ARCH=`hostnamectl status | grep 'Architecture:' | awk {'print $2'}`
 OS=`cat /etc/os-release | grep 'PRETTY_NAME=' | awk -F\" {'print $2'}`
@@ -64,7 +64,7 @@ DISKSPACE=`lsblk | grep 'disk' | awk {'print $4'}`
 SESTATUS=$(grep -E '^SELINUX=' /etc/selinux/config | awk -F= {'print $2'})
 
 echo "        IP Address: ${IP}"
-echo "          Hostname: ${REVERSE}"
+echo "       Reverse DNS: ${REVERSE:-none}"
 hostnamectl status | grep -E --color=none 'Static hostname|Operating System|Kernel|Architecture|Virtualization' | sed 's/^/  /'
 echo "         Processor: ${CPU}"
 echo "            vCores: ${VCORE}"
@@ -82,13 +82,65 @@ case "${EL}" in
         exit 1 ;;
 esac
 
-#if [[ "${REVERSE}" == "" ]]; then
-#    REVERSE='unknown'
-#fi
-if [[ "${HOSTNAME}" != "${REVERSE}" ]]
-    then echo -e "\n ${YELLOW}SET: hostname to ${REVERSE} instead of ${HOSTNAME}\n" 1>&2
-    (hostnamectl set-hostname ${REVERSE}) >> ./install_reqad.log 2>&1
-	HOSTNAME=$(hostnamectl status | grep 'Static hostname:' | awk {'print $3'})
+#==[ hostname ]===============================================
+# The reqad package refuses to install when the hostname does not resolve (its
+# %pre asks DNS with `host`, which skips /etc/hosts), and the panel's certificate
+# is made for that name. So check it here, before anything is installed.
+# hostname_error NAME -> prints why NAME can't be used, nothing when it can.
+hostname_error() {
+    local name="$1" out
+    case "${name}" in
+        '') echo "no hostname is set"; return ;;
+        localhost|localhost.*|*.localdomain|*.local)
+            echo "'${name}' is a local-only name"; return ;;
+        *.*) ;;
+        *)  echo "'${name}' is not a full name (like server.example.com)"; return ;;
+    esac
+    command -v host >/dev/null 2>&1 || return 0
+    out=$(host "${name}" 2>&1 | grep -E 'has (IPv6 )?address')
+    if [ -z "${out}" ]; then
+        echo "'${name}' does not resolve in DNS"; return
+    fi
+    if ! echo "${out}" | grep -qvE 'address (127\.|::1$)'; then
+        echo "'${name}' resolves only to a loopback address"
+    fi
+}
+
+# Skipped when Reqad is already installed (a re-run): the name passed then.
+if ! rpm -q --quiet reqad; then
+    # host comes with bind-utils, not always on a minimal install
+    if ! command -v host >/dev/null 2>&1; then
+        (dnf -y install bind-utils) >> ./install_reqad.log 2>&1
+    fi
+
+    HOST_ERR=$(hostname_error "${HOSTNAME}")
+    # A bad hostname is swapped for the reverse DNS name, but only one that passes
+    # the same check: an empty or "localhost" answer would leave it worse.
+    if [ -n "${HOST_ERR}" ] && [ -n "${REVERSE}" ] && [ "${REVERSE}" != "${HOSTNAME}" ] \
+       && [ -z "$(hostname_error "${REVERSE}")" ]; then
+        echo -e "\n ${YELLOW}SET: hostname to ${REVERSE} instead of ${HOSTNAME}${NC}" 1>&2
+        (hostnamectl set-hostname "${REVERSE}") >> ./install_reqad.log 2>&1
+        HOSTNAME="${REVERSE}"
+        HOST_ERR=''
+    fi
+
+    if [ -n "${HOST_ERR}" ]; then
+        echo -e "\n ${RED}ERROR: hostname: ${HOST_ERR}.${NC}" 1>&2
+        echo -e " Reqad needs a fully qualified hostname with a DNS A record pointing to this" 1>&2
+        echo -e " server (it is also used for the panel's SSL certificate). Set it and run the" 1>&2
+        echo -e " installer again:\n" 1>&2
+        echo -e "     hostnamectl set-hostname server.example.com" 1>&2
+        echo -e "     host server.example.com     # must show this server's IP address\n" 1>&2
+        exit 1
+    fi
+
+    # Behind NAT the name rightly points to a public address this server doesn't
+    # see, so this is only a warning (the certificate for the name may fail).
+    if command -v host >/dev/null 2>&1 && [ -n "${IP}" ] \
+       && ! host "${HOSTNAME}" 2>/dev/null | awk -v ip="${IP}" '$NF == ip {f = 1} END {exit !f}'; then
+        echo -e "\n ${YELLOW}NOTE: ${HOSTNAME} does not point to ${IP} - fine behind NAT, but the" 1>&2
+        echo -e " Let's Encrypt certificate for it will only work once it points to this server.${NC}" 1>&2
+    fi
 fi
 
 echo -e "${GREEN}"
@@ -424,8 +476,17 @@ if ! systemctl is-active --quiet reqad; then
         echo -e "[ ${GREEN}OK${NC} ]"
     else
         echo -e "[ ${RED}ERROR${NC} ]"
-        systemctl status reqad
-        exit
+        LOGFILE=$(readlink -f ./install_reqad.log)
+        if rpm -q --quiet reqad; then
+            echo -e "\n The reqad package is installed but its service did not start:\n"
+            systemctl status reqad --no-pager -l 2>&1 | head -n 20 | sed 's/^/   /'
+        else
+            # dnf's own words (a failed %pre, a missing dependency...) are in the log
+            echo -e "\n The reqad package was not installed. Last lines of ${LOGFILE}:\n"
+            tail -n 30 ./install_reqad.log | sed 's/^/   /'
+        fi
+        echo -e "\n Full log: ${LOGFILE}\n"
+        exit 1
     fi
 else
 	echo -n "Reqad status                        ";

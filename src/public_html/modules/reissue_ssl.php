@@ -18,6 +18,8 @@ if($errmsg === '') {
 	$r = reissue_letsencrypt_cert($db, $acct['domain'], !empty($acct['has_email']));
 	if($r === 'not-le')
 		$errmsg = "Error: This account is not using a Let's Encrypt certificate.";
+	else if($r === 'not-free')
+		$errmsg = 'Error: '.ssl_free_error($acct_user);
 	else if($r === 'none')
 		$errmsg = 'Error: '.$acct['domain'].' does not resolve to this server yet, so a certificate cannot be issued.';
 	else if($r === 'no-dns')

@@ -91,7 +91,6 @@
 		'backup'			=> array('generate-backup', 'delete-backup', 'download-backup', 'restore-backup',
 							       'remote-backup-settings', 'remote-backup-cron', 'remote-backup-restore',
 							       'remote-backup-restore-server', 'backup-exclude'),
-		'transfer-tool'		=> array('ajax-transfer-run'),
 		'ssh-keys'			=> array('add-ssh-key', 'delete-ssh-key'),
 		'cron'				=> array('create-cron', 'edit-cron', 'delete-cron'),
 	);

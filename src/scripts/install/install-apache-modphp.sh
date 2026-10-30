@@ -157,6 +157,9 @@ fi
 # index.php before index.html / index.htm (the stock order is the other way
 # round; the rpm's post-install ran before httpd was here)
 bash /usr/local/reqad/scripts/update/setup_directory_index.sh >> ./install_reqad.log 2>&1
+# an addon site in ~/public_html/<site> reads the main site's .htaccess too:
+# the same rights there as in the vhosts (stock userdir.conf refuses Options)
+bash /usr/local/reqad/scripts/update/setup_httpd_home_overrides.sh >> ./install_reqad.log 2>&1
 
 if grep -qE '^[[:space:]]*LoadModule[[:space:]]+proxy_module' ${MODDIR}/00-proxy.conf 2>/dev/null \
 	&& grep -qE '^[[:space:]]*LoadModule[[:space:]]+proxy_fcgi_module' ${MODDIR}/00-proxy.conf 2>/dev/null; then

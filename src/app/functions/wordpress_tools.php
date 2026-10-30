@@ -156,10 +156,7 @@ function wordpress_tools_status(array $row, $probe = null) {
 	if (!$nginx) {
 		$perf['nginx_cache'] = 'na';
 		$why['nginx_cache'] = 'The page cache needs nginx as the web server.';
-	} elseif (web_backend($ini) !== 'none') {
-		$perf['nginx_cache'] = 'na';
-		$why['nginx_cache'] = 'The page cache is not available while Apache runs behind nginx.';
-	} else
+	} else    /* nginx alone caches PHP's answers, nginx in front of Apache caches Apache's */
 		$perf['nginx_cache'] = strpos($c['conf'], '# BEGIN reqad-nginx-cache') !== false ? 'on' : 'off';
 	$cron_on = false;
 	if ($wp && !empty($probe['disable_wp_cron'])) {

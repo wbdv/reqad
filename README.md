@@ -77,12 +77,40 @@ Try Reqad without installing anything - a live demo panel is available at
 - **OS:** Rocky Linux, AlmaLinux or RHEL 8 / 9 - a fresh, clean install
 - **Architecture:** x86_64
 - **Access:** root over SSH
+- **Hostname:** a fully qualified name (e.g. `srv1.example.com`) with a DNS A record
+  pointing to the server - see [Hostname and reverse DNS](#hostname-and-reverse-dns)
 - **A reqad.com account** - free registration at [reqad.com](https://www.reqad.com/)
 
 **Stack it manages:** Nginx / Apache · MariaDB · Exim / Dovecot · PHP / Roundcube ·
 PowerDNS / Cloudflare · Let's Encrypt · WordPress · Monit · CSF firewall.
 
 ## Installation
+
+### Hostname and reverse DNS
+
+Set the server's hostname before you install. Reqad needs a fully qualified name that
+resolves in public DNS to the server's IP address: the panel is reached at that name and
+its Let's Encrypt certificate is made for it. `localhost`, single words like `myvps` and
+local-only names (`.local`, `.localdomain`) can't be used.
+
+```bash
+hostnamectl set-hostname srv1.example.com
+host srv1.example.com     # must show the server's public IP
+host 203.0.113.10         # reverse DNS of the IP - should show srv1.example.com
+```
+
+- **A record:** create it at your DNS provider, `srv1.example.com` → the server's IP.
+- **Reverse DNS (PTR):** set it in your hosting provider's control panel, to the same
+  name. If the hostname can't be used, the installer takes the reverse DNS name instead,
+  as long as that name passes the same check. If you install the mail stack, a matching
+  PTR also helps your mail get delivered, since many mail servers check it.
+
+If the hostname doesn't pass, the installer stops at the start, before installing Reqad,
+and tells you what to fix. Behind NAT the name may point to a public address the server
+doesn't see itself: the installer only warns about that, and the certificate for the name
+works as long as ports 80 and 443 on that address reach the server.
+
+### Install
 
 One command on a fresh EL8 or EL9 server - the same command for both, it detects which
 one you are on:
@@ -147,6 +175,34 @@ bash <(curl -sSL https://repo.reqad.net/install.sh) \
 During early access the package repository is access-controlled: register at
 [reqad.com](https://www.reqad.com/) and send the server's public IP so it can be
 allow-listed before running the installer.
+
+## Premium
+
+Reqad stays open source and free to self-host. A Premium subscription, per server, adds:
+
+- **Account Panel** - a control panel for each of your customers on port 2083: WordPress
+  Toolkit with staging, email, files, databases, domains & SSL, backups and metrics
+- **Hosting Pro** - hosting packages with limits, disk and mailbox quotas, monthly
+  bandwidth limits, account suspension, own IP addresses and Apache behind Nginx
+- **ModSecurity** - web application firewall with the OWASP Core Rule Set, per account
+- **FTP server** - Pure-FTPd with TLS and per-account FTP users
+- **Full server transfer** - move accounts from cPanel® / WHM® servers over SSH, with
+  all their data
+- **Other add-ons** - WireGuard VPN, Minecraft Java server
+- **Priority email support** and help with migrations and setup
+
+Premium has its own installer, which sets up the base system as above and then the
+add-ons:
+
+```bash
+bash <(curl -sSL https://repo.reqad.net/install-premium.sh)
+```
+
+See [reqad.com/pricing](https://www.reqad.com/pricing) for plans and prices, and
+[Which version?](https://www.reqad.com/which-version) for a full comparison.
+
+cPanel® and WHM® are registered trademarks of WebPros International LLC. Reqad is not
+affiliated with or endorsed by them.
 
 ## License
 

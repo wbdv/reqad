@@ -170,13 +170,15 @@
 							<? $php_color = $php_version_colors[$row["version"]] ?? '#aaa'; ?>
 							<? if($row["handler"] == 'none') { ?>
 							<span class="badge bg-danger" title="No php-fpm pool for this domain — PHP requests will fail">no pool</span>
+							<? } elseif($row["version"] == 'off') { ?>
+							<span class="badge bg-grey-lt border badge-muted" title="PHP is off: .php files are not run (they answer 403)">PHP disabled</span>
 							<? } else { ?>
 							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($row["version"]);?></span>
 							<? } ?>
                         </td>
 					<? if($modphp): ?>
                         <td class="text-muted" data-label="Handler">
-							<span class="text-muted" style="font-size:0.85em;"><?=$row["handler"] == 'fpm' ? 'php-fpm' : $row["handler"];?></span>
+							<span class="text-muted" style="font-size:0.85em;"><?=$row["handler"] == 'off' ? '-' : ($row["handler"] == 'fpm' ? 'php-fpm' : $row["handler"]);?></span>
                         </td>
 					<? endif; ?>
                         <td data-label="Created on" class="text-muted">
@@ -290,7 +292,7 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body">
-            <p>Change the PHP version for this addon domain.</p>
+            <p>Change the PHP version for this addon domain, or turn PHP off for a static site or an app.</p>
             <div class="mb-3">
               <label class="form-label">Domain name:</label>
               <code id="addon-domain-title"></code>
@@ -304,6 +306,7 @@
                 <div class="mb-3">
           			<label class="form-label">PHP version:</label>
 		            <select name="phpversion" id="addon-phpversion" class="form-select">
+						<option value="off">No PHP - static site or app</option>
 					<? if($modphp): ?>
 						<option value="<?=$ini['php'];?>:mod_php">PHP <?=$ini['php'];?> (mod_php)</option>
 						<option value="<?=$ini['php'];?>:fpm">PHP <?=$ini['php'];?> (php-fpm)</option>
@@ -494,7 +497,7 @@ jQuery(document).ready(function () {
 		$('#addon-domain-title').html(domain);
 		$('#addon-user-title').html(user);
 	<?php if($modphp): ?>
-		$('#addon-phpversion').val(phpversion + ':' + (phphandler === 'fpm' ? 'fpm' : 'mod_php'));
+		$('#addon-phpversion').val(phpversion == 'off' ? 'off' : phpversion + ':' + (phphandler === 'fpm' ? 'fpm' : 'mod_php'));
 	<?php else: ?>
 		$('#addon-phpversion').val(phpversion);
 	<?php endif; ?>

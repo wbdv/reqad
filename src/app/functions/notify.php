@@ -32,10 +32,11 @@ const ACCOUNT_NOTICE_REPEAT = 7 * 86400;
 /*
  * The kinds of message, for $user: kind => label, hint, default, checks (the
  * health checks it covers). Kinds that cannot happen for the account (no
- * email, no deployments) are left out. Add-ons add theirs through the filter
- * account.notify.kinds and send them with account_notify_send().
+ * email, no deployments) are left out, unless $all. Add-ons add theirs
+ * through the filter account.notify.kinds and send them with
+ * account_notify_send().
  */
-function account_notify_kinds($user = '') {
+function account_notify_kinds($user = '', $all = false) {
 	global $db, $ini;
 	$acc = $user !== '' ? account_get($db, $user) : null;
 	$k = array(
@@ -56,11 +57,11 @@ function account_notify_kinds($user = '') {
 		'apps'     => array('label' => 'Deployments and apps', 'default' => true, 'checks' => array('deploy', 'app'),
 		                    'hint' => 'A deployment failed or an app stopped running.'),
 	);
-	if ($acc && !($acc['has_email'] === 'true' || $acc['has_email'] == 1))
+	if (!$all && $acc && !($acc['has_email'] === 'true' || $acc['has_email'] == 1))
 		unset($k['mail']);
 	if (!feature_enabled($ini, 'wptoolkit'))
 		$k['updates']['hint'] = 'A site runs a PHP version that no longer gets security fixes.';
-	if (!function_exists('deploy_enabled') || !deploy_enabled())
+	if (!$all && (!function_exists('deploy_enabled') || !deploy_enabled()))
 		unset($k['apps']);
 	$more = plugin_filter('account.notify.kinds', $k, (string)$user);
 	return is_array($more) ? $more : $k;
@@ -105,10 +106,12 @@ function account_notify_wants($user, $kind) {
 	return !empty($p[$kind]['enabled']);
 }
 
-/* Save the kinds $user wants: kind => bool (kinds not given stay as they are). */
+/* Save the kinds $user wants: kind => bool (kinds not given stay as they are;
+   a kind hidden for the account now, like Email setup without email, is
+   kept for when it shows). */
 function account_notify_set($user, array $kinds) {
 	global $db;
-	$known = account_notify_kinds($user);
+	$known = account_notify_kinds($user, true);
 	$changed = array();
 	foreach ($kinds as $kind => $on) {
 		if (!isset($known[$kind]))
@@ -243,6 +246,39 @@ function account_contact_remove($user, $password = null) {
 	plugin_hook('account.contact_changed', array('account' => $user, 'email' => '', 'old' => $p['email']));
 	account_contact_tell_old($user, (string)$p['email'], '');
 	return result_ok('The contact address was removed. No more messages are sent.');
+}
+
+/*
+ * An account brought over from another server (the transfer tool): $email,
+ * its contact address there, is stored as confirmed - no code, no message -
+ * and every kind of message is turned off except sign-ins from a new device
+ * ('security'), so the move itself mails nobody; the account turns the rest
+ * on in its Profile. An address the account already has here is kept.
+ * $email '' only sets the kinds.
+ */
+function account_contact_import($user, $email) {
+	if (!auth_ready())
+		return result_error('The login tables are missing (db 1037).');
+	$email = strtolower(trim((string)$email));
+	if ($email !== '' && (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 254))
+		return result_error('That is not a valid email address.');
+	$kinds = array();
+	foreach (array_keys(account_notify_kinds($user, true)) as $kind)
+		$kinds[$kind] = $kind === 'security';
+	account_notify_set($user, $kinds);
+	if ($email === '')
+		return result_ok('', array('email' => account_contact($user), 'kept' => false));
+	auth_q("INSERT OR IGNORE INTO auth_principals (type, username, pw_hash, email, created_at)
+	        VALUES ('account', :u, '', '', :ts)", array('u' => (string)$user, 'ts' => time()));
+	$p = auth_principal($user, 'account');
+	if (!$p)
+		return result_error('The account\'s panel login could not be made.');
+	if ((string)$p['email'] !== '')
+		return result_ok('', array('email' => (string)$p['email'], 'kept' => true));
+	auth_q('UPDATE auth_principals SET email = :e WHERE id = :id', array('e' => $email, 'id' => (int)$p['id']));
+	auth_log_event('contact_changed', $email.' (imported)', (int)$p['id'], $user);
+	plugin_hook('account.contact_changed', array('account' => $user, 'email' => $email, 'old' => ''));
+	return result_ok('', array('email' => $email, 'kept' => false));
 }
 
 /* Tell the address that was replaced ($new) or removed ($new = '') - always,

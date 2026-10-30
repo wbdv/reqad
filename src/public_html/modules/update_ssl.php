@@ -14,7 +14,10 @@ if(valid_domain($domain)) {
     /* Accounts, addon domains and the hostname alike -- the accounts table alone
        rejected an addon domain (no row) and this server's own hostname. */
     if (ssl_domain_exists($db, $ini, $domain)) {
-		if($ssltype == 'letsencrypt') {
+		$le_owner = $ssltype == 'letsencrypt' ? scope_domain_owner($domain) : '';
+		if($le_owner !== '' && ($le_off = ssl_free_error($le_owner)) !== '') {
+			$errmsg = 'Error: '.$le_off.' Install a bought certificate for '.$domain.' instead.';
+		} else if($ssltype == 'letsencrypt') {
 			#shell_exec('sudo certbot --non-interactive --nginx -d '.$domain.',www.'.$domain.' >> '.__DIR__.'/../../log/debug_log 2>&1');
 
 			/* the front server answers the challenge and holds the certificate */

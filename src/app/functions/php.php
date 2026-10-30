@@ -285,8 +285,8 @@ function php_pool_write($path, $content) {
 
 /* Run $domain (main or addon domain of $account) on PHP $version: "8.3",
    "8.3:fpm" / "8.5:mod_php" (the handler; mod_php only on a mod_php template
-   and only the server's default version), or "off" (no PHP: main domain only,
-   as Accounts > Manage on 2087). Without a handler a mod_php site stays on
+   and only the server's default version), or "off" (no PHP, as Accounts >
+   Manage and Addon Domains > Manage on 2087). Without a handler a mod_php site stays on
    mod_php for the default version and moves to PHP-FPM for any other; the
    settings set in PHP settings go with it when the handler changes. */
 function php_version_set($account, $domain, $version) {
@@ -303,9 +303,7 @@ function php_version_set($account, $domain, $version) {
 	if ($version === 'off') {
 		if ($s['version'] === 'off')
 			return result_ok("PHP is already off for $domain.", array('domain' => $s['domain'], 'version' => 'off', 'changed' => false));
-		if ($s['kind'] !== 'main')
-			return result_error("PHP can only be turned off for the account's main domain.");
-		$r = account_edit($db, array('user' => $account, 'php' => 'off'));
+		$r = $s['kind'] === 'main' ? account_edit($db, array('user' => $account, 'php' => 'off')) : addon_domain_php_set($s['domain'], 'off');
 		if (empty($r['ok']))
 			return $r;
 		plugin_hook('php.version', array('account' => $account, 'domain' => $s['domain'], 'from' => $s['version'], 'to' => 'off'));

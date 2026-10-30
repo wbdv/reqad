@@ -792,6 +792,14 @@ function settings_main_save($p) {
 		$errs[] = auto_update_cron_write(isset($p['auto_update']), $upd['hour'], $upd['min']);
 	if (isset($p['dnf_automatic']) !== dnf_automatic_status()['on'])
 		$errs[] = dnf_automatic_set(isset($p['dnf_automatic']));
+	/* http(s)://<site>/webmail: only when the row was on the page (email on)
+	   and the switch changed - writing every site's vhost is not free */
+	if (isset($p['webmail_link_row']) && isset($p['webmail_link']) !== (setting_get('webmail-link', '1') !== '0')) {
+		setting_put('webmail-link', isset($p['webmail_link']) ? '1' : '0');
+		if ($w = webmail_links_sync_all())
+			$errs[] = 'The /webmail address was not changed on every site: '.implode('; ', $w);
+	}
+
 	$errs = array_filter($errs);
 	if ($errs)
 		return array('error', 'Settings were saved, but: '.implode(' ', $errs));
@@ -1517,8 +1525,12 @@ function ajax_required_feature($action) {
 		'ajax-mobileconfig'       => 'email',
 		'ajax-wp-install'         => 'wptoolkit',
 		'ajax-wp-scan'            => 'wptoolkit',
-		'ajax-transfer-run'       => 'transfer',
-		'ajax-transfer-check'     => 'transfer',
+		'ajax-transfer-start'     => 'transfer',
+		'ajax-transfer-status'    => 'transfer',
+		'ajax-transfer-stop'      => 'transfer',
+		'ajax-transfer-accounts'  => 'transfer',
+		'ajax-transfer-php'       => 'transfer',
+		'ajax-transfer-precheck'  => 'transfer',
 		'ajax-fm-list'            => 'filemanager',
 		'ajax-fm-read'            => 'filemanager',
 		'ajax-fm-save'            => 'filemanager',
@@ -1701,6 +1713,17 @@ function plugin_for_action($action) {
  * account.notify.brand (array(name, panel) the messages to an account come
  * from, + user: the account panel sets the provider and its address;
  * app/functions/notify.php),
+ * ssl.free ('' or why the account may not get free Let's Encrypt
+ * certificates, + user, + account_create()'s $o while the account is being
+ * made (else null); core asks it through ssl_free_error() in
+ * app/functions/domains.php: Hosting Pro's packages can turn them off),
+ * ip.list (null, or the server's extra addresses when an add-on gives
+ * accounts addresses of their own: address, public, users, mail_domains),
+ * account.ip.set (null or a result_ok/result_error(), + user, ipv4, ipv6: an
+ * address, or null to leave that kind) and mail.ip.set (the same, + domain,
+ * ipv4, ipv6: the address the domain's mail goes out from, '' = none) - the
+ * transfer tool's IP restore (transfer_ip_restore()) asks Hosting Pro through
+ * these three,
  * stats.needed (false, or true when an add-on needs the sites' logs counted
  * while visitor stats are switched off: Hosting Pro's bandwidth limits;
  * app/functions/stats.php).
@@ -1714,7 +1737,28 @@ function plugin_for_action($action) {
  * (see plugins/hosting). Core binds an account's vhosts to extra addresses
  * with account_vhost_listen() (app/functions/accounts.php).
  */
+/* Core's own listeners, run before the plugins': event => functions. */
+function core_hooks() {
+	return array(
+		/* http(s)://<site>/webmail (webmail_link_sync(), app/functions/emails.php) */
+		'account.created' => array('webmail_link_on_event'),
+		'account.edited'  => array('webmail_link_on_event'),
+		'addon.created'   => array('webmail_link_on_event'),
+		'ssl.issued'      => array('webmail_link_on_event'),
+		'php.version'     => array('webmail_link_on_event'),
+	);
+}
+
 function plugin_hook($event, array $data = array()) {
+	foreach (core_hooks()[$event] ?? array() as $fn) {
+		if (!function_exists($fn))
+			continue;
+		try {
+			$fn($data + array('event' => $event));
+		} catch (Throwable $e) {
+			log_debug('[core] hook '.$event.' '.$fn.' failed: '.$e->getMessage());
+		}
+	}
 	foreach ((isset($GLOBALS['plugins']) ? $GLOBALS['plugins'] : array()) as $pl) {
 		if (empty($pl['hooks'][$event]) || !is_callable($pl['hooks'][$event]))
 			continue;
@@ -2075,11 +2119,14 @@ function account_has_wildcard_alias($db, $domain) {
    DNS-01 (all SANs, no resolve filter — TXT-based); otherwise the standard
    HTTP-01 flow is used and names are filtered to those that resolve here. Runs
    certbot in the background. Returns: '' launched, 'not-le' (own/self-signed
-   cert), 'none' (main domain does not resolve, HTTP-01), 'no-dns' (wildcard but
+   cert), 'not-free' (the account may not get free certificates: ssl_free_error()),
+   'none' (main domain does not resolve, HTTP-01), 'no-dns' (wildcard but
    no DNS provider configured). */
 function reissue_letsencrypt_cert($db, $domain, $has_email, $token = '') {
 	$ok = trim(shell_exec('sudo test -d /etc/letsencrypt/live/'.escapeshellarg($domain).' && echo y'));
 	if($ok !== 'y') return 'not-le';
+	if(function_exists('ssl_free_error') && ($acct = account_get($db, '', $domain)) && ssl_free_error($acct['user']) !== '')
+		return 'not-free';
 
 	/* Wildcard present -> DNS-01 re-issue of the full SAN set. */
 	if(account_has_wildcard_alias($db, $domain)) {
@@ -2563,11 +2610,28 @@ function wp_nginx_conf_path($domain) {
 	return '/etc/nginx/conf.d/'.$domain.'.conf';
 }
 
-/* --- Nginx FastCGI cache ------------------------------------------------- */
+/* --- Nginx page cache (FastCGI, or proxy with Apache behind nginx) -------- */
 
-/* Build the three marker-delimited config fragments for a site.
-   Returns array('http' => ..., 'purge' => ..., 'fcgi' => ...). Uses nowdoc so
-   nginx '$' variables survive verbatim; only %ZONE% / %IP% are substituted.
+/* How a vhost's page cache works: 'fcgi' = nginx runs PHP itself and caches
+   PHP-FPM's answers (fastcgi_cache); 'proxy' = Apache behind nginx
+   (nginx_backend_root(): `include /etc/nginx/reqad-backend.conf;`) and nginx
+   caches Apache's answers (proxy_cache). Same zone, maps, rules and purge. */
+function wp_nginx_cache_mode($conf) {
+	return preg_match('#^[ \t]*include[ \t]+/etc/nginx/reqad-backend\.conf;#m', (string)$conf) ? 'proxy' : 'fcgi';
+}
+
+/* A zone's cache folder. Each kind has its own: the two caches store their
+   entries differently, so one must never read the other's files. */
+function wp_nginx_cache_dir($zone, $mode = 'fcgi') {
+	return '/var/cache/nginx/'.($mode === 'proxy' ? 'proxy-' : 'fcgi-').$zone;
+}
+
+/* Build the marker-delimited config fragments for a site.
+   Returns array('http' => ..., 'purge' => ..., 'fcgi' => ..., 'proxy' => ...):
+   http + purge for $mode (wp_nginx_cache_mode()), and both location-level
+   blocks ('fcgi' after the PHP handler's fastcgi_pass, 'proxy' after each
+   include of reqad-backend.conf). Uses nowdoc so nginx '$' variables survive
+   verbatim; only %ZONE% / %IP% are substituted.
    $rules: the site's own additions (wp_cache_rules_get()): 'pages' = paths
    that are never cached, 'cookies' = cookie names that turn the cache off.
 
@@ -2576,8 +2640,10 @@ function wp_nginx_conf_path($domain) {
    and PHP gets it WITHOUT the tags when the answer may be cached, so no
    visitor's click id ends up in a page the others get. Any other parameter
    skips the cache, as before. The key is the path alone (%ZONE%_cache_path):
-   only cacheable requests ever read or write it. */
-function wp_nginx_cache_fragments($zone, $ip, array $rules = array()) {
+   only cacheable requests ever read or write it. With Apache behind nginx the
+   address cannot be changed on the way, so a tagged request reads the cache
+   but its answer is never stored (proxy_no_cache ... _nc_track). */
+function wp_nginx_cache_fragments($zone, $ip, array $rules = array(), $mode = 'fcgi') {
 	$cookies = '';
 	foreach (wp_cache_rules_clean($rules)['cookies'] as $c) {
 		$name = preg_quote(rtrim($c, '*'));
@@ -2710,10 +2776,73 @@ EOT;
 
 EOT;
 
+	$proxy = <<<'EOT'
+            # BEGIN reqad-nginx-cache-proxy
+            # Page cache of Apache's answers; the key is the path without its query.
+            # Requests with campaign tags alone read it, but only plain addresses
+            # are stored (Apache gets the tags, so its answer may carry them).
+            # Apache gets no Accept-Encoding: the cached copy is plain and nginx
+            # compresses it per visitor, so one copy serves every browser and a
+            # purge of the address clears it (Vary is ignored for the same reason).
+            proxy_cache               %ZONE%;
+            proxy_cache_key           "$scheme$host$%ZONE%_cache_path";
+            proxy_cache_methods       GET;
+            proxy_cache_valid         200 301 302 12h;
+            proxy_cache_valid         404 1m;
+            proxy_cache_lock          on;
+            proxy_cache_revalidate    on;
+            proxy_cache_use_stale     error timeout updating invalid_header http_500 http_503;
+            proxy_cache_background_update on;
+            proxy_ignore_headers      Cache-Control Expires Vary;
+            proxy_cache_bypass        $%ZONE%_skip_cache;
+            proxy_no_cache            $%ZONE%_skip_cache $%ZONE%_nc_track;
+            proxy_set_header          Accept-Encoding "";
+            # END reqad-nginx-cache-proxy
+
+EOT;
+
+	if ($mode === 'proxy') {
+		$http = str_replace(array("# FastCGI microcache — managed by the Reqad WP Toolkit \"Manage\" panel.",
+		                          "fastcgi_cache_path /var/cache/nginx/fcgi-%ZONE% levels=1:2 keys_zone=%ZONE%:100m\n                  "),
+		                    array("# Page cache of Apache's answers (Apache behind nginx) — managed by the Reqad WP Toolkit.",
+		                          "proxy_cache_path /var/cache/nginx/proxy-%ZONE% levels=1:2 keys_zone=%ZONE%:100m\n                "), $http);
+		/* the header keeps its name: the purge plugin and admins look for it */
+		$purge = str_replace(array('fastcgi_cache_purge %ZONE%', 'must match fastcgi_cache_key'),
+		                     array('proxy_cache_purge   %ZONE%', 'must match proxy_cache_key'), $purge);
+	}
+
 	$sub = function($s) use ($zone, $ip, $cookies, $pages, $track) {
 		return str_replace(array('%ZONE%', '%IP%', '%COOKIES%', '%PAGES%', '%TRACK%'), array($zone, $ip, $cookies, $pages, $track), $s);
 	};
-	return array('http' => $sub($http), 'purge' => $sub($purge), 'fcgi' => $sub($fcgi));
+	return array('http' => $sub($http), 'purge' => $sub($purge), 'fcgi' => $sub($fcgi), 'proxy' => $sub($proxy));
+}
+
+/* Put the location-level cache blocks of $mode into a vhost, after taking
+   out any there are (of either kind). fcgi: after the first PHP handler's
+   `fastcgi_pass php-fpm...;`. proxy: after every `include
+   /etc/nginx/reqad-backend.conf;` (`location /` and its PHP location; not the
+   server's @reqad_backend, which only gets static files that are not on
+   disk). Returns array(conf, blocks placed); 0 = no place for them (PHP off,
+   a customised vhost). */
+function wp_nginx_cache_place($conf, array $frag, $mode) {
+	foreach (array('reqad-nginx-cache-fcgi', 'reqad-nginx-cache-proxy') as $mk)
+		$conf = preg_replace('/[ \t]*# BEGIN '.$mk.'\b.*?# END '.$mk.'[^\n]*\n?/s', '', $conf);
+	$out = array(); $n = 0; $loc = '';
+	foreach (explode("\n", $conf) as $ln) {
+		$out[] = $ln;
+		if (preg_match('/^[ \t]*location\b[^{]*\{/', $ln))
+			$loc = $ln;
+		if ($mode === 'proxy') {
+			if (preg_match('#^([ \t]*)include[ \t]+/etc/nginx/reqad-backend\.conf;#', $ln, $m) && strpos($loc, '@reqad_backend') === false) {
+				$out[] = conf_indent(preg_replace('/^[ \t]+/m', '', trim($frag['proxy'], "\n")), $m[1]);
+				$n++;
+			}
+		} elseif ($n === 0 && strpos($ln, 'fastcgi_pass') !== false && strpos($ln, 'php-fpm') !== false) {
+			$out[] = rtrim($frag['fcgi'], "\n");
+			$n++;
+		}
+	}
+	return array(implode("\n", $out), $n);
 }
 
 /* The query parameters that only tag a visit (ads, newsletters, social
@@ -2814,12 +2943,21 @@ function wp_cache_rules_forget($domain) {
 
 /* A vhost's text with its cache blocks written again from the current
    fragments (same zone, the site's rules), or null when it has no cache. The
-   purge block keeps the address it allows. */
+   purge block keeps the address it allows. The kind follows the vhost
+   (wp_nginx_cache_mode()): after a switch between nginx alone and Apache
+   behind nginx the location-level blocks of the other kind are replaced, so
+   this is also how a switch keeps the cache on (the old kind's folder is then
+   left for the caller to empty). */
 function wp_nginx_cache_rewrite($conf, $domain) {
 	if (!preg_match('/^# BEGIN reqad-nginx-cache[ \t]*$/m', $conf) || !preg_match('/keys_zone=([a-z0-9_]+):/', $conf, $zm))
 		return null;
+	$mode = wp_nginx_cache_mode($conf);
 	$ip = preg_match('/# BEGIN reqad-nginx-cache-purge.*?allow\s+(?!127\.0\.0\.1|::1)([0-9a-fA-F.:]+);/s', $conf, $im) ? $im[1] : reqad_server_ip();
-	$frag = wp_nginx_cache_fragments($zm[1], $ip, wp_cache_rules_get($domain));
+	$frag = wp_nginx_cache_fragments($zm[1], $ip, wp_cache_rules_get($domain), $mode);
+	$want  = $mode === 'proxy' ? 'reqad-nginx-cache-proxy' : 'reqad-nginx-cache-fcgi';
+	$other = $mode === 'proxy' ? 'reqad-nginx-cache-fcgi' : 'reqad-nginx-cache-proxy';
+	if (strpos($conf, '# BEGIN '.$other) !== false || strpos($conf, '# BEGIN '.$want) === false)
+		list($conf, ) = wp_nginx_cache_place($conf, $frag, $mode);
 	$swap = function ($mk, $text, $c) {
 		/* the block keeps the indent of its BEGIN line */
 		$text = trim($text, "\n");
@@ -2827,11 +2965,11 @@ function wp_nginx_cache_rewrite($conf, $domain) {
 		$text = preg_replace('/^'.preg_quote($lead, '/').'/m', '', $text);    // the fragment's own indent off
 		return preg_replace_callback('/^([ \t]*)# BEGIN '.$mk.'[ \t]*\n.*?# END '.$mk.'[^\n]*\n?/ms', function ($m) use ($text) {
 			return conf_indent($text, $m[1])."\n";
-		}, $c, 1);
+		}, $c);
 	};
 	$conf = $swap('reqad-nginx-cache', $frag['http'], $conf);
 	$conf = $swap('reqad-nginx-cache-purge', $frag['purge'], $conf);
-	$conf = $swap('reqad-nginx-cache-fcgi', $frag['fcgi'], $conf);
+	$conf = $swap($want, $frag[$mode], $conf);
 	return $conf;
 }
 
@@ -2924,15 +3062,15 @@ function wp_install_cache_purger($user, $docroot) {
 	return $log;
 }
 
-/* Enable the nginx FastCGI cache for a site: inject the three fragments into the
-   vhost, create the cache dir, install+activate the purge plugin, test & reload.
-   Reverts the vhost on a failed `nginx -t`. Returns array(error, success, log). */
+/* Enable the nginx page cache for a site: inject the fragments into the vhost
+   (FastCGI cache, or the proxy cache with Apache behind nginx:
+   wp_nginx_cache_mode()), create the cache dir, install+activate the purge
+   plugin, test & reload. Reverts the vhost on a failed `nginx -t`. Returns
+   array(error, success, log). */
 function wp_nginx_cache_enable($ini, $user, $domain, $docroot, $zone = null) {
 	$log = '';
 	if(!wp_is_nginx($ini))
-		return array('error' => 'This server does not use nginx, so the FastCGI cache is not available.', 'success' => '', 'log' => '');
-	if(web_backend($ini) !== 'none')
-		return array('error' => 'The nginx cache needs nginx to run PHP itself; with Apache behind nginx it is not available yet.', 'success' => '', 'log' => '');
+		return array('error' => 'This server does not use nginx, so the page cache is not available.', 'success' => '', 'log' => '');
 
 	$path = wp_nginx_conf_path($domain);
 	$orig = wp_read_conf($path);
@@ -2944,7 +3082,8 @@ function wp_nginx_cache_enable($ini, $user, $domain, $docroot, $zone = null) {
 	/* the zone: wordpress_tool_ctx() gives one per site (an account's sites must not share one) */
 	$zone = $zone ?? wp_cache_zone($user);
 	$ip   = reqad_server_ip();
-	$frag = wp_nginx_cache_fragments($zone, $ip, wp_cache_rules_get($domain));
+	$mode = wp_nginx_cache_mode($orig);
+	$frag = wp_nginx_cache_fragments($zone, $ip, wp_cache_rules_get($domain), $mode);
 
 	// 1) http-context block at the very top of the file (conf.d is http context).
 	$new = $frag['http']."\n".$orig;
@@ -2963,23 +3102,17 @@ function wp_nginx_cache_enable($ini, $user, $domain, $docroot, $zone = null) {
 		return array('error' => 'Could not locate an `index` directive in the vhost to anchor the purge block.', 'success' => '', 'log' => '');
 	$new = implode("\n", $out);
 
-	// 3) fcgi cache directives: right after the `fastcgi_pass php-fpm-<user>;` line.
-	$lines = explode("\n", $new);
-	$out = array(); $did_fcgi = false;
-	foreach($lines as $ln) {
-		$out[] = $ln;
-		if(!$did_fcgi && strpos($ln, 'fastcgi_pass') !== false && strpos($ln, 'php-fpm') !== false) {
-			$out[] = rtrim($frag['fcgi'], "\n");
-			$did_fcgi = true;
-		}
-	}
-	if(!$did_fcgi)
-		return array('error' => 'Could not locate the `fastcgi_pass` line in the vhost to anchor the cache directives.', 'success' => '', 'log' => '');
-	$new = implode("\n", $out);
+	// 3) location-level cache directives: right after the `fastcgi_pass php-fpm-<user>;`
+	//    line, or (Apache behind nginx) after each include of reqad-backend.conf.
+	list($new, $placed) = wp_nginx_cache_place($new, $frag, $mode);
+	if(!$placed)
+		return array('error' => $mode === 'proxy'
+			? 'Could not find the line that passes requests to Apache (include /etc/nginx/reqad-backend.conf;) in the vhost to anchor the cache directives.'
+			: 'Could not locate the `fastcgi_pass` line in the vhost to anchor the cache directives.', 'success' => '', 'log' => '');
 
 	// Cache dir (nginx creates sublevels itself, but needs the root to exist+own).
 	// 0700: other accounts must not be able to read or plant cache entries.
-	shell_exec('sudo install -d -o nginx -g nginx -m 0700 /var/cache/nginx/fcgi-'.escapeshellarg($zone).' 2>/dev/null');
+	shell_exec('sudo install -d -o nginx -g nginx -m 0700 '.escapeshellarg(wp_nginx_cache_dir($zone, $mode)).' 2>/dev/null');
 
 	// Snapshot the pre-change vhost into the Advanced Config version history so the
 	// admin can roll back the cache injection from that panel's "Version history".
@@ -3000,10 +3133,10 @@ function wp_nginx_cache_enable($ini, $user, $domain, $docroot, $zone = null) {
 	$log .= "\n".wp_install_cache_purger($user, $docroot);
 
 	log_debug('[wp-manage] nginx-cache enabled for '.$domain.' ('.$user.')');
-	return array('error' => '', 'success' => 'Nginx FastCGI cache enabled and nginx reloaded.', 'log' => $log);
+	return array('error' => '', 'success' => 'Nginx page cache enabled and nginx reloaded.', 'log' => $log);
 }
 
-/* Disable the nginx cache: strip the three marker blocks, test & reload, empty
+/* Disable the nginx cache: strip the marker blocks, test & reload, empty
    the cache dir and deactivate the purge plugin. Returns array(error, success, log). */
 function wp_nginx_cache_disable($ini, $user, $domain, $docroot, $zone = null) {
 	$log = '';
@@ -3019,7 +3152,7 @@ function wp_nginx_cache_disable($ini, $user, $domain, $docroot, $zone = null) {
 
 	// Remove each marker block (and the blank line that follows it, if any).
 	$new = $orig;
-	foreach(array('reqad-nginx-cache-purge', 'reqad-nginx-cache-fcgi', 'reqad-nginx-cache') as $mk) {
+	foreach(array('reqad-nginx-cache-purge', 'reqad-nginx-cache-fcgi', 'reqad-nginx-cache-proxy', 'reqad-nginx-cache') as $mk) {
 		$new = preg_replace('/[ \t]*# BEGIN '.$mk.'\b.*?# END '.$mk.'[^\n]*\n?\n?/s', '', $new);
 	}
 
@@ -3041,7 +3174,8 @@ function wp_nginx_cache_disable($ini, $user, $domain, $docroot, $zone = null) {
 		$zone = $zm[1];
 	$zone = preg_replace('/[^a-z0-9_]/', '', (string)($zone ?? wp_cache_zone($user)));
 	if($zone !== '')
-		shell_exec('sudo rm -rf /var/cache/nginx/fcgi-'.escapeshellarg($zone).'/* 2>/dev/null');
+		foreach(array('fcgi', 'proxy') as $kind)
+			shell_exec('sudo rm -rf '.escapeshellarg(wp_nginx_cache_dir($zone, $kind)).'/* 2>/dev/null');
 	// Deactivate the canonical slug, plus any branch-suffixed copy left behind by
 	// an install that went through the GitHub archive (reqad-cache-purger-main).
 	foreach(array(WP_CACHE_PURGER_SLUG, WP_CACHE_PURGER_SLUG.'-main', WP_CACHE_PURGER_SLUG.'-master') as $pslug) {
@@ -3051,7 +3185,7 @@ function wp_nginx_cache_disable($ini, $user, $domain, $docroot, $zone = null) {
 	}
 
 	log_debug('[wp-manage] nginx-cache disabled for '.$domain.' ('.$user.')');
-	return array('error' => '', 'success' => 'Nginx FastCGI cache disabled and nginx reloaded.', 'log' => $log);
+	return array('error' => '', 'success' => 'Nginx page cache disabled and nginx reloaded.', 'log' => $log);
 }
 
 /* Disable WP-Cron, search engine indexing, maintenance mode, the must-use
@@ -3232,14 +3366,15 @@ function wp_site_probe_cached($user) {
 	return is_array($d) ? $d : array('error' => 'pending');
 }
 
-/* Empty a site's nginx FastCGI cache (no-op when there is none). Used when an
+/* Empty a site's nginx page cache (FastCGI or proxy) (no-op when there is none). Used when an
    option changes what anonymous visitors must see (maintenance, robots.txt). */
 /* $zone: a site's cache zone, or an account name - then every site of the account
    (their zones are <account> and <account>_<hash>, wordpress_tool_ctx()) */
 function wp_nginx_cache_purge_all($zone) {
 	$zone = preg_replace('/[^a-z0-9_]/', '', strtolower((string)$zone));
 	if($zone !== '')
-		shell_exec('sudo sh -c '.escapeshellarg('rm -rf /var/cache/nginx/fcgi-'.$zone.'/* /var/cache/nginx/fcgi-'.$zone.'_*/*').' 2>/dev/null');
+		shell_exec('sudo sh -c '.escapeshellarg('rm -rf /var/cache/nginx/fcgi-'.$zone.'/* /var/cache/nginx/fcgi-'.$zone.'_*/*'
+			.' /var/cache/nginx/proxy-'.$zone.'/* /var/cache/nginx/proxy-'.$zone.'_*/*').' 2>/dev/null');
 }
 
 /* --- Site screenshot -----------------------------------------------------
@@ -3685,7 +3820,7 @@ function wp_sec_php_handler($vhost) {
 	}
 	if($end < 0) return '';
 	$body = substr($vhost, $i + 1, $end - $i - 1);
-	$body = preg_replace('/[ \t]*# BEGIN reqad-nginx-cache-fcgi\b.*?# END reqad-nginx-cache-fcgi[^\n]*\n?/s', '', $body);
+	$body = preg_replace('/[ \t]*# BEGIN reqad-nginx-cache-(fcgi|proxy)\b.*?# END reqad-nginx-cache-\1[^\n]*\n?/s', '', $body);
 	$out = "    try_files \$uri =404;\n";
 	foreach(explode("\n", $body) as $ln) {
 		$t = trim($ln);
@@ -8370,10 +8505,16 @@ function addon_socket($user, $domain) {
 }
 
 /* Which PHP version/handler serves $domain: array(version, handler, pool).
-   handler is 'fpm' when a pool file exists, 'mod_php' on apache when none does
-   (apache falls back to the module, which is always the default PHP), and
-   'none' on nginx with no pool — a broken state PHP requests would 502 on. */
+   version and handler are 'off' when PHP is turned off (the PHP-off block of
+   account_php_disable() in the vhost with the PHP handler, the backend's if
+   any), handler is 'fpm' when a pool file exists, 'mod_php' on apache when
+   none does (apache falls back to the module, which is always the default
+   PHP), and 'none' on nginx with no pool — a broken state PHP requests would
+   502 on. */
 function addon_domain_php($ini, $domain) {
+	$vhost = web_vhost_path($domain, web_php_server($ini));
+	if (strpos((string)@file_get_contents($vhost), '# BEGIN reqad-php-disabled') !== false)
+		return array('version' => 'off', 'handler' => 'off', 'pool' => null);
 	$php_versions = array_map('trim', explode(',', $ini['php_versions'] ?? ''));
 	foreach ($php_versions as $pv) {
 		$pool = addon_pool_path($ini, $domain, $pv);
@@ -8419,12 +8560,27 @@ function addon_domain_list($ini) {
 			'pool'    => $php['pool'],
 			'vhost'   => $file,
 			'created' => $created,
-			'ssl'     => is_file('/etc/letsencrypt/live/'.$domain.'/cert.pem') ? 'letsencrypt'
-			             : (is_file('/etc/ssl/certs/'.$domain.'.crt') ? 'self-signed' : ''),
+			'ssl'     => addon_domain_ssl_kind($domain, $content),
 		);
 	}
 	ksort($list);
 	return $list;
+}
+
+/* What certificate an addon domain's vhost serves: 'letsencrypt', 'self-signed',
+   'custom' (any other: one installed by hand or brought by a transfer) or ''.
+   Read from the certificate line of the vhost, not from which files exist:
+   every new site gets a self-signed <domain>.crt that stays after a real
+   certificate (<domain>_newcert.pem) is put in its place. */
+function addon_domain_ssl_kind($domain, $content) {
+	if (!preg_match('/^[ \t]*(?:ssl_certificate|SSLCertificateFile)[ \t]+"?([^";\s]+)/m', (string)$content, $m))
+		return is_file('/etc/letsencrypt/live/'.$domain.'/cert.pem') ? 'letsencrypt'
+		       : (is_file('/etc/ssl/certs/'.$domain.'.crt') ? 'self-signed' : '');
+	if (strpos($m[1], '/etc/letsencrypt/') === 0)
+		return 'letsencrypt';
+	$pem = @file_get_contents($m[1]);   // /etc/ssl/certs is world-readable; the keys are not read
+	$c = $pem !== false && strpos($pem, '-----BEGIN CERTIFICATE-----') !== false ? @openssl_x509_parse($pem) : false;
+	return is_array($c) && ssl_is_self_signed($c) ? 'self-signed' : 'custom';
 }
 
 /* One addon domain by name, or null when $domain is not an addon domain. Every
@@ -8483,7 +8639,9 @@ php_value[soap.wsdl_cache_dir]  = /var/lib/php/wsdlcache
    app/functions/accounts.php - move/create/delete the pool file, restart the
    affected php-fpm services - except the pool is named after the addon domain
    and listens on its own per-domain socket. $handler 'fpm', or 'mod_php' on
-   Apache (default PHP only). Used by modules/edit_addon_domain.php (2087) and
+   Apache (default PHP only); $new_version 'off' = No PHP (account_php_disable()
+   with the addon's socket: pool removed, .php answers 403), and a version
+   brings it back. Used by modules/edit_addon_domain.php (2087) and
    php_version_set() (the API, the account panel). result_ok / result_error. */
 function addon_domain_php_set($domain, $new_version, $new_handler = 'fpm') {
 	global $ini;
@@ -8495,6 +8653,15 @@ function addon_domain_php_set($domain, $new_version, $new_handler = 'fpm') {
 	$addon = addon_domain_get($ini, $domain);
 	if ($addon === null)
 		return result_error("'".$domain."' is not an addon domain on this server.");
+	if ($new_version === 'off') {
+		if ($addon['version'] === 'off')
+			return result_ok("PHP is already off for ".$domain.".", array('domain' => $domain, 'changed' => false));
+		route_log("edit addon domain $domain: PHP {$addon['version']}/{$addon['handler']} -> off");
+		if (($err = account_php_disable($domain, $addon['user'], true)) !== '')
+			return result_error("PHP was not turned off for ".$domain.": ".$err);
+		return result_ok("PHP is off for ".$domain.": its .php files are not run any more (they answer 403).",
+		                 array('domain' => $domain, 'changed' => true));
+	}
 	if (!in_array($new_version, $php_versions, true))
 		return result_error("PHP ".$new_version." is not installed on this server.");
 	if (!in_array($new_handler, array('fpm', 'mod_php'), true))
@@ -8512,6 +8679,15 @@ function addon_domain_php_set($domain, $new_version, $new_handler = 'fpm') {
 	$label = "PHP ".$new_version.($modphp ? " (".($new_handler == 'fpm' ? 'php-fpm' : 'mod_php').")" : "");
 	if ($new_version == $old_version && !$handler_changed)
 		return result_ok("Addon domain ".$domain." already runs ".$label.".", array('domain' => $domain, 'changed' => false));
+	if ($old_version === 'off') {
+		route_log("edit addon domain $domain: PHP off -> $new_version/$new_handler");
+		if (($err = account_php_enable($domain, $user, $new_version, $new_handler, true)) !== '')
+			return result_error("PHP was not turned on for ".$domain.": ".$err);
+		/* mod_php writes the account's tmp/ and logs/ as apache */
+		if ($new_handler == 'mod_php')
+			shell_exec('sudo '._PATH.'/scripts/update/harden_account_perms.sh --apply --quiet --user='.escapeshellarg($user).' >/dev/null 2>&1');
+		return result_ok("Addon domain ".$domain." now runs ".$label.".", array('domain' => $domain, 'changed' => true));
+	}
 
 	route_log("edit addon domain $domain: PHP $old_version/$old_handler -> $new_version/$new_handler");
 	$old_pool = ($old_handler == 'fpm') ? $addon['pool'] : null;
@@ -8896,4 +9072,1827 @@ function result_redirect($url, $r) {
 	if ($r['warnings'])
 		msg_redirect($url, $r['message'].' '.implode(' ', $r['warnings']), 'warning');
 	msg_redirect($url, $r['message'], 'success');
+}
+
+
+/* ===================== Transfer tool: the cPanel server =====================
+   The transfer tool reads the old cPanel server over SSH (whmapi1 as root).
+   Only server, port and SSH user come from the form and they are checked here;
+   every command sent to the remote shell is fixed text, and anything read back
+   that is used again (account names, document roots) is checked before use. */
+
+/* The ssh command for the form's values, or '' with $error set. */
+function transfer_ssh($server, $port, $ruser, &$error) {
+	$error = '';
+	if (!preg_match('/^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,253}$/', $server))
+		$error = 'Invalid server address.';
+	elseif (!preg_match('/^[a-z_][a-z0-9_\-]{0,31}$/', $ruser))
+		$error = 'Invalid SSH username.';
+	elseif ((int)$port < 1 || (int)$port > 65535)
+		$error = 'Invalid SSH port.';
+	if ($error !== '')
+		return '';
+	return 'ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p '.(int)$port.' '
+	     .escapeshellarg($ruser.'@'.$server);
+}
+
+/* The reqad user's SSH public key, which transfer_ssh() logs in with (ssh
+   finds ~/.ssh/id_rsa or id_ed25519 by itself). Made the first time it is
+   asked for - a new server has none. '' when it cannot be made. */
+function transfer_ssh_pubkey() {
+	$dir = _PATH.'/.ssh';
+	foreach (array('id_rsa', 'id_ed25519') as $k) {
+		if (!is_file("$dir/$k"))
+			continue;
+		if (!is_file("$dir/$k.pub"))
+			exec('ssh-keygen -y -f '.escapeshellarg("$dir/$k").' > '.escapeshellarg("$dir/$k.pub").' 2>/dev/null');
+		$pub = trim((string)@file_get_contents("$dir/$k.pub"));
+		if ($pub !== '')
+			return $pub;
+	}
+	if (!is_dir($dir) && !@mkdir($dir, 0700))
+		return '';
+	exec('ssh-keygen -q -t ed25519 -N "" -C '.escapeshellarg('reqad@'.gethostname())
+		.' -f '.escapeshellarg("$dir/id_ed25519").' < /dev/null 2>&1', $out, $rc);
+	if ($rc !== 0)
+		return '';
+	route_log('transfer: made an SSH key for the reqad user ('.$dir.'/id_ed25519)');
+	return trim((string)@file_get_contents("$dir/id_ed25519.pub"));
+}
+
+/* Several whmapi1 calls over ONE ssh connection (one login, not one per call).
+   Returns the 'data' of each call in order, null for a call that failed. */
+function transfer_whmapi($ssh, array $calls) {
+	$sep = '@@REQAD-NEXT@@';
+	$parts = array();
+	foreach ($calls as $c)
+		$parts[] = 'whmapi1 --output=json '.$c.' 2>/dev/null';
+	$raw = (string)shell_exec($ssh.' '.escapeshellarg(implode("; echo '".$sep."'; ", $parts)).' 2>/dev/null');
+	$out = array();
+	foreach (explode($sep, $raw) as $i => $chunk) {
+		if ($i >= count($calls))
+			break;
+		$j = json_decode(trim($chunk), true);
+		$out[] = (is_array($j) && !empty($j['metadata']['result'])) ? ($j['data'] ?? array()) : null;
+	}
+	while (count($out) < count($calls))
+		$out[] = null;
+	return $out;
+}
+
+/* "ea-php82" / "alt-php74" / "php82" -> "8.2"; '' when it is not a version */
+function transfer_php_version($pkg) {
+	if (preg_match('/(?:^|-)php(\d)(\d{1,2})$/', strtolower(trim((string)$pkg)), $m))
+		return $m[1].'.'.$m[2];
+	return '';
+}
+
+/* What this server has of a PHP version: 'installed' | 'installable' | 'missing',
+   plus 'ended' (past its end of life) for an installed one. */
+function transfer_php_local($version) {
+	static $have = null, $can = null;
+	if ($have === null) {
+		$have = array();
+		foreach (php_versions() as $v)
+			$have[$v['version']] = $v['ended'];
+		$can = php_installable_versions();
+	}
+	if (isset($have[$version]))
+		return array('status' => 'installed', 'ended' => (bool)$have[$version]);
+	return array('status' => in_array($version, $can, true) ? 'installable' : 'missing', 'ended' => false);
+}
+
+/* ---- Transfer tool: the pre-transfer check ------------------------------------
+   One check of the cPanel server (MySQL, PHP extensions, mail settings) and one
+   per account (domains and DNS, cPanel features missing here, mail settings,
+   PHP settings, databases, cron jobs, size, certificates). Items:
+   array(area, level ok|info|warn|block, title, detail, list[], code (list is commands)). */
+
+/* $cmd on the cPanel server with $stdin on its stdin (never in the command);
+   its output. The local ssh is stopped after $timeout seconds. */
+function transfer_remote($ssh, $cmd, $stdin = '', $timeout = 120) {
+	$tmp = tempnam(sys_get_temp_dir(), 'rqtf');
+	file_put_contents($tmp, $stdin);
+	$out = '';
+	$p = proc_open('timeout '.(int)$timeout.' '.$ssh.' '.escapeshellarg($cmd),
+	               array(0 => array('file', $tmp, 'r'), 1 => array('pipe', 'w'), 2 => array('file', '/dev/null', 'w')), $pipes);
+	if (is_resource($p)) {
+		$out = (string)stream_get_contents($pipes[1]);
+		fclose($pipes[1]);
+		proc_close($p);
+	}
+	@unlink($tmp);
+	return $out;
+}
+
+/* Output of the remote scripts below, in sections: a line "@@RQ name arg"
+   starts one. array of array(name, arg, lines) */
+function transfer_sections($out) {
+	$sec = array();
+	$cur = -1;
+	foreach (explode("\n", $out) as $l) {
+		if (strncmp($l, '@@RQ ', 5) === 0) {
+			$p = explode(' ', substr($l, 5), 2);
+			$sec[] = array($p[0], trim($p[1] ?? ''), array());
+			$cur = count($sec) - 1;
+		} elseif ($cur >= 0)
+			$sec[$cur][2][] = $l;
+	}
+	return $sec;
+}
+
+function transfer_item($area, $level, $title, $detail = '', array $list = array(), $code = false) {
+	return array('area' => $area, 'level' => $level, 'title' => $title, 'detail' => $detail, 'list' => array_values($list), 'code' => $code);
+}
+
+function transfer_bytes($n) {
+	$n = (float)$n;
+	foreach (array('B', 'KB', 'MB', 'GB', 'TB') as $i => $u)
+		if ($n < 1024 || $u === 'TB')
+			return ($i ? number_format($n, $n < 10 ? 1 : 0) : (int)$n).' '.$u;
+		else
+			$n /= 1024;
+}
+
+/* The registered domain of a name (example.co.uk for www.shop.example.co.uk),
+   '' when the name is itself a public suffix. Public Suffix List rules. */
+function transfer_registrable($d) {
+	static $rules = null;
+	if ($rules === null) {
+		$rules = array();
+		foreach ((array)@file('/usr/share/publicsuffix/public_suffix_list.dat', FILE_IGNORE_NEW_LINES) as $l) {
+			$l = strtolower(trim(explode(' ', trim((string)$l))[0]));
+			if ($l !== '' && strpos($l, '//') !== 0)
+				$rules[$l] = true;
+		}
+	}
+	$labels = explode('.', strtolower(trim($d, '.')));
+	$n = count($labels);
+	$suffix = 1;
+	for ($i = 0; $i < $n; $i++) {
+		$cand = implode('.', array_slice($labels, $i));
+		if (isset($rules['!'.$cand])) { $suffix = $n - $i - 1; break; }
+		if (isset($rules[$cand]) || ($i + 1 < $n && isset($rules['*.'.implode('.', array_slice($labels, $i + 1))]))) {
+			$suffix = $n - $i;
+			break;
+		}
+	}
+	return $n > $suffix ? implode('.', array_slice($labels, $n - $suffix - 1)) : '';
+}
+
+/* The registry's RDAP server for a top-level domain ('' = it has none). IANA's
+   list, kept a week. */
+function transfer_rdap_base($tld) {
+	$f = _PATH.'/transfers/rdap-dns.json';
+	$map = (is_file($f) && filemtime($f) > time() - 7 * 86400) ? json_decode((string)@file_get_contents($f), true) : null;
+	if (!is_array($map)) {
+		$j = json_decode((string)@file_get_contents('https://data.iana.org/rdap/dns.json', false,
+		                 stream_context_create(array('http' => array('timeout' => 8)))), true);
+		$map = array();
+		foreach ((array)($j['services'] ?? array()) as $s)
+			foreach ((array)($s[0] ?? array()) as $t)
+				$map[strtolower($t)] = rtrim((string)($s[1][0] ?? ''), '/').'/';
+		if ($map) {
+			@mkdir(dirname($f), 0750, true);
+			@file_put_contents($f, json_encode($map));
+		}
+	}
+	return $map[strtolower($tld)] ?? '';
+}
+
+/* What the registry says of a registered domain: array(state found|none|unknown,
+   statuses, expires (unix time or 0), source rdap|whois). RDAP when the TLD has
+   it, else whois (.ro has no RDAP, and RoTLD shows no expiry date). */
+function transfer_registry($domain) {
+	$tld = substr(strrchr($domain, '.'), 1);
+	$base = transfer_rdap_base($tld);
+	if ($base !== '/' && $base !== '') {
+		$ctx = stream_context_create(array('http' => array('timeout' => 8, 'ignore_errors' => true,
+		                             'header' => "Accept: application/rdap+json\r\n")));
+		$body = @file_get_contents($base.'domain/'.rawurlencode($domain), false, $ctx);
+		$code = 0;
+		foreach ((array)($http_response_header ?? array()) as $h)
+			if (preg_match('#^HTTP/\S+ (\d{3})#', $h, $m))
+				$code = (int)$m[1];
+		if ($code === 404)
+			return array('none', array(), 0, 'rdap');
+		$j = $code === 200 ? json_decode((string)$body, true) : null;
+		if (is_array($j)) {
+			$exp = 0;
+			foreach ((array)($j['events'] ?? array()) as $e)
+				if (($e['eventAction'] ?? '') === 'expiration')
+					$exp = (int)strtotime((string)$e['eventDate']);
+			return array('found', array_values(array_filter((array)($j['status'] ?? array()), 'is_string')), $exp, 'rdap');
+		}
+	}
+	$p = proc_open(array('timeout', '15', 'whois', '--', $domain),
+	               array(0 => array('file', '/dev/null', 'r'), 1 => array('pipe', 'w'), 2 => array('file', '/dev/null', 'w')), $pipes);
+	if (!is_resource($p))
+		return array('unknown', array(), 0, 'whois');
+	$w = (string)stream_get_contents($pipes[1]);
+	fclose($pipes[1]);
+	proc_close($p);
+	if (trim($w) === '')
+		return array('unknown', array(), 0, 'whois');
+	if (preg_match('/no (match|entries|data) (found|for)|^\s*not found|status:\s*(free|available)|is available for registration/im', $w))
+		return array('none', array(), 0, 'whois');
+	$exp = 0;
+	if (preg_match('/^\s*(?:registry expiry date|registrar registration expiration date|expiry date|expiration date|expires on|expire date|paid-till|expires|expire|renewal date)\s*:\s*(\S+)/im', $w, $m))
+		$exp = (int)strtotime(str_replace('.', '-', $m[1]));
+	preg_match_all('/^\s*(?:domain )?status\s*:\s*(.+)$/im', $w, $mm);
+	$st = array();
+	foreach ($mm[1] as $s)
+		$st[] = trim(preg_replace('#\s+https?://\S+#', '', $s));
+	return array('found', array_values(array_unique($st)), $exp, 'whois');
+}
+
+/* Is $ip in one of Cloudflare's published ranges (IPv4 and IPv6)? */
+function transfer_is_cloudflare($ip) {
+	$nets = array('173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
+	              '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+	              '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32',
+	              '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32');
+	$bin = @inet_pton($ip);
+	if ($bin === false)
+		return false;
+	foreach ($nets as $n) {
+		list($net, $len) = explode('/', $n);
+		$nb = inet_pton($net);
+		if (strlen($nb) !== strlen($bin))
+			continue;
+		$bytes = intdiv((int)$len, 8);
+		$bits = (int)$len % 8;
+		if (substr($bin, 0, $bytes) !== substr($nb, 0, $bytes))
+			continue;
+		if ($bits === 0 || ((ord($bin[$bytes]) ^ ord($nb[$bytes])) & (0xFF << (8 - $bits)) & 0xFF) === 0)
+			return true;
+	}
+	return false;
+}
+
+/* The versions chosen on the Transfer tool's PHP step for versions this server
+   does not have ("8.1" => "8.2"): set from the request (pre-check) or the job
+   (the runner), read by transfer_php_nearest(). $set: replaces the map, only
+   entries of a missing version to an installed one are kept. */
+function transfer_php_map(?array $set = null) {
+	static $map = array();
+	if ($set !== null) {
+		$have = array_column(php_versions(), 'version');
+		$map = array();
+		foreach ($set as $from => $to)
+			if (preg_match('/^\d\.\d{1,2}$/', (string)$from) && !in_array((string)$from, $have, true) && in_array((string)$to, $have, true))
+				$map[(string)$from] = (string)$to;
+	}
+	return $map;
+}
+
+/* The version here for one that is not installed: the one chosen for it
+   (transfer_php_map()), else the nearest newer one, else the newest. */
+function transfer_php_nearest($version) {
+	$map = transfer_php_map();
+	if (isset($map[$version]))
+		return $map[$version];
+	$have = array_column(php_versions(), 'version');
+	usort($have, 'version_compare');
+	foreach ($have as $v)
+		if (version_compare($v, $version, '>='))
+			return $v;
+	return $have ? end($have) : '';
+}
+
+/*
+ * A cPanel crontab made into jobs for this server. cPanel's PHP binaries
+ * (/opt/cpanel/ea-phpXY/..., /usr/local/bin/ea-phpXY, CloudLinux /opt/alt/phpXY,
+ * and /usr/local/bin/php or /usr/bin/php, which on cPanel pick the account's
+ * version) become this server's binary of the same version; /home/<remote>/
+ * becomes /home/<local>/. A job that needs a cPanel program, or a program this
+ * server does not have, comes in paused. @reboot jobs are not taken.
+ * $php: the version /usr/local/bin/php meant for the account (its main site's).
+ * array(jobs: array(schedule, command, original, on, notes[]), skipped: array(line, why), notes[])
+ */
+function transfer_cron_convert($text, $ruser, $luser, $php) {
+	$jobs = $skipped = $notes = array();
+	$have = array_column(php_versions(), 'version');
+	$bin_for = function ($v, &$n) use ($have) {
+		if (!in_array($v, $have, true)) {
+			$near = transfer_php_nearest($v);
+			$n[] = 'PHP '.$v.' is not installed here, so it runs with PHP '.$near;
+			$v = $near;
+		}
+		return cron_php_bin($v);
+	};
+	foreach (explode("\n", str_replace("\r", '', (string)$text)) as $l) {
+		$t = trim($l);
+		if ($t === '' || $t[0] === '#')
+			continue;
+		if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/', $t, $m)) {
+			if ($m[1] === 'MAILTO' && trim($m[2], " \"'") !== '')
+				$notes[] = 'MAILTO='.trim($m[2], " \"'").' is not carried over: here each run\'s output is kept with the job (Cron jobs page).';
+			elseif ($m[1] !== 'SHELL' && $m[1] !== 'MAILTO')
+				$notes[] = 'The line "'.$t.'" (a setting for all jobs) is not carried over.';
+			continue;
+		}
+		if (!preg_match('/^(@[a-z]+|\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.+)$/', $t, $m)) {
+			$skipped[] = array($t, 'not a cron line');
+			continue;
+		}
+		$sched = preg_replace('/\s+/', ' ', $m[1]);
+		$orig = $m[2];
+		if (strtolower($sched) === '@reboot') {
+			$skipped[] = array($t, 'jobs that run when the server starts are not available here');
+			continue;
+		}
+		if (cron_schedule($sched) === false) {
+			$skipped[] = array($t, 'the schedule is not valid');
+			continue;
+		}
+		$n = array();
+		$on = true;
+		$cmd = $orig;
+		if ($ruser !== $luser) {
+			$cmd = preg_replace('#/home\d*/'.preg_quote($ruser, '#').'(?=/|\s|$|[\'";|&)])#', '/home/'.$luser, $cmd);
+			$cmd = preg_replace('#~'.preg_quote($ruser, '#').'(?=/|\s|$)#', '~'.$luser, $cmd);
+		} else
+			$cmd = preg_replace('#/home\d+/'.preg_quote($ruser, '#').'(?=/|\s|$)#', '/home/'.$luser, $cmd);
+		// cPanel's PHP binaries, by version
+		$cmd = preg_replace_callback('#(?:/opt/cpanel/ea-php(\d)(\d+)/root/usr/bin/php(-cgi)?|/usr/local/bin/ea-php(\d)(\d+)|/opt/alt/php(\d)(\d+)/usr/bin/php(-cgi)?)(?=\s|$|[;|&)])#',
+			function ($mm) use ($bin_for, &$n) {
+				$v = $mm[1] !== '' ? $mm[1].'.'.$mm[2] : (($mm[4] ?? '') !== '' ? $mm[4].'.'.$mm[5] : $mm[6].'.'.$mm[7]);
+				if (!empty($mm[3]) || !empty($mm[8]))
+					$n[] = 'php-cgi became the command-line php';
+				return "\x01".$v."\x01";   // made a binary below, after the second pass
+			}, $cmd);
+		// the version-choosing wrappers, and a bare "php" at the start of a command
+		$cmd = preg_replace_callback('#(^|[;&|(]\s*|\bnice\s+(?:-n\s*\d+\s+)?)(/usr/local/bin/php|/usr/bin/php|php)(-cgi)?(?=\s|$)#',
+			function ($mm) use ($bin_for, $php, &$n) {
+				if (!empty($mm[3]))
+					$n[] = 'php-cgi became the command-line php';
+				return $mm[1].$bin_for($php, $n);
+			}, $cmd);
+		$cmd = preg_replace_callback('/\x01([0-9.]+)\x01/', function ($mm) use ($bin_for, &$n) { return $bin_for($mm[1], $n); }, $cmd);
+		if (preg_match('#/usr/local/cpanel/|(^|[\s;&|])/scripts/#', $cmd)) {
+			$on = false;
+			$n[] = 'it runs a cPanel program, which does not exist here: imported paused';
+		} else {
+			// every program a part of the command starts with must be on this server
+			foreach (preg_split('/\s*(?:&&|\|\||;|\|)\s*/', $cmd) as $part) {
+				$w = preg_split('/\s+/', trim($part));
+				$i = 0;
+				while (isset($w[$i]) && preg_match('/^[A-Za-z_][A-Za-z0-9_]*=/', $w[$i]))
+					$i++;
+				if (in_array($w[$i] ?? '', array('nice', 'ionice', 'timeout', 'flock', 'nohup'), true))
+					continue;
+				$prog = $w[$i] ?? '';
+				if ($prog === '' || !preg_match('#^[A-Za-z0-9_./-]+$#', $prog) || in_array($prog, array('cd', 'echo', 'test', '[', 'exit', 'export', 'source', '.'), true))
+					continue;
+				if ($prog[0] === '/') {
+					if (preg_match('#^/home/#', $prog))
+						continue;
+					$ok = is_executable($prog);
+				} else
+					$ok = is_executable('/usr/bin/'.$prog) || is_executable('/bin/'.$prog) || is_executable('/usr/local/bin/'.$prog);
+				if (!$ok) {
+					$on = false;
+					$n[] = $prog.' is not on this server: imported paused';
+				}
+			}
+		}
+		if (strlen($cmd) > CRON_CMD_MAX) {
+			$skipped[] = array($t, 'the command is too long');
+			continue;
+		}
+		$jobs[] = array('schedule' => $sched, 'command' => $cmd, 'original' => $orig, 'on' => $on, 'notes' => array_values(array_unique($n)));
+	}
+	return array('jobs' => $jobs, 'skipped' => $skipped, 'notes' => array_values(array_unique($notes)));
+}
+
+/* PHP extension names made comparable ("Zend OPcache" = "opcache", ionCube's
+   long name = "ioncube") */
+function transfer_php_ext_name($m) {
+	$m = strtolower(trim($m));
+	if (strpos($m, 'ioncube') !== false) return 'ioncube';
+	if (strpos($m, 'sourceguardian') !== false) return 'sourceguardian';
+	if (strpos($m, 'opcache') !== false) return 'opcache';
+	if (strpos($m, 'zend guard') !== false) return 'zend guard loader';
+	return $m;
+}
+
+/* "php -m": the extension names */
+function transfer_php_exts(array $lines) {
+	$out = array();
+	foreach ($lines as $l) {
+		$l = trim($l);
+		if ($l !== '' && $l[0] !== '[')
+			$out[transfer_php_ext_name($l)] = true;
+	}
+	return $out;
+}
+
+/* The check of the cPanel server itself. $pkgs: the PHP packages its sites
+   use (ea-php82, alt-php74). array(items, ctx) - ctx goes back with each
+   account's check: the server's addresses and name servers, free space here,
+   and whether encoded files need looking for. */
+function transfer_precheck_server($ssh, array $pkgs) {
+	$script = <<<'SH'
+echo "@@RQ mysql"; mysql -N -B -e 'SELECT VERSION()' 2>/dev/null
+echo "@@RQ hostname"; hostname
+echo "@@RQ ns"; grep -E '^NS[0-9]* ' /etc/wwwacct.conf 2>/dev/null | awk '{print $2}'
+echo "@@RQ ips"; hostname -I 2>/dev/null | tr ' ' '\n'; awk -F: '{print $1}' /etc/ips 2>/dev/null
+echo "@@RQ cpconf"; grep -E '^(maxemailsperhour|emailsperdaynotify|email_outbound_spam_detect_enable|email_outbound_spam_detect_action|email_outbound_spam_detect_threshold|nobodyspam|smtpmailgidonly)=' /var/cpanel/cpanel.config 2>/dev/null
+echo "@@RQ localopts"; grep -E '^(smarthost_routelist|per_domain_mailips|acl_[a-z0-9_]*rbl[a-z0-9_]*|acl_ratelimit[a-z0-9_]*|acl_deny_spam_score_over_int|acl_default_spam_scan[a-z0-9_]*|require_secure_auth|max_spam_scan_size|senderverify|callouts|acl_requirehelo[a-z0-9_]*)=' /etc/exim.conf.localopts 2>/dev/null
+echo "@@RQ mailipsall"; awk -F': *' '$1=="*"{print FILENAME": "$2}' /etc/mailips /etc/mailhelo 2>/dev/null
+while read -r p; do
+  case "$p" in
+    ea-php[0-9]*) b=/opt/cpanel/$p/root/usr/bin/php ;;
+    alt-php[0-9]*) b=/opt/alt/php${p#alt-php}/usr/bin/php ;;
+    *) continue ;;
+  esac
+  echo "@@RQ phpm $p"; [ -x "$b" ] && "$b" -m 2>/dev/null
+done
+SH;
+	$pk = array();
+	foreach ($pkgs as $p)
+		if (preg_match('/^(ea|alt)-php\d{2,3}$/', (string)$p))
+			$pk[$p] = true;
+	$out = transfer_remote($ssh, $script, implode("\n", array_keys($pk))."\n", 90);
+	if (trim($out) === '')
+		return array(array(transfer_item('Server', 'block', 'The cPanel server did not answer the check.')), array());
+
+	$sec = array('mysql' => array(), 'ns' => array(), 'ips' => array(), 'cpconf' => array(), 'localopts' => array(), 'mailipsall' => array(), 'hostname' => array());
+	$phpm = array();
+	foreach (transfer_sections($out) as $s) {
+		if ($s[0] === 'phpm')
+			$phpm[$s[1]] = transfer_php_exts($s[2]);
+		else
+			$sec[$s[0]] = array_values(array_filter(array_map('trim', $s[2]), 'strlen'));
+	}
+	$items = array();
+
+	// MySQL / MariaDB
+	$rv = $sec['mysql'][0] ?? '';
+	$lv = trim((string)(mysql_rows('SELECT VERSION()')[0] ?? ''));
+	$remote_mysql8 = $rv !== '' && stripos($rv, 'mariadb') === false && version_compare($rv, '8.0', '>=');
+	$items[] = transfer_item('Databases', $remote_mysql8 ? 'warn' : 'ok', 'Database server: '.($rv ?: 'unknown').' there, '.($lv ?: 'unknown').' here',
+		$remote_mysql8 ? 'MySQL 8 databases can use collations (utf8mb4_0900_*) and password types (caching_sha2_password) that MariaDB does not have. Each account\'s check below looks at its own databases.' : '');
+
+	// PHP extensions per version
+	$scan = array();
+	foreach ($phpm as $pkg => $exts) {
+		$v = transfer_php_version($pkg);
+		if (!$exts) {
+			$items[] = transfer_item('PHP', 'info', 'PHP '.$v.' ('.$pkg.'): could not list its extensions on the cPanel server.');
+			continue;
+		}
+		/* a version missing here: compared with the one chosen to replace it */
+		$lv = $v;
+		$label = 'PHP '.$v;
+		if (!in_array($v, array_column(php_versions(), 'version'), true)) {
+			$lv = transfer_php_map()[$v] ?? '';
+			if ($lv === '') {
+				$items[] = transfer_item('PHP', 'warn', 'PHP '.$v.' is not installed here, so its extensions cannot be compared yet.',
+					'Install PHP '.$v.' in PHP Settings, or choose a version to use instead on the PHP versions step, then run the check again.');
+				continue;
+			}
+			$label = 'PHP '.$v.' (PHP '.$lv.' here)';
+		}
+		// without the panel's own PHP_INI_SCAN_DIR / PHPRC, which name the panel
+		// PHP's ini folder: the version must read its own php.d
+		$local = transfer_php_exts(explode("\n", (string)shell_exec('env -u PHP_INI_SCAN_DIR -u PHPRC '.escapeshellarg(cron_php_bin($lv)).' -m 2>/dev/null')));
+		$missing = array_keys(array_diff_key($exts, $local));
+		sort($missing);
+		foreach (array('ioncube', 'sourceguardian') as $enc)
+			if (in_array($enc, $missing, true))
+				$scan[$v][] = $enc;
+		if ($missing)
+			$items[] = transfer_item('PHP', 'warn', $label.': '.count($missing).' extension'.(count($missing) === 1 ? '' : 's').' of the cPanel server '.(count($missing) === 1 ? 'is' : 'are').' not loaded here',
+				'Extensions a site uses must be installed here (PHP Settings > PHP Modules) or the site breaks. Not every site needs all of them.'
+				.(isset($scan[$v]) ? ' Each account\'s check looks for encoded files ('.implode(', ', $scan[$v]).').' : ''), $missing);
+		else
+			$items[] = transfer_item('PHP', 'ok', $label.': every extension of the cPanel server is loaded here too.');
+	}
+
+	// mail settings of the whole server that change how mail goes out or comes in
+	$kv = array();
+	foreach (array_merge($sec['cpconf'], $sec['localopts']) as $l)
+		if (strpos($l, '=') !== false) {
+			list($k, $val) = explode('=', $l, 2);
+			$kv[$k] = trim($val);
+		}
+	if (($kv['smarthost_routelist'] ?? '') !== '')
+		$items[] = transfer_item('Mail', 'warn', 'The cPanel server sends its mail through a smarthost',
+			'Outgoing mail is relayed through '.$kv['smarthost_routelist'].'. If the sites need that (a provider that blocks port 25, or a sending service), set the same up here.');
+	$mx = $kv['maxemailsperhour'] ?? '';
+	$items[] = transfer_item('Mail', 'info', 'Sending limit for every domain: '.($mx === '' || $mx === '0' ? 'none' : $mx.' messages an hour'),
+		'Accounts and domains can have their own limit (shown in each account\'s check). Limits here come with the hosting packages.');
+	$rbls = array();
+	foreach ($kv as $k => $val)
+		if (preg_match('/^acl_(.+_rbl)$/', $k, $m) && $val === '1')
+			$rbls[] = $m[1];
+	if ($rbls)
+		$items[] = transfer_item('Mail', 'info', 'Blocklists (RBLs) the cPanel server checks incoming mail against', 'Compare with this server\'s mail settings.', $rbls);
+	if (($kv['email_outbound_spam_detect_enable'] ?? '') === '1')
+		$items[] = transfer_item('Mail', 'info', 'The cPanel server watches for accounts sending spam ('.($kv['email_outbound_spam_detect_action'] ?? 'noaction').' above '.($kv['email_outbound_spam_detect_threshold'] ?? '?').' messages)');
+	if (($kv['per_domain_mailips'] ?? '') === '1' || $sec['mailipsall'])
+		$items[] = transfer_item('Mail', 'info', 'The cPanel server chooses the address mail is sent from', 'Per domain (/etc/mailips, /etc/mailhelo). Domains with their own address are shown in their account\'s check; Hosting Pro does the same with Settings > IP addresses > Outgoing mail.', $sec['mailipsall']);
+
+	// space here
+	$free = (float)@disk_free_space('/home');
+	$items[] = transfer_item('Size', 'info', 'Free space here: '.transfer_bytes($free).' in /home');
+
+	$ips = array();
+	foreach ($sec['ips'] as $ip)
+		if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE))
+			$ips[] = strtolower($ip);
+	$ns = array();
+	foreach ($sec['ns'] as $n)
+		if (valid_domain(strtolower(rtrim($n, '.'))))
+			$ns[] = strtolower(rtrim($n, '.'));
+	return array($items, array('ips' => array_values(array_unique($ips)), 'ns' => $ns, 'free' => $free, 'scan' => $scan ? 1 : 0,
+	                           'maxemail' => preg_match('/^\d+$/', $mx) ? $mx : '',
+	                           'scan_for' => $scan, 'hostname' => $sec['hostname'][0] ?? ''));
+}
+
+/* Everything the account check reads on the cPanel server, in one ssh call.
+   $1 = the account (checked before), $2 = 1 to look for encoded PHP files. */
+function transfer_account_script() {
+	return <<<'SH'
+u="$1"; scan="$2"
+h=$(getent passwd "$u" | cut -d: -f6)
+if [ -z "$h" ] || [ ! -d "$h" ]; then echo "@@RQ nouser"; exit 0; fi
+doms=$(awk -F': ' -v u="$u" '$2==u{print $1}' /etc/userdomains 2>/dev/null)
+echo "@@RQ cron"; crontab -l -u "$u" 2>/dev/null
+echo "@@RQ caldav"
+if [ -d "$h/.caldav" ]; then
+  find "$h/.caldav" -type f \( -name '*.ics' -o -name '*.vcf' \) 2>/dev/null | sed "s#^$h/.caldav/##" | awk -F/ '{n=$NF; sub(/.*\./,"",n); c[$1" "n]++} END{for(k in c) print k" "c[k]}'
+fi
+echo "@@RQ webdisk"; [ -f "$h/etc/webdav/passwd" ] && cut -d: -f1 "$h/etc/webdav/passwd"
+echo "@@RQ htpasswds"; [ -d "$h/.htpasswds" ] && find "$h/.htpasswds" -type f -name passwd -size +0 2>/dev/null | sed "s#^$h/.htpasswds/##; s#/passwd\$##" | head -50
+echo "@@RQ boxtrapper"; find "$h/etc" -maxdepth 3 -name '.boxtrapperenable' 2>/dev/null | sed "s#^$h/etc/##; s#\.boxtrapperenable\$##; s#/\$##" | awk -F/ -v u="$u" '{ if ($0 == "") print u " (main account)"; else if (NF == 2) print $2 "@" $1; else print $0 }' | head -50
+echo "@@RQ apps"; [ -s "/var/cpanel/userdata/$u/applications.json" ] && cat "/var/cpanel/userdata/$u/applications.json"; echo
+echo "@@RQ clsel"; for d in nodevenv virtualenv rubyvenv .cl.selector; do [ -d "$h/$d" ] && echo "$d"; done
+echo "@@RQ repos"; [ -d "$h/repositories" ] && find "$h/repositories" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed "s#^$h/##" | head -50
+echo "@@RQ ftp"; for f in "/etc/proftpd/$u" "/etc/pure-ftpd/$u"; do [ -f "$f" ] && cut -d: -f1 "$f"; done | sort -u
+echo "@@RQ fwddomain"; for d in $doms; do [ -s "/etc/vdomainaliases/$d" ] && echo "$d $(grep -v '^#' "/etc/vdomainaliases/$d" | head -1)"; done
+echo "@@RQ maildomains"; for d in $doms; do r=local; grep -qxF "$d" /etc/remotedomains 2>/dev/null && r=remote; grep -qxF "$d" /etc/secondarymx 2>/dev/null && r=secondary; echo "$d $r"; done
+echo "@@RQ mailips"; for d in $doms; do awk -F': *' -v d="$d" '$1==d{print FILENAME" "d" "$2}' /etc/mailips /etc/mailhelo 2>/dev/null; done
+echo "@@RQ outgoing"; grep -qxF "$u" /etc/outgoing_mail_suspended_users 2>/dev/null && echo suspended; grep -qxF "$u" /etc/outgoing_mail_hold_users 2>/dev/null && echo hold
+echo "@@RQ limits"; grep -E '^MAX_(EMAIL_PER_HOUR|DEFER_FAIL_PERCENTAGE)' "/var/cpanel/users/$u" 2>/dev/null
+echo "@@RQ quotas"; for f in "$h"/etc/*/quota; do [ -s "$f" ] && awk -v d="$(basename "$(dirname "$f")")" -F: 'NF>=2{print d" "$1" "$2}' "$f"; done
+echo "@@RQ mailboxes"; for f in "$h"/etc/*/passwd; do [ -s "$f" ] && awk -v d="$(basename "$(dirname "$f")")" -F: 'NF>1{print d" "$1}' "$f"; done
+echo "@@RQ spam"; [ -e "$h/.spamassassinenable" ] && echo enabled; [ -e "$h/.spamassassinboxenable" ] && echo spambox; grep -iE '^[[:space:]]*required_score' "$h/.spamassassin/user_prefs" 2>/dev/null | head -1
+echo "@@RQ dbs"; whmapi1 --output=json list_mysql_databases_and_users user="$u" 2>/dev/null; echo
+echo "@@RQ disk"; whmapi1 --output=json get_disk_usage 2>/dev/null; echo
+echo "@@RQ maildu"; [ -d "$h/mail" ] && timeout 90 nice du -sb "$h/mail" 2>/dev/null | cut -f1
+for f in /var/cpanel/userdata/"$u"/*; do
+  n=${f##*/}
+  case "$n" in main|cache|*.cache|*.json|*.yaml|*_SSL|*.db|*.stor) continue ;; esac
+  dr=$(awk '/^documentroot:/{print $2; exit}' "$f")
+  echo "@@RQ site $n $dr"
+  if [ -n "$dr" ]; then
+    [ -f "$dr/.user.ini" ] && grep -vE '^[[:space:]]*(;|#|\[|$)' "$dr/.user.ini" | head -40 | sed 's/^/userini /'
+    [ -f "$dr/php.ini" ] && grep -vE '^[[:space:]]*(;|#|\[|$)' "$dr/php.ini" | head -40 | sed 's/^/phpini /'
+    [ -f "$dr/.htaccess" ] && awk '{ l = tolower($0) }
+      l ~ /^[[:space:]]*<ifmodule/ { d++; p[d] = (l ~ /mod_php|php[0-9]*_module|lsapi|suphp/) }
+      l ~ /^[[:space:]]*<\/ifmodule/ { if (d > 0) d-- }
+      l ~ /^[[:space:]]*php_(value|flag|admin_value|admin_flag)[[:space:]]/ { g = 0; for (i = 1; i <= d; i++) if (p[i]) g = 1; print (g ? "htaccessg " : "htaccess ") $0 }' "$dr/.htaccess" | head -40
+  fi
+  [ -f "/var/cpanel/userdata/$u/$n.php-fpm.yaml" ] && grep -E '^[[:space:]]*php_(admin_)?(value|flag)_' "/var/cpanel/userdata/$u/$n.php-fpm.yaml" | head -40 | sed 's/^/fpm /'
+  c="/var/cpanel/ssl/apache_tls/$n/certificates"
+  [ -f "$c" ] && awk '/BEGIN CERTIFICATE/{p=1} p{print "cert "$0} /END CERTIFICATE/{exit}' "$c"
+  if [ "$scan" = 1 ] && [ -n "$dr" ] && [ -d "$dr" ]; then
+    timeout 60 nice grep -rlsE --include='*.php' 'ionCube Loader|sg_load\(' "$dr" 2>/dev/null | head -3 | sed 's/^/encoded /'
+  fi
+done
+SH;
+}
+
+/* "key = value" / php_value key value / php_admin_value_key: value - array(key, value) or null */
+function transfer_ini_line($kind, $l) {
+	$l = trim($l);
+	if ($kind === 'htaccess') {
+		if (preg_match('/^php_(?:admin_)?(?:value|flag)\s+(\S+)\s+(.*)$/i', $l, $m))
+			return array(strtolower($m[1]), trim($m[2], " \"'"));
+	} elseif ($kind === 'fpm') {
+		if (preg_match('/^php_(?:admin_)?(?:value|flag)_([A-Za-z0-9_.]+)\s*:\s*(.*)$/', $l, $m)) {
+			$v = preg_match("/value:\s*['\"]?([^'\",}]*)/", $m[2], $vm) ? $vm[1] : $m[2];
+			return array(strtolower($m[1]), trim($v, " \"'"));
+		}
+	} elseif (preg_match('/^([A-Za-z0-9_.]+)\s*=\s*(.*)$/', $l, $m))
+		return array(strtolower($m[1]), trim($m[2], " \"'"));
+	return null;
+}
+
+/*
+ * The check of one account. $sites: from the PHP step (domain, type, version,
+ * package, docroot); $ctx: from transfer_precheck_server() plus the account's
+ * IP. Assumes the account keeps its user name here (the transfer can change it).
+ */
+function transfer_precheck_account($ssh, $user, array $sites, array $ctx) {
+	global $db;
+	$items = array();
+	$rips = (array)($ctx['ips'] ?? array());
+	$rns = (array)($ctx['ns'] ?? array());
+	$scan = !empty($ctx['scan']) ? '1' : '0';
+	$out = transfer_remote($ssh, 'bash -s -- '.escapeshellarg($user).' '.$scan, transfer_account_script(), 300);
+	$sec = array();
+	$site_sec = array();
+	foreach (transfer_sections($out) as $s) {
+		if ($s[0] === 'site') {
+			$p = explode(' ', $s[1], 2);
+			$site_sec[strtolower($p[0])] = array('docroot' => $p[1] ?? '', 'lines' => $s[2]);
+		} else
+			$sec[$s[0]] = array_values(array_filter($s[2], function ($l) { return trim($l) !== ''; }));
+	}
+	if (isset($sec['nouser']) || trim($out) === '')
+		return array(transfer_item('Account', 'block', trim($out) === '' ? 'The cPanel server did not answer the check.' : 'There is no such account on the cPanel server.'));
+
+	/* ---- name here ---- */
+	if (!valid_username($user))
+		$items[] = transfer_item('Account', 'warn', 'The user name '.$user.' is not allowed here',
+			'Here a user name is a letter followed by 1 to 15 letters or digits. Give the account another name when it is created; paths in its files and cron jobs then change with it.');
+	elseif (account_get($db, $user))
+		$items[] = transfer_item('Account', 'warn', 'An account named '.$user.' exists here already', 'Transfer into it, or give the new one another name.');
+	else
+		$items[] = transfer_item('Account', 'ok', 'The user name '.$user.' is free here');
+
+	/* ---- domains and DNS ---- */
+	$here_ips = domain_server_ips('');
+	$names = array();
+	$mail_names = array();
+	foreach ($sites as $s) {
+		$names[] = $s['domain'];
+		if ($s['type'] !== 'sub') {
+			$names[] = 'www.'.$s['domain'];
+			$mail_names[] = $s['domain'];
+		}
+	}
+	$where = function (array $ips) use ($rips, $here_ips) {
+		if (!$ips) return 'none';
+		if (array_intersect($ips, $rips)) return 'cpanel';
+		if (array_intersect($ips, $here_ips)) return 'here';
+		foreach ($ips as $ip)
+			if (transfer_is_cloudflare($ip)) return 'cloudflare';
+		return 'other';
+	};
+	$cache = array();
+	$regs = array();
+	foreach ($sites as $s)
+		if (($r = transfer_registrable($s['domain'])) !== '')
+			$regs[$r][] = $s['domain'];
+	$local_ns = dns_expected_nameservers();
+	foreach ($regs as $reg => $under) {
+		list($dstate, $nsnames) = dns_delegation($reg, $cache);
+		list($rstate, $statuses, $exp, $src) = transfer_registry($reg);
+		$bad = array_values(array_filter($statuses, function ($s) { return preg_match('/hold|expired|redemption|pending ?delete|inactive|suspend/i', $s); }));
+		$sub = count($under) > 1 || $under[0] !== $reg ? ' (for '.implode(', ', $under).')' : '';
+		if ($dstate === 'none' && $rstate !== 'found')
+			$items[] = transfer_item('Domains', 'block', $reg.' is not registered'.$sub, 'The registry does not know it: it has expired or was never registered. There is nothing to transfer for it unless it is renewed.');
+		elseif ($bad)
+			$items[] = transfer_item('Domains', 'block', $reg.': '.implode(', ', $bad).$sub, 'The registry has the domain on hold or expired, so it does not work now. Renew it, or leave it out.');
+		elseif ($exp && $exp < time())
+			$items[] = transfer_item('Domains', 'block', $reg.' expired on '.date('Y-m-d', $exp).$sub);
+		elseif ($exp && $exp < time() + 30 * 86400)
+			$items[] = transfer_item('Domains', 'warn', $reg.' expires on '.date('Y-m-d', $exp).$sub, 'Make sure it is renewed.');
+		elseif ($rstate === 'unknown' && $dstate !== 'ok')
+			$items[] = transfer_item('Domains', 'warn', $reg.': the registry did not answer'.$sub);
+		else
+			$items[] = transfer_item('Domains', 'ok', $reg.' is registered'.($exp ? ', until '.date('Y-m-d', $exp) : ' (the registry shows no expiry date)').$sub,
+				$statuses ? 'Status: '.implode(', ', $statuses) : '');
+		if ($dstate !== 'ok')
+			continue;
+		// whose name servers
+		$ns_ips = array();
+		foreach ($nsnames as $n)
+			foreach ((array)@gethostbynamel($n.'.') as $ip)
+				$ns_ips[] = $ip;
+		if (array_intersect($nsnames, $local_ns))
+			$items[] = transfer_item('DNS', 'ok', $reg.': name servers are this server\'s', '', $nsnames);
+		elseif (array_intersect($nsnames, $rns) || array_intersect($ns_ips, $rips))
+			$items[] = transfer_item('DNS', 'warn', $reg.': name servers are the cPanel server\'s',
+				'The zone has to be made here (or at another DNS provider) before the switch, then the name servers changed at the registrar.', $nsnames);
+		elseif (preg_grep('/\.ns\.cloudflare\.com$/', $nsnames))
+			$items[] = transfer_item('DNS', 'info', $reg.': DNS is at Cloudflare', 'At the switch, change the records there.', $nsnames);
+		else
+			$items[] = transfer_item('DNS', 'info', $reg.': DNS is at another provider', 'At the switch, change the records there.', $nsnames);
+		// TTL, from the zone's own server
+		$ttl = null;
+		foreach (dns_delegation_ips($nsnames) as $ip) {
+			$r = dns_wire_query($ip, 53, $reg, 'A', array('timeout' => 2));
+			if ($r && $r['rcode'] === 0) {
+				foreach ($r['answer'] as $rr)
+					if ($rr[1] === 1 || $rr[1] === 5)
+						$ttl = $rr[2];
+				break;
+			}
+		}
+		if ($ttl !== null)
+			$items[] = transfer_item('DNS', $ttl > 3600 ? 'info' : 'ok', $reg.': time to live of its address is '.$ttl.' s',
+				$ttl > 600 ? 'Lower it to 300 s a day before the switch, so the change is seen within minutes.' : '');
+	}
+	// where each site points now
+	$pts = domain_points($names);
+	$list = array();
+	$worst = 'ok';
+	$labels = array('cpanel' => 'the cPanel server', 'here' => 'this server', 'cloudflare' => 'Cloudflare (proxied)', 'other' => 'another server', 'none' => 'no address');
+	foreach ($names as $n) {
+		$ips = $pts[$n]['ips'] ?? array();
+		$w = $where($ips);
+		if (strpos($n, 'www.') === 0 && $w === 'none')
+			continue;
+		$list[] = $n.' → '.($ips ? implode(', ', $ips).' ' : '').'('.$labels[$w].')';
+		if ($w === 'other' || ($w === 'none' && strpos($n, 'www.') !== 0))
+			$worst = 'warn';
+	}
+	$items[] = transfer_item('DNS', $worst, 'Where the sites point now',
+		$worst === 'warn' ? 'A site that points to another server, or nowhere, may already have moved or be unused: ask before transferring it.' : '', $list);
+	// mail: MX and SPF
+	$mlist = array();
+	$mworst = 'ok';
+	foreach ($mail_names as $d) {
+		$mx = array();
+		foreach ((array)@dns_get_record($d, DNS_MX) as $r)
+			$mx[] = array('host' => strtolower($r['target'] ?? ''), 'pri' => (int)($r['pri'] ?? 0));
+		usort($mx, function ($a, $b) { return $a['pri'] - $b['pri']; });
+		$spf = '';
+		foreach ((array)@dns_get_record($d, DNS_TXT) as $r)
+			if (stripos($t = (string)($r['txt'] ?? ''), 'v=spf1') === 0)
+				$spf = $t;
+		if (!$mx) {
+			$mlist[] = $d.': no MX record (gets no mail)';
+			continue;
+		}
+		$top = (array)@gethostbynamel($mx[0]['host'].'.');
+		$prov = array_intersect($top, $rips) ? 'local' : mail_provider_detect($mx, false);
+		$pname = $prov === 'local' ? 'the cPanel server' : (mail_providers()[$prov]['name'] ?? $prov);
+		$line = $d.': mail goes to '.$pname.' ('.$mx[0]['host'].')';
+		if ($prov !== 'local') {
+			$line .= ' - set it as the site\'s mail provider here; mailboxes are not needed';
+			if ($mworst === 'ok') $mworst = 'info';
+		}
+		if ($spf === '')
+			$line .= '; no SPF record';
+		else
+			foreach ($rips as $ip)
+				if (stripos($spf, 'ip4:'.$ip) !== false || stripos($spf, 'ip6:'.$ip) !== false) {
+					$line .= '; SPF names the cPanel server\'s address '.$ip.': add this server\'s at the switch';
+					$mworst = 'warn';
+					break;
+				}
+		$mlist[] = $line;
+	}
+	if ($mlist)
+		$items[] = transfer_item('DNS', $mworst, 'Where mail goes now', '', $mlist);
+
+	/* ---- cPanel features missing here ---- */
+	$caldav = array();
+	foreach ($sec['caldav'] ?? array() as $l) {
+		$p = preg_split('/\s+/', trim($l));
+		if (count($p) === 3)
+			$caldav[] = $p[0].': '.$p[2].' '.($p[1] === 'ics' ? 'calendar entries' : 'contacts');
+	}
+	if ($caldav)
+		$items[] = transfer_item('Features', 'warn', 'Calendars and contacts are used', 'This server has no calendar or contacts service. Ask the users to export them (from webmail or their phone) before the switch; they are not transferred.', $caldav);
+	if (!empty($sec['webdisk']))
+		$items[] = transfer_item('Features', 'warn', 'Web Disk accounts: '.count($sec['webdisk']), 'Web Disk is not available here. FTP accounts or the file manager can replace it.', $sec['webdisk']);
+	if (!empty($sec['boxtrapper']))
+		$items[] = transfer_item('Features', 'warn', 'BoxTrapper is switched on', 'BoxTrapper (challenge mails to unknown senders) is not available here; spam filtering is.', $sec['boxtrapper']);
+	if (!empty($sec['fwddomain']))
+		$items[] = transfer_item('Features', 'warn', 'Domain forwarders', 'A whole domain\'s mail forwarded to another domain is not available here: make forwarders for the addresses that are used.', $sec['fwddomain']);
+	if (!empty($sec['htpasswds']))
+		$items[] = transfer_item('Features', 'info', 'Password-protected folders: '.count($sec['htpasswds']),
+			'With Apache they keep working, but their passwords are in ~/.htpasswds, outside the document root, so that folder has to be copied too (and the paths in .htaccess changed if the user name changes).', $sec['htpasswds']);
+	$apps = json_decode(implode("\n", $sec['apps'] ?? array()), true);
+	if (is_array($apps) && $apps) {
+		$al = array();
+		foreach ($apps as $name => $a)
+			$al[] = (is_string($name) ? $name : ($a['name'] ?? '?')).(isset($a['path']) ? ' ('.$a['path'].')' : '').(isset($a['domain']) ? ' on '.$a['domain'] : '');
+		$items[] = transfer_item('Features', 'warn', 'Applications (Application Manager): '.count($apps),
+			'Ruby applications are not available here. Node.js and Python ones can run as apps here (Deployments, switched off by default) and are set up by hand.', $al);
+	}
+	if (!empty($sec['clsel']))
+		$items[] = transfer_item('Features', 'warn', 'CloudLinux app selector folders', 'The account has Node.js / Python / Ruby environments of CloudLinux\'s selector. Node.js and Python apps are set up by hand here; Ruby is not available.', $sec['clsel']);
+	if (!empty($sec['repos']))
+		$items[] = transfer_item('Features', 'info', 'Git repositories: '.count($sec['repos']), 'They are files in the home folder. Here Git deployments can deploy a site from a repository.', $sec['repos']);
+	$ftp = array_values(array_filter($sec['ftp'] ?? array(), function ($f) use ($user) { return $f !== $user && $f !== 'ftp' && $f !== $user.'_logs' && strpos($f, '#') !== 0; }));
+	if ($ftp)
+		$items[] = transfer_item('Features', is_file(_PATH.'/public_html/plugins/pureftpd/plugin.php') ? 'info' : 'warn', 'FTP accounts: '.count($ftp),
+			is_file(_PATH.'/public_html/plugins/pureftpd/plugin.php') ? 'Make them again under Files > FTP accounts (passwords are not carried over).' : 'FTP accounts need the Pure-FTPd add-on here.', $ftp);
+	if (!$caldav && empty($sec['webdisk']) && empty($sec['boxtrapper']) && empty($sec['fwddomain']) && !(is_array($apps) && $apps) && empty($sec['clsel']))
+		$items[] = transfer_item('Features', 'ok', 'No cPanel feature this server lacks is in use', 'Looked for: calendars and contacts, Web Disk, BoxTrapper, domain forwarders, Application Manager and CloudLinux apps.');
+
+	/* ---- mail settings ---- */
+	foreach ($sec['maildomains'] ?? array() as $l) {
+		$p = explode(' ', trim($l));
+		if (count($p) === 2 && $p[1] === 'remote')
+			$items[] = transfer_item('Mail', 'info', $p[0].': cPanel sends its mail to another server (Remote Mail Exchanger)', 'Set the site\'s mail provider here the same way.');
+		elseif (count($p) === 2 && $p[1] === 'secondary')
+			$items[] = transfer_item('Mail', 'warn', $p[0].': the cPanel server is a backup mail server for it', 'This is not available here.');
+	}
+	$mi = array();
+	$site_names = array_column($sites, 'domain');
+	foreach ($sec['mailips'] ?? array() as $l) {
+		$p = preg_split('/\s+/', trim($l));
+		if (count($p) === 3 && in_array($p[1], $site_names, true))
+			$mi[$p[1]][strpos($p[0], 'mailhelo') !== false ? 'helo' : 'ip'] = $p[2];
+	}
+	if ($mi) {
+		$ml = array();
+		foreach ($mi as $d => $v)
+			$ml[] = $d.': sends from '.($v['ip'] ?? 'the main address').(isset($v['helo']) ? ', HELO '.$v['helo'] : '');
+		$items[] = transfer_item('Mail', 'info', 'Address and HELO name mail is sent with', 'Hosting Pro does this with Settings > IP addresses > Outgoing mail; the new server\'s address needs its own reverse DNS (PTR).', $ml);
+	}
+	foreach ($sec['outgoing'] ?? array() as $o)
+		$items[] = transfer_item('Mail', 'warn', $o === 'hold' ? 'Outgoing mail of this account is held on the cPanel server' : 'Outgoing mail of this account is suspended on the cPanel server',
+			'Probably because it sent spam. Find out why before it sends mail from this server.');
+	$lim = array();
+	$srv_max = (string)($ctx['maxemail'] ?? '');
+	foreach ($sec['limits'] ?? array() as $l)
+		if (preg_match('/^MAX_EMAIL_PER_HOUR(?:-([^=]+))?=(.*)$/', trim($l), $m) && $m[2] !== '' && $m[2] !== $srv_max
+		    && !(in_array($m[2], array('unlimited', '0'), true) && in_array($srv_max, array('', '0', 'unlimited'), true)))
+			$lim[] = ($m[1] !== '' ? $m[1] : 'the account').': '.(in_array($m[2], array('unlimited', '0'), true) ? 'no limit' : $m[2].' messages an hour');
+	if ($lim)
+		$items[] = transfer_item('Mail', 'info', 'Sending limits different from the server\'s'.($srv_max !== '' ? ' ('.$srv_max.' an hour)' : ''),
+			'They come with the hosting package here.', $lim);
+	$q = array();
+	foreach ($sec['quotas'] ?? array() as $l) {
+		$p = explode(' ', trim($l));
+		if (count($p) === 3 && (float)$p[2] > 0)
+			$q[] = $p[1].'@'.$p[0].': '.transfer_bytes((float)$p[2]);
+	}
+	$q = array_values(array_unique($q));
+	$nbox = count(array_unique($sec['mailboxes'] ?? array()));
+	if ($nbox)
+		$items[] = transfer_item('Mail', 'info', 'Mailboxes: '.$nbox.($q ? ', '.count($q).' with a size limit' : ''),
+			$q ? 'Mailbox size limits come with Hosting Pro here.' : '', $q);
+	$spam = $sec['spam'] ?? array();
+	if ($spam)
+		$items[] = transfer_item('Mail', 'info', 'Spam filtering on the cPanel server', 'The allow/block lists are taken by the transfer ("Transfer spam filters").',
+			array_map(function ($s) { return $s === 'enabled' ? 'SpamAssassin is on' : ($s === 'spambox' ? 'spam goes to a Spam folder' : trim($s)); }, $spam));
+
+	/* ---- PHP settings and encoded files ---- */
+	$mode = php_mode();
+	$apache = web_php_server() === 'httpd';
+	$specs = php_setting_specs();
+	$scan_for = (array)($ctx['scan_for'] ?? array());
+	$site_certs = array();
+	/* what cPanel writes into every customised PHP-FPM pool */
+	$fpm_defaults = array('allow_url_fopen' => 'on', 'log_errors' => 'on', 'short_open_tag' => 'on',
+	                      'disable_functions' => 'show_source,system,shell_exec,passthru,exec,popen,proc_open');
+	foreach ($sites as $s) {
+		$ss = $site_sec[$s['domain']] ?? null;
+		if (!$ss)
+			continue;
+		$by = array('userini' => array(), 'phpini' => array(), 'htaccess' => array(), 'htaccessg' => array(), 'fpm' => array());
+		$cert = '';
+		$enc = array();
+		foreach ($ss['lines'] as $l) {
+			$p = explode(' ', $l, 2);
+			if ($p[0] === 'cert')
+				$cert .= ($p[1] ?? '')."\n";
+			elseif ($p[0] === 'encoded')
+				$enc[] = substr($p[1] ?? '', strlen($ss['docroot']) + 1);
+			elseif (isset($by[$p[0]]) && ($kv = transfer_ini_line($p[0] === 'htaccessg' ? 'htaccess' : $p[0], $p[1] ?? ''))) {
+				// cPanel's pool files list doc_root / error_log (empty or its own paths) for every site
+				if ($p[0] === 'fpm' && ($kv[1] === '' || in_array($kv[0], array('doc_root', 'error_log'), true)
+				    || (isset($fpm_defaults[$kv[0]]) && strtolower(str_replace(' ', '', $kv[1])) === $fpm_defaults[$kv[0]])))
+					continue;
+				$by[$p[0]][$kv[0].'='.$kv[1]] = $kv;   // keyed: a line repeated in the file counts once
+			}
+		}
+		/* $mark: say which ones PHP Settings cannot set (when they have to be set there) */
+		$fmt = function (array $kvs, $mark = true) use ($specs) {
+			return array_map(function ($kv) use ($specs, $mark) { return $kv[0].' = '.$kv[1].($mark && !isset($specs[$kv[0]]) ? '  (not one of PHP Settings\' choices)' : ''); }, $kvs);
+		};
+		/* cPanel writes its own folders into these files (session.save_path =
+		   /var/cpanel/php/sessions/ea-php82): here they do not exist, and PHP-FPM
+		   or mod_php would still use them - sessions (logins) fail */
+		$cp = array();
+		// lines in an <IfModule> of mod_php / LSAPI only count where mod_php runs them
+		foreach (array('userini' => '.user.ini', 'htaccess' => '.htaccess') + ($mode === 'fpm' ? array() : array('htaccessg' => '.htaccess')) as $k => $f)
+			foreach ($by[$k] as $kv)
+				if (preg_match('#/(var|opt|usr/local)/cpanel/|/opt/alt/#', $kv[1]))
+					$cp[] = $f.': '.$kv[0].' = '.$kv[1];
+		$cp = array_values(array_unique($cp));
+		if ($cp)
+			$items[] = transfer_item('PHP', 'warn', $s['domain'].': settings that point at cPanel folders',
+				'These folders do not exist here, so for example PHP sessions (logins) fail. Remove the lines after the transfer.', $cp);
+		if ($by['htaccess']) {
+			if ($mode === 'fpm' && $apache)
+				$items[] = transfer_item('PHP', 'block', $s['domain'].': php_value lines in .htaccess',
+					'With Apache and PHP-FPM these lines make every page fail (error 500). Take them out of .htaccess after the transfer and set the values in the site\'s PHP settings.', $fmt($by['htaccess']));
+			elseif ($mode === 'fpm')
+				$items[] = transfer_item('PHP', 'warn', $s['domain'].': php_value lines in .htaccess', 'nginx does not read .htaccess: set these in the site\'s PHP settings.', $fmt($by['htaccess']));
+			else
+				$items[] = transfer_item('PHP', 'ok', $s['domain'].': php_value lines in .htaccess keep working with mod_php', '', $fmt($by['htaccess'], false));
+		}
+		if ($by['htaccessg'])
+			$items[] = $mode === 'fpm'
+				? transfer_item('PHP', 'info', $s['domain'].': php_value lines in .htaccess, inside <IfModule> blocks for mod_php / LSAPI',
+					'With PHP-FPM those blocks are skipped, so they do no harm, but their values do not apply either: set the ones that matter in the site\'s PHP settings.', $fmt($by['htaccessg']))
+				: transfer_item('PHP', 'ok', $s['domain'].': php_value lines in .htaccess (inside <IfModule> blocks) work with mod_php', '', $fmt($by['htaccessg'], false));
+		if ($by['userini'])
+			$items[] = $mode === 'fpm'
+				? transfer_item('PHP', 'ok', $s['domain'].': .user.ini comes with the files and PHP-FPM reads it', '', $fmt($by['userini'], false))
+				: transfer_item('PHP', 'warn', $s['domain'].': .user.ini is not read by mod_php', 'Set these in the site\'s PHP settings.', $fmt($by['userini']));
+		if ($by['phpini'])
+			$items[] = transfer_item('PHP', 'warn', $s['domain'].': php.ini in the document root is not read here', 'Only cPanel\'s CGI / suPHP handlers read it. Set what is needed in the site\'s PHP settings.', $fmt($by['phpini']));
+		if ($by['fpm'])
+			$items[] = transfer_item('PHP', 'warn', $s['domain'].': PHP-FPM settings made in cPanel', 'They are in cPanel\'s own configuration and are not carried over: set them in the site\'s PHP settings.', $fmt($by['fpm']));
+		if ($enc) {
+			$need = $scan_for[$s['version']] ?? array();
+			$items[] = transfer_item('PHP', $need ? 'block' : 'info', $s['domain'].': encoded PHP files (ionCube / SourceGuardian)',
+				$need ? 'Install the '.implode(' / ', $need).' loader for PHP '.$s['version'].' here first, or these files do not run.' : 'Their loader is installed here.', $enc);
+		}
+		$site_certs[$s['domain']] = $cert;
+	}
+
+	/* ---- databases ---- */
+	$dbj = json_decode(implode("\n", $sec['dbs'] ?? array()), true);
+	$dbs = array();
+	$dbusers = array();
+	foreach ((array)($dbj['data']['mysql_databases'] ?? array()) as $name => $us) {
+		if (!preg_match('/^[A-Za-z0-9_]{1,64}$/', $name))
+			continue;
+		$dbs[] = $name;
+		foreach ((array)$us as $u2)
+			if (is_string($u2) && preg_match('/^[A-Za-z0-9_]{1,80}$/', $u2))
+				$dbusers[$u2] = true;
+	}
+	$db_bytes = 0;
+	if ($dbs) {
+		$in = "'".implode("','", $dbs)."'";
+		$uin = $dbusers ? "'".implode("','", array_keys($dbusers))."'" : "''";
+		$sql = "SELECT 'size', TABLE_SCHEMA, COALESCE(SUM(DATA_LENGTH+INDEX_LENGTH),0), COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA IN ($in) GROUP BY TABLE_SCHEMA;\n"
+		     . "SELECT 'coll', TABLE_SCHEMA, TABLE_COLLATION, COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA IN ($in) AND TABLE_COLLATION IS NOT NULL GROUP BY TABLE_SCHEMA, TABLE_COLLATION;\n"
+		     . "SELECT 'coll', TABLE_SCHEMA, COLLATION_NAME, COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA IN ($in) AND COLLATION_NAME IS NOT NULL GROUP BY TABLE_SCHEMA, COLLATION_NAME;\n"
+		     . "SELECT 'coll', SCHEMA_NAME, DEFAULT_COLLATION_NAME, 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN ($in);\n"
+		     . "SELECT 'engine', TABLE_SCHEMA, ENGINE, COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA IN ($in) AND ENGINE IS NOT NULL GROUP BY TABLE_SCHEMA, ENGINE;\n"
+		     . "SELECT 'definer', TABLE_SCHEMA, DEFINER, COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA IN ($in) GROUP BY TABLE_SCHEMA, DEFINER;\n"
+		     . "SELECT 'definer', TRIGGER_SCHEMA, DEFINER, COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA IN ($in) GROUP BY TRIGGER_SCHEMA, DEFINER;\n"
+		     . "SELECT 'definer', ROUTINE_SCHEMA, DEFINER, COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA IN ($in) GROUP BY ROUTINE_SCHEMA, DEFINER;\n"
+		     . "SELECT 'plugin', User, plugin, 1 FROM mysql.user WHERE User IN ($uin);\n";
+		$rows = array();
+		foreach (explode("\n", transfer_remote($ssh, 'mysql -N -B 2>/dev/null', $sql, 120)) as $l) {
+			$p = explode("\t", $l);
+			if (count($p) === 4)
+				$rows[$p[0]][] = $p;
+		}
+		$have_coll = array_flip(array_map(function ($l) { return explode("\t", $l)[0]; }, mysql_rows('SHOW COLLATION')));
+		$have_eng = array();
+		foreach (mysql_rows('SHOW ENGINES') as $l) {
+			$p = explode("\t", $l);
+			if (in_array(strtoupper($p[1] ?? ''), array('YES', 'DEFAULT'), true))
+				$have_eng[strtolower($p[0])] = true;
+		}
+		$sizes = array();
+		foreach ($rows['size'] ?? array() as $r) {
+			$sizes[$r[1]] = (float)$r[2];
+			$db_bytes += (float)$r[2];
+		}
+		$bad_coll = $bad_eng = $definers = array();
+		foreach ($rows['coll'] ?? array() as $r) {
+			$alt = strpos($r[2], 'utf8mb3_') === 0 ? 'utf8_'.substr($r[2], 8) : (strpos($r[2], 'utf8_') === 0 ? 'utf8mb3_'.substr($r[2], 5) : '');
+			if (!isset($have_coll[$r[2]]) && ($alt === '' || !isset($have_coll[$alt])))
+				$bad_coll[$r[2]][$r[1]] = true;
+		}
+		foreach ($rows['engine'] ?? array() as $r)
+			if (!isset($have_eng[strtolower($r[2])]))
+				$bad_eng[] = $r[1].': '.$r[2].' ('.$r[3].' tables)';
+		foreach ($rows['definer'] ?? array() as $r)
+			$definers[] = $r[1].': '.$r[3].' made by '.$r[2];
+		$dl = array();
+		foreach ($dbs as $d)
+			$dl[] = $d.': '.transfer_bytes($sizes[$d] ?? 0);
+		$items[] = transfer_item('Databases', 'info', 'Databases: '.count($dbs).', '.transfer_bytes($db_bytes), '', $dl);
+		if ($bad_coll) {
+			$bl = array();
+			foreach ($bad_coll as $c => $in_dbs)
+				$bl[] = $c.' (in '.implode(', ', array_keys($in_dbs)).')';
+			$items[] = transfer_item('Databases', 'block', 'Collations this server\'s MariaDB does not have',
+				'The import stops at the first table that uses one. The dump has to be changed on the way (utf8mb4_0900_* to utf8mb4_unicode_520_ci, for example).', $bl);
+		}
+		if ($bad_eng)
+			$items[] = transfer_item('Databases', 'block', 'Table types this server does not have', '', $bad_eng);
+		if ($definers)
+			$items[] = transfer_item('Databases', 'info', 'Views, triggers and routines with an owner',
+				'They keep their owner\'s name; if the database user is named differently here they stop working until the owner is changed.', $definers);
+		$sha2 = array();
+		foreach ($rows['plugin'] ?? array() as $r)
+			if (!in_array($r[2], array('mysql_native_password', ''), true))
+				$sha2[] = $r[1].' ('.$r[2].')';
+		if ($sha2)
+			$items[] = transfer_item('Databases', 'warn', 'Database users whose password cannot be moved',
+				'Their passwords are stored in a form MariaDB cannot read. Give them a new password here and put it in the site\'s configuration (wp-config.php and the like).', array_values(array_unique($sha2)));
+		$long = array();
+		foreach ($dbs as $d)
+			if (strlen($d) > 64)
+				$long[] = $d;
+		foreach (array_keys($dbusers) as $u2)
+			if (strlen($u2) > database_user_max())
+				$long[] = $u2.' (users: at most '.database_user_max().' characters here)';
+		if ($long)
+			$items[] = transfer_item('Databases', 'warn', 'Names too long for this server', '', $long);
+	} else
+		$items[] = transfer_item('Databases', 'ok', 'No databases');
+
+	/* ---- cron jobs ---- */
+	$main_php = '';
+	foreach ($sites as $s)
+		if ($s['type'] === 'main')
+			$main_php = $s['version'];
+	$cron = transfer_cron_convert(implode("\n", $sec['cron'] ?? array()), $user, $user, $main_php ?: (string)($GLOBALS['ini']['php'] ?? ''));
+	if ($cron['jobs'] || $cron['skipped']) {
+		$cl = array();
+		$paused = $noted = 0;
+		foreach ($cron['jobs'] as $j) {
+			$paused += $j['on'] ? 0 : 1;
+			$noted += $j['notes'] ? 1 : 0;
+			$cl[] = $j['schedule'].' '.$j['command'].($j['command'] !== $j['original'] ? "\n    was: ".$j['original'] : '')
+			      .($j['notes'] ? "\n    ! ".implode("\n    ! ", $j['notes']) : '');
+		}
+		foreach ($cron['skipped'] as $sk)
+			$cl[] = $sk[0]."\n    ! not taken: ".$sk[1];
+		$items[] = transfer_item('Cron jobs', ($paused || $cron['skipped']) ? 'warn' : ($noted || $cron['notes'] ? 'info' : 'ok'),
+			'Cron jobs: '.count($cron['jobs']).($paused ? ', '.$paused.' will come in paused' : '').($cron['skipped'] ? ', '.count($cron['skipped']).' not taken' : ''),
+			trim('The transfer changes them like this (cPanel\'s PHP to this server\'s, same version). '.implode(' ', $cron['notes'])), $cl, true);
+	} else
+		$items[] = transfer_item('Cron jobs', 'ok', 'No cron jobs');
+
+	/* ---- size ---- */
+	$disk = json_decode(implode("\n", $sec['disk'] ?? array()), true);
+	$used = $files = null;
+	foreach ((array)($disk['data']['accounts'] ?? array()) as $a)
+		if (($a['user'] ?? '') === $user) {
+			$used = isset($a['blocks_used']) ? (float)$a['blocks_used'] * 1024 : null;
+			$files = isset($a['inodes_used']) ? (int)$a['inodes_used'] : null;
+		}
+	$mail_bytes = (float)($sec['maildu'][0] ?? 0);
+	$sl = array();
+	if ($used !== null) $sl[] = 'home folder: '.transfer_bytes($used).($files !== null ? ', '.number_format($files).' files' : '');
+	if ($mail_bytes) $sl[] = 'of it mail: '.transfer_bytes($mail_bytes);
+	$sl[] = 'databases: '.transfer_bytes($db_bytes);
+	$total = (float)$used + $db_bytes;
+	$free = (float)($ctx['free'] ?? 0);
+	$items[] = transfer_item('Size', $free && $total > $free * 0.8 ? 'block' : 'info',
+		'Size: '.transfer_bytes($total).($free && $total > $free * 0.8 ? ' - more than this server can take' : ''), '', $sl);
+
+	/* ---- certificates ---- */
+	$cl = array();
+	$paid = 0;
+	foreach ($site_certs as $d => $pem) {
+		if (trim($pem) === '')
+			continue;
+		$x = @openssl_x509_parse($pem);
+		if (!$x)
+			continue;
+		$iss = $x['issuer']['O'] ?? ($x['issuer']['CN'] ?? '?');
+		$isscn = $x['issuer']['CN'] ?? '';
+		$to = (int)($x['validTo_time_t'] ?? 0);
+		$days = (int)round(($to - (int)($x['validFrom_time_t'] ?? 0)) / 86400);
+		$self = ($x['issuer'] ?? null) == ($x['subject'] ?? null);
+		$free_ca = preg_match("/let's encrypt|cpanel|zerossl|google trust/i", $iss.' '.$isscn) || $days <= 100;
+		if ($self)
+			$kind = 'self-signed';
+		elseif ($to < time())
+			$kind = 'expired';
+		elseif ($free_ca)
+			$kind = 'free (AutoSSL / Let\'s Encrypt)';
+		else {
+			$kind = 'PAID';
+			$paid++;
+		}
+		$cl[] = $d.': '.$kind.', '.$iss.', until '.date('Y-m-d', $to);
+	}
+	if ($cl)
+		$items[] = transfer_item('Certificates', $paid ? 'warn' : 'ok', $paid ? $paid.' paid certificate'.($paid === 1 ? '' : 's') : 'Certificates',
+			$paid ? 'A paid certificate is copied with the site (the transfer does this); renew it here before it ends. Free ones are issued again here.' : 'Free certificates are issued again here after the switch.', $cl);
+	return $items;
+}
+
+/* ---- Transfer tool: the sites of cPanel accounts --------------------------------
+   Every site (main, addon, subdomain, alias) of the accounts $users with its
+   document root and PHP version: cPanel's MultiPHP choice, or the AddHandler
+   line of its .htaccess, which wins for the non-FPM handlers. Used by the PHP
+   step of the page and by the transfer itself.
+   array(error, accounts: [{user, domain, sites[]}], versions, system_default, local_versions) */
+function transfer_sites($ssh, array $users) {
+	$want = array_flip($users);
+	list($vh_data, $dom_data, $def_data) = transfer_whmapi($ssh, [
+		'php_get_vhost_versions',
+		'get_domain_info',
+		'php_get_system_default_version',
+	]);
+	if($vh_data === null || $dom_data === null)
+		return ['error' => 'Could not read the PHP versions from the cPanel server (whmapi1 php_get_vhost_versions / get_domain_info).'];
+	$sys_default = (string)($def_data['version'] ?? '');
+
+	$vhosts = [];
+	foreach((array)($vh_data['versions'] ?? []) as $v)
+		if(isset($want[$v['account'] ?? ''])) $vhosts[strtolower($v['vhost'])] = $v;
+
+	$doms = []; $twins = []; $main_of = [];
+	foreach((array)($dom_data['domains'] ?? []) as $d) {
+		if(!isset($want[$d['user'] ?? ''])) continue;
+		$doms[] = $d;
+		// every addon domain has a subdomain twin on cPanel (addon.main.tld), not a site of its own
+		if(($d['domain_type'] ?? '') === 'addon' && !empty($d['parent_domain'])) $twins[strtolower($d['parent_domain'])] = true;
+		if(($d['domain_type'] ?? '') === 'main') $main_of[$d['user']] = strtolower($d['domain']);
+	}
+
+	$sites = [];
+	foreach($doms as $d) {
+		$name = strtolower((string)$d['domain']);
+		$type = (string)($d['domain_type'] ?? '');
+		if($type === 'sub' && isset($twins[$name])) continue;
+		$vh_name = ($type === 'parked') ? strtolower($d['parent_domain'] ?? ($main_of[$d['user']] ?? '')) : $name;
+		$vh = $vhosts[$vh_name] ?? null;
+		$pkg = (string)($vh['version'] ?? '');
+		if($pkg === '' || $pkg === 'inherit') $pkg = $sys_default;
+		$src = (array)($vh['phpversion_source'] ?? []);
+		if(!empty($src['system_default']))      $source = 'server default';
+		elseif(!empty($src['domain']) && strtolower($src['domain']) !== $vh_name) $source = 'from '.strtolower($src['domain']);
+		elseif(!empty($src['domain']))         $source = 'set for the site';
+		else                                   $source = '';
+		if($type === 'parked') $source = 'alias of '.$vh_name;
+		$docroot = (string)($d['docroot'] ?? ($vh['documentroot'] ?? ''));
+		$sites[] = [
+			'user'     => (string)$d['user'],
+			'domain'   => $name,
+			'type'     => $type,
+			'docroot'  => $docroot,
+			'package'  => $pkg,
+			'version'  => transfer_php_version($pkg),
+			'source'   => $source,
+			'fpm'      => !empty($vh['php_fpm']),
+			'htaccess' => '',
+			// the cPanel name of its vhost: an addon domain's is its twin subdomain
+			'twin'     => ($type === 'addon') ? strtolower((string)($d['parent_domain'] ?? '')) : '',
+			// its addresses on cPanel (the IP map)
+			'ip4'      => (string)($d['ipv4'] ?? ''),
+			'ip6'      => (string)($d['ipv6'] ?? ''),
+			'ip6_own'  => !empty($d['ipv6_is_dedicated']),
+		];
+	}
+
+	/* cPanel sets a site's PHP for the CGI / suPHP / LSAPI handlers with an
+	   AddHandler line in the document root's .htaccess, and a hand-edited one
+	   wins over what cPanel shows. Read that line too (as root on the cPanel
+	   server; the folders go in on stdin, never into the command). */
+	$roots = [];
+	foreach($sites as $s)
+		if(preg_match('#^/[A-Za-z0-9._@+\-/]+$#', $s['docroot']) && strpos($s['docroot'], '/..') === false)
+			$roots[$s['docroot']] = true;
+	$found = [];
+	if($roots) {
+		$tmp = tempnam(sys_get_temp_dir(), 'rqtf');
+		file_put_contents($tmp, implode("\n", array_keys($roots))."\n");
+		$script = 'while IFS= read -r d; do '
+		        . 'h=$(grep -v "^[[:space:]]*#" "$d/.htaccess" 2>/dev/null | grep -ioE "x-httpd-[a-z0-9-]*php[0-9]+" | tail -n1); '
+		        . 'echo "$d|$h"; done';
+		$p = proc_open($ssh.' '.escapeshellarg($script), [0 => ['file', $tmp, 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+		if(is_resource($p)) {
+			foreach(explode("\n", (string)stream_get_contents($pipes[1])) as $line) {
+				$i = strrpos($line, '|');
+				if($i !== false) $found[substr($line, 0, $i)] = transfer_php_version(substr($line, $i + 1));
+			}
+			fclose($pipes[1]);
+			proc_close($p);
+		}
+		@unlink($tmp);
+	}
+
+	$versions = [];
+	foreach($sites as &$s) {
+		$h = $found[$s['docroot']] ?? '';
+		if($h !== '' && $h !== $s['version']) {
+			$s['htaccess'] = $h;
+			// PHP-FPM is chosen in the vhost, so there the .htaccess line does nothing
+			if(!$s['fpm']) $s['version'] = $h;
+		}
+		$v = $s['version'];
+		if($v === '') continue;
+		if(!isset($versions[$v])) {
+			$versions[$v] = transfer_php_local($v) + ['sites' => 0];
+			// what the transfer uses unless another one is chosen
+			if($versions[$v]['status'] !== 'installed') $versions[$v]['instead'] = transfer_php_nearest($v);
+		}
+		$versions[$v]['sites']++;
+		$s['local'] = $versions[$v]['status'];
+	}
+	unset($s);
+	uksort($versions, function($a, $b) { return version_compare($b, $a); });
+
+	$accounts = [];
+	foreach(array_keys($want) as $u) $accounts[$u] = ['user' => $u, 'domain' => $main_of[$u] ?? '', 'sites' => []];
+	$order = ['main' => 0, 'addon' => 1, 'sub' => 2, 'parked' => 3];
+	usort($sites, function($a, $b) use ($order) {
+		return [$order[$a['type']] ?? 9, $a['domain']] <=> [$order[$b['type']] ?? 9, $b['domain']];
+	});
+	foreach($sites as $s) $accounts[$s['user']]['sites'][] = $s;
+
+	return [
+		'error'          => '',
+		'accounts'       => array_values($accounts),
+		'versions'       => $versions,
+		'system_default' => transfer_php_version($sys_default),
+		'local_versions' => array_column(php_versions(), 'version'),
+	];
+}
+
+/* ---- Certificates brought from another server ---------------------------------
+   Serve $domain with the certificate $cert (PEM: the certificate, then its
+   chain) and its private key $key, the way the SSL page's "own certificate"
+   does: /etc/ssl/certs/<domain>_newcert.pem + _privkey.pem, named in the
+   front server's vhost. Checked first (a certificate, not expired, the key
+   fits it); the vhost is put back when the web server refuses the change.
+   $reload false: the caller reloads the web server once for several sites.
+   Returns '' or why not. */
+function ssl_custom_install($domain, $cert, $key, $reload = true) {
+	global $ini;
+	$domain = strtolower(trim((string)$domain));
+	if (!valid_domain($domain))
+		return 'Not a domain name.';
+	$x = @openssl_x509_read((string)$cert);
+	$k = @openssl_pkey_get_private((string)$key);
+	if ($x === false || $k === false)
+		return 'Not a certificate and private key in PEM form.';
+	$info = openssl_x509_parse($x);
+	if (!is_array($info) || (int)($info['validTo_time_t'] ?? 0) < time())
+		return 'The certificate has expired.';
+	if (!openssl_x509_check_private_key($x, $k))
+		return 'The private key does not belong to the certificate.';
+
+	$server = web_front($ini);
+	$ws = web_server($server);
+	$vhost = web_vhost_path($domain, $server);
+	$conf = (string)shell_exec('sudo -n cat '.escapeshellarg($vhost).' 2>/dev/null');
+	if ($conf === '')
+		return "$domain has no vhost here ($vhost).";
+	$crt_file = '/etc/ssl/certs/'.$domain.'_newcert.pem';
+	$key_file = '/etc/ssl/certs/'.$domain.'_privkey.pem';
+	if ($server === 'httpd') {
+		$new = preg_replace('/^([ \t]*SSLCertificateFile[ \t]+)\S+[ \t]*$/m', '${1}'.$crt_file, $conf);
+		$new = preg_replace('/^([ \t]*SSLCertificateKeyFile[ \t]+)\S+[ \t]*$/m', '${1}'.$key_file, $new);
+		$new = preg_replace('/^[ \t]*SSLCertificateChainFile[ \t][^\n]*\n/m', '', $new);   // the chain is in the certificate file
+	} else {
+		$new = preg_replace('/^([ \t]*ssl_certificate[ \t]+)[^;\n]+;/m', '${1}'.$crt_file.';', $conf);
+		$new = preg_replace('/^([ \t]*ssl_certificate_key[ \t]+)[^;\n]+;/m', '${1}'.$key_file.';', $new);
+	}
+	if ($new === $conf && strpos($conf, $crt_file) === false)
+		return "The vhost of $domain names no certificate to replace.";
+
+	$pem = trim((string)$cert)."\n";
+	shell_with_stdin('sudo -n tee '.escapeshellarg($crt_file).' > /dev/null', $pem);
+	shell_with_stdin('sudo -n sh -c '.escapeshellarg('umask 077; cat > '.escapeshellarg($key_file)), trim((string)$key)."\n");
+	shell_exec('sudo -n chmod 600 '.escapeshellarg($key_file).'; sudo -n chmod 644 '.escapeshellarg($crt_file));
+	if ($new !== $conf) {
+		shell_with_stdin('sudo -n tee '.escapeshellarg($vhost).' > /dev/null', $new);
+		exec('sudo -n '.$ws['test'].' 2>&1', $out, $rc);
+		if ($rc !== 0) {
+			shell_with_stdin('sudo -n tee '.escapeshellarg($vhost).' > /dev/null', $conf);
+			return $ws['label'].' refused the change: '.trim(implode(' ', array_slice($out, -2)));
+		}
+	}
+	if ($reload)
+		shell_exec('sudo -n systemctl reload '.escapeshellarg($ws['service']).' 2>&1');
+	route_log("install certificate for $domain (".($info['issuer']['O'] ?? ($info['issuer']['CN'] ?? '?')).')');
+	return '';
+}
+
+/* ---- Transfer tool: transfer jobs ---------------------------------------------
+   The page starts a job for the accounts it has checked; the job runs as root
+   in its own systemd unit (reqad-transfer-<id>, scripts/transfer_cpanel.php),
+   one account after the other, so closing the page does not stop it. In
+   _PATH/transfers: job-<id>.json (what to do, written by the panel),
+   job-<id>.state.json (how far it is, written by the job) and
+   job-<id>.<account>.log (what it did). No passwords or keys in any of them. */
+
+function transfer_job_dir() {
+	return _PATH.'/transfers';
+}
+
+function transfer_job_file($id, $kind = '') {
+	return transfer_job_dir().'/job-'.$id.($kind === '' ? '.json' : '.'.$kind);
+}
+
+function transfer_job_valid_id($id) {
+	return preg_match('/^[a-f0-9]{16}$/', (string)$id) === 1;
+}
+
+/* What the transfer can bring, all on unless the page says otherwise */
+function transfer_job_parts() {
+	return array('files' => 'Files', 'databases' => 'Databases', 'mail' => 'Email (mailboxes, mail, forwarders, filters, autoresponders, spam lists, DKIM)',
+	             'cron' => 'Cron jobs', 'ssl' => 'Certificates');
+}
+
+function transfer_job_get($id) {
+	if (!transfer_job_valid_id($id))
+		return null;
+	$j = json_decode((string)@file_get_contents(transfer_job_file($id)), true);
+	return is_array($j) ? $j : null;
+}
+
+function transfer_job_state($id) {
+	$s = json_decode((string)@file_get_contents(transfer_job_file($id, 'state.json')), true);
+	return is_array($s) ? $s : array();
+}
+
+function transfer_job_active($id) {
+	return transfer_job_valid_id($id)
+	    && trim((string)shell_exec('systemctl is-active '.escapeshellarg('reqad-transfer-'.$id).' 2>/dev/null')) === 'active';
+}
+
+/* the newest job, or null */
+function transfer_job_latest() {
+	$files = glob(transfer_job_dir().'/job-*.json') ?: array();
+	$files = array_filter($files, function ($f) { return preg_match('#/job-[a-f0-9]{16}\.json$#', $f); });
+	usort($files, function ($a, $b) { return filemtime($b) - filemtime($a); });
+	return $files ? transfer_job_get(substr(basename($files[0]), 4, 16)) : null;
+}
+
+/*
+ * Start a transfer. $conn: server, port, ruser. $accounts: rows from the
+ * account list (user, domain, diskused); each keeps its user name here.
+ * $parts: transfer_job_parts() keys to take. data: id.
+ */
+function transfer_job_start(array $conn, array $accounts, array $parts, array $php_map = array()) {
+	$ssh = transfer_ssh((string)($conn['server'] ?? ''), (int)($conn['port'] ?? 22), (string)($conn['ruser'] ?? ''), $err);
+	if ($err !== '')
+		return result_error($err);
+	$latest = transfer_job_latest();
+	if ($latest && transfer_job_active($latest['id']))
+		return result_error('A transfer is already running. Wait for it to end, or stop it.');
+	$list = array();
+	foreach ($accounts as $a) {
+		$u = (string)($a['user'] ?? '');
+		if (!valid_username($u))
+			return result_error("$u cannot be an account name here (2-16 lowercase letters and digits, starting with a letter).");
+		$list[$u] = array('user' => $u, 'domain' => strtolower((string)($a['domain'] ?? '')),
+		                  'diskused' => preg_match('/^[0-9.]+[KMGT]?$/i', (string)($a['diskused'] ?? '')) ? (string)$a['diskused'] : '');
+	}
+	if (!$list)
+		return result_error('Choose at least one account.');
+	$take = array();
+	foreach (transfer_job_parts() as $k => $label)
+		$take[$k] = in_array($k, $parts, true);
+	if (!array_filter($take))
+		return result_error('Choose at least one thing to transfer.');
+
+	$id = bin2hex(random_bytes(8));
+	$dir = transfer_job_dir();
+	if (!is_dir($dir))
+		@mkdir($dir, 0750, true);
+	$job = array('id' => $id, 'server' => (string)$conn['server'], 'port' => (int)$conn['port'], 'ruser' => (string)$conn['ruser'],
+	             'accounts' => array_values($list), 'parts' => $take, 'php_map' => transfer_php_map($php_map), 'created' => time(), 'by' => function_exists('auth_user') ? (string)auth_user() : '');
+	if (@file_put_contents(transfer_job_file($id), json_encode($job, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) === false)
+		return result_error("Could not write the job file in $dir.");
+	@chmod(transfer_job_file($id), 0640);
+	$cmd = server_sudo().'systemd-run --quiet --collect --unit='.escapeshellarg('reqad-transfer-'.$id)
+	     .' --description='.escapeshellarg('Reqad transfer of '.count($list).' cPanel account(s) from '.$job['server'])
+	     .' -p Nice=5 -p IOSchedulingClass=best-effort -p IOSchedulingPriority=6'
+	     .' -- /opt/reqad/php-current/usr/bin/php -c /etc/reqad/php-fpm/php.ini '._PATH.'/scripts/transfer_cpanel.php --job='.$id.' 2>&1';
+	transfer_job_log($id, 'Transfer from '.$job['server'].' asked by '.transfer_actor().': '.implode(', ', array_keys($list))
+	                    .'. Parts: '.implode(', ', array_keys(array_filter($take))).($job['php_map'] ? '. PHP versions replaced: '
+	                    .implode(', ', array_map(function ($f, $t) { return "$f -> $t"; }, array_keys($job['php_map']), $job['php_map'])) : '').'.');
+	exec($cmd, $out, $rc);
+	if ($rc !== 0) {
+		transfer_job_log($id, 'Could not start: '.trim(implode(' ', $out)));
+		return result_error('Could not start the transfer: '.trim(implode(' ', $out)));
+	}
+	route_log('transfer from '.$job['server'].': '.implode(', ', array_keys($list)));
+	return result_ok('Transfer started.', array('id' => $id));
+}
+
+/* The job, its progress and what each account's log got since $offsets
+   (account => bytes already shown). */
+function transfer_job_status($id, array $offsets = array()) {
+	$job = transfer_job_get($id);
+	if (!$job)
+		return result_error('No such transfer.');
+	$state = transfer_job_state($id);
+	$active = transfer_job_active($id);
+	$accounts = array();
+	foreach ($job['accounts'] as $a) {
+		$u = $a['user'];
+		$st = (array)($state['accounts'][$u] ?? array());
+		$log = '';
+		$off = max(0, (int)($offsets[$u] ?? 0));
+		$f = transfer_job_file($id, $u.'.log');
+		$size = is_file($f) ? (int)filesize($f) : 0;
+		if ($size > $off)
+			$log = (string)@file_get_contents($f, false, null, $off, min(262144, $size - $off));
+		$status = (string)($st['status'] ?? 'queued');
+		if (!$active && in_array($status, array('queued', 'running'), true))
+			$status = 'stopped';
+		$accounts[] = array('user' => $u, 'domain' => $a['domain'], 'status' => $status, 'step' => (string)($st['step'] ?? ''),
+		                    'detail' => (string)($st['detail'] ?? ''), 'warnings' => (int)($st['warnings'] ?? 0),
+		                    'started' => (int)($st['started'] ?? 0), 'finished' => (int)($st['finished'] ?? 0),
+		                    'log' => $log, 'offset' => $off + strlen($log));
+	}
+	$status = (string)($state['status'] ?? 'queued');
+	if (!$active && in_array($status, array('queued', 'running'), true))
+		$status = 'stopped';
+	return result_ok('', array('id' => $id, 'server' => $job['server'], 'parts' => $job['parts'], 'created' => $job['created'],
+	                           'by' => (string)($job['by'] ?? ''), 'ips' => is_file(transfer_job_file($id, 'ips')),
+	                           'joblog' => (string)@file_get_contents(transfer_job_file($id, 'log'), false, null, 0, 65536),
+	                           'status' => $status, 'active' => $active, 'accounts' => $accounts));
+}
+
+function transfer_job_stop($id) {
+	if (!transfer_job_get($id))
+		return result_error('No such transfer.');
+	if (!transfer_job_active($id))
+		return result_ok('The transfer is not running.');
+	shell_exec(server_sudo().'systemctl stop '.escapeshellarg('reqad-transfer-'.$id).' 2>&1');
+	route_log("transfer $id stopped");
+	transfer_job_log($id, 'Stopped by '.transfer_actor().'.');
+	return result_ok('Transfer stopped. What was done so far stays; start the account again to finish it.');
+}
+
+/* ============== Transfer tool: history, logs and the IP address map ==============
+   Each transfer keeps its files in transfers/ for good, like a transfer session
+   on cPanel: job-<id>.json (what was asked), .state.json (progress), .log (the
+   transfer's own log: started, each account's end, stopped, finished),
+   .<user>.log (each account's log) and .ips (the IP map: the address each site
+   and its mail had on the cPanel server). The IP map is plain text, one line per
+   site, so it can be kept, edited and read back to give the accounts their
+   addresses here once the addresses have moved to this server
+   (transfer_ip_restore(); restores are logged in transfers/ip-restores.log). */
+
+/* Append lines to a transfer log, each with the date and time. A file made by
+   root (the runner, the CLI) is given to reqad, so the panel can add to it. */
+function transfer_log_append($file, $msg) {
+	$new = !is_file($file);
+	$lines = '';
+	foreach (explode("\n", rtrim((string)$msg, "\n")) as $l)
+		$lines .= date('Y-m-d H:i:s').' '.$l."\n";
+	if (@file_put_contents($file, $lines, FILE_APPEND) === false)
+		return false;
+	if ($new) {
+		@chmod($file, 0640);
+		if (function_exists('posix_geteuid') && posix_geteuid() === 0)
+			@chown($file, 'reqad');
+		@chgrp($file, 'reqad');
+	}
+	return true;
+}
+
+function transfer_job_log($id, $msg) {
+	return transfer_job_valid_id($id) && transfer_log_append(transfer_job_file($id, 'log'), $msg);
+}
+
+/* Who did it: the panel's admin, or the CLI's user */
+function transfer_actor() {
+	$by = function_exists('auth_user') ? (string)auth_user() : '';
+	return $by !== '' ? $by : (PHP_SAPI === 'cli' ? 'cli' : 'admin');
+}
+
+/* Every transfer, newest first: id, server, created, finished, by, status,
+   active, accounts (count), done / warn / failed, warnings, ips (has a map). */
+function transfer_job_list() {
+	$out = array();
+	foreach (glob(transfer_job_dir().'/job-*.json') ?: array() as $f) {
+		if (!preg_match('#/job-([a-f0-9]{16})\.json$#', $f, $m))
+			continue;
+		$job = transfer_job_get($m[1]);
+		if (!$job)
+			continue;
+		$st = transfer_job_state($m[1]);
+		$status = (string)($st['status'] ?? 'queued');
+		/* only a job that says it runs asks systemd */
+		$active = in_array($status, array('queued', 'running'), true) && transfer_job_active($m[1]);
+		if (!$active && in_array($status, array('queued', 'running'), true))
+			$status = 'stopped';
+		$n = array('done' => 0, 'warn' => 0, 'failed' => 0, 'warnings' => 0);
+		foreach ((array)($st['accounts'] ?? array()) as $a) {
+			$s = (string)($a['status'] ?? '');
+			if (isset($n[$s]))
+				$n[$s]++;
+			$n['warnings'] += (int)($a['warnings'] ?? 0);
+		}
+		$out[] = array('id' => $m[1], 'server' => (string)$job['server'], 'created' => (int)$job['created'],
+		               'finished' => (int)($st['finished'] ?? 0), 'by' => (string)($job['by'] ?? ''), 'status' => $status, 'active' => $active,
+		               'accounts' => count($job['accounts']), 'users' => array_column($job['accounts'], 'user'),
+		               'done' => $n['done'], 'warn' => $n['warn'], 'failed' => $n['failed'], 'warnings' => $n['warnings'],
+		               'ips' => is_file(transfer_job_file($m[1], 'ips')));
+	}
+	usort($out, function ($a, $b) { return $b['created'] - $a['created']; });
+	return $out;
+}
+
+/* A transfer's log as one text: its own log, then each account's ($user: only
+   that account's). data: name (a file name to save it as), text. */
+function transfer_job_log_text($id, $user = '') {
+	$job = transfer_job_get($id);
+	if (!$job)
+		return result_error('No such transfer.');
+	$users = array_column($job['accounts'], 'user');
+	if ($user !== '' && !in_array($user, $users, true))
+		return result_error("The transfer $id did not have the account $user.");
+	$text = '';
+	if ($user === '') {
+		$text = "Transfer $id from {$job['server']}, started ".date('Y-m-d H:i', (int)$job['created'])
+		      .($job['by'] !== '' ? " by {$job['by']}" : '')."\nAccounts: ".implode(', ', $users)."\n\n";
+		$own = (string)@file_get_contents(transfer_job_file($id, 'log'));
+		if ($own !== '')
+			$text .= $own."\n";
+	}
+	foreach ($user === '' ? $users : array($user) as $u) {
+		$l = (string)@file_get_contents(transfer_job_file($id, $u.'.log'));
+		$text .= ($user === '' ? "==================== $u ====================\n" : '').($l !== '' ? $l : "(nothing logged)\n").($user === '' ? "\n" : '');
+	}
+	return result_ok('', array('name' => 'transfer-'.date('Ymd-Hi', (int)$job['created']).($user !== '' ? '-'.$user : '').'.log', 'text' => $text));
+}
+
+/* --- the IP map --- */
+
+function transfer_ip_map_columns() {
+	return array('domain', 'account', 'kind', 'ipv4', 'ipv4_use', 'ipv6', 'ipv6_use', 'mail_from');
+}
+
+/* The map as text: rows of transfer_ip_map_columns() keys ('' = '-'). */
+function transfer_ip_map_text(array $rows, $title) {
+	$w = array(30, 16, 6, 15, 9, 39, 9, 0);
+	$line = function (array $v) use ($w) {
+		$s = '';
+		foreach (array_values($v) as $i => $x)
+			$s .= $w[$i] ? str_pad($x, $w[$i]).' ' : $x;
+		return rtrim($s)."\n";
+	};
+	$t = "# Reqad transfer IP map: $title\n"
+	   . "# The address each site had on the cPanel server (ipv4_use / ipv6_use: dedicated = the\n"
+	   . "# account's own, shared = shared by several accounts) and the address its mail went out\n"
+	   . "# from. Once the addresses have been moved to this server and added in Settings > IP\n"
+	   . "# addresses, restore them: Transfer tool > History > IP map, or\n"
+	   . "#   reqad transfer ip-restore <this file> [--apply]\n"
+	   . "# Lines can be removed or changed; '-' = none.\n"
+	   . '# '.$line(transfer_ip_map_columns());
+	foreach ($rows as $r) {
+		$v = array();
+		foreach (transfer_ip_map_columns() as $k)
+			$v[] = (string)($r[$k] ?? '') !== '' ? (string)$r[$k] : '-';
+		$t .= $line($v);
+	}
+	return $t;
+}
+
+/* Rows and errors of a map file's text. Lines that are not right are left out
+   (errors: "line N: why"). */
+function transfer_ip_map_parse($text) {
+	$rows = array(); $errors = array();
+	$cols = transfer_ip_map_columns();
+	foreach (preg_split('/\r?\n/', (string)$text) as $i => $l) {
+		$l = trim($l);
+		if ($l === '' || $l[0] === '#')
+			continue;
+		if (count($rows) >= 20000) {
+			$errors[] = 'more than 20000 lines: the rest is left out';
+			break;
+		}
+		$p = preg_split('/\s+/', $l);
+		$n = $i + 1;
+		if (count($p) !== count($cols)) {
+			$errors[] = "line $n: ".count($cols).' columns expected ('.implode(' ', $cols).')';
+			continue;
+		}
+		$r = array_combine($cols, array_map(function ($x) { return $x === '-' ? '' : $x; }, $p));
+		$r['domain'] = strtolower(rtrim($r['domain'], '.'));
+		if ($r['kind'] === 'parked')
+			$r['kind'] = 'alias';
+		$why = '';
+		if (!valid_domain($r['domain']))                                          $why = 'not a domain name';
+		elseif (!valid_username($r['account']))                                   $why = 'not an account name';
+		elseif (!in_array($r['kind'], array('main', 'addon', 'sub', 'alias'), true)) $why = 'kind: main, addon, sub or alias';
+		elseif ($r['ipv4'] !== '' && !filter_var($r['ipv4'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $why = 'ipv4: not an IPv4 address';
+		elseif ($r['ipv6'] !== '' && !filter_var($r['ipv6'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) $why = 'ipv6: not an IPv6 address';
+		elseif (!in_array($r['ipv4_use'], array('', 'dedicated', 'shared'), true) || !in_array($r['ipv6_use'], array('', 'dedicated', 'shared'), true)) $why = 'ipv4_use / ipv6_use: dedicated or shared';
+		elseif ($r['mail_from'] !== '' && !filter_var($r['mail_from'], FILTER_VALIDATE_IP)) $why = 'mail_from: not an IP address';
+		if ($why !== '') {
+			$errors[] = "line $n: $why";
+			continue;
+		}
+		foreach (array('ipv4', 'ipv6', 'mail_from') as $k)
+			if ($r[$k] !== '')
+				$r[$k] = (string)inet_ntop(inet_pton($r[$k]));
+		if ($r['ipv4'] !== '' && $r['ipv4_use'] === '') $r['ipv4_use'] = 'dedicated';
+		if ($r['ipv6'] !== '' && $r['ipv6_use'] === '') $r['ipv6_use'] = 'dedicated';
+		$rows[] = $r;
+	}
+	return array($rows, $errors);
+}
+
+/* Save one account's rows in a transfer's map (the runner, as root; a
+   resumed account replaces its lines). */
+function transfer_ip_map_save($id, $user, array $rows) {
+	$job = transfer_job_get($id);
+	if (!$job)
+		return false;
+	$f = transfer_job_file($id, 'ips');
+	list($old) = transfer_ip_map_parse((string)@file_get_contents($f));
+	$keep = array_values(array_filter($old, function ($r) use ($user) { return $r['account'] !== $user; }));
+	$text = transfer_ip_map_text(array_merge($keep, $rows), 'transfer '.$id.' from '.$job['server'].', '.date('Y-m-d H:i', (int)$job['created']));
+	if (@file_put_contents($f.'.tmp', $text) === false)
+		return false;
+	@chmod($f.'.tmp', 0640);
+	@chgrp($f.'.tmp', 'reqad');
+	return @rename($f.'.tmp', $f);
+}
+
+/* data: name, text of a transfer's map */
+function transfer_ip_map_get($id) {
+	$job = transfer_job_get($id);
+	if (!$job)
+		return result_error('No such transfer.');
+	$text = (string)@file_get_contents(transfer_job_file($id, 'ips'));
+	if ($text === '')
+		return result_error('This transfer has no IP map (transfers made before the map existed have none; transfer the account again to make one).');
+	return result_ok('', array('name' => 'transfer-'.date('Ymd-Hi', (int)$job['created']).'-ips.txt', 'text' => $text));
+}
+
+/* The addresses this server has (bound to its interfaces). */
+function transfer_ip_local() {
+	$out = array();
+	foreach (explode("\n", (string)shell_exec('ip -o addr show 2>/dev/null')) as $l)
+		if (preg_match('/\sinet6?\s+([0-9a-fA-F:.]+)\//', $l, $m) && ($b = @inet_pton($m[1])) !== false)
+			$out[] = (string)inet_ntop($b);
+	return array_values(array_unique($out));
+}
+
+/*
+ * What restoring a map would do. Per account (the main domain's line gives its
+ * addresses): an address that was its own on cPanel is given to it again when
+ * the address is in Settings > IP addresses (Hosting Pro) and free; a shared one
+ * is never given to one account - every site here answers on every IPv4 address
+ * of the server, so once it is on this server the sites answer on it as they
+ * did; mail of a domain that went out from another address than the account's
+ * gets an outgoing mail rule for that address, when it is here.
+ * data: hosting (Hosting Pro gives addresses), accounts [account, domain,
+ * domains, here, items [what, address, state, text, do]], counts by state.
+ * States: done (nothing to do), ready (the restore does it), missing (the
+ * address is not here yet), taken (another account has it), warn, skip.
+ */
+function transfer_ip_plan(array $rows) {
+	global $db;
+	$local = transfer_ip_local();
+	$list = plugin_filter('ip.list', null);
+	$hp = is_array($list);
+	$extra = array();
+	foreach ($hp ? $list : array() as $ip) {
+		$extra[(string)$ip['address']] = $ip;
+		if ((string)($ip['public'] ?? '') !== '')
+			$extra[(string)$ip['public']] = $ip;
+	}
+	$by = array();
+	foreach ($rows as $r)
+		$by[$r['account']][] = $r;
+	ksort($by);
+	$accounts = array();
+	$count = array('done' => 0, 'ready' => 0, 'missing' => 0, 'taken' => 0, 'warn' => 0, 'skip' => 0);
+	$add_text = $hp ? 'Once it has been moved to this server, add it in Settings > IP addresses and restore again.'
+	                : 'Giving an account an address of its own needs Reqad Hosting Pro.';
+	foreach ($by as $user => $rs) {
+		$main = $rs[0];
+		foreach ($rs as $r)
+			if ($r['kind'] === 'main')
+				$main = $r;
+		$acc = array('account' => $user, 'domain' => $main['domain'], 'domains' => array_values(array_unique(array_column($rs, 'domain'))),
+		             'here' => (bool)account_get($db, $user), 'items' => array());
+		$item = function ($what, $addr, $state, $text, array $do = array()) use (&$acc, &$count) {
+			$acc['items'][] = array('what' => $what, 'address' => $addr, 'state' => $state, 'text' => $text, 'do' => $do);
+			$count[$state]++;
+		};
+		if (!$acc['here']) {
+			$item('Account', '', 'skip', "$user is not an account on this server.");
+			$accounts[] = $acc;
+			continue;
+		}
+		$own = array(4 => '', 6 => '');   // the account's own address after the restore
+		foreach (array(4, 6) as $k) {
+			$a = $main['ipv'.$k];
+			if ($a === '')
+				continue;
+			$what = 'IPv'.$k;
+			$x = $extra[$a] ?? null;
+			$users = $x ? array_values((array)$x['users']) : array();
+			if ($x && in_array($user, $users, true)) {
+				$own[$k] = $a;
+				$item($what, $a, 'done', "$user has it.");
+				continue;
+			}
+			if ($main['ipv'.$k.'_use'] === 'shared') {
+				if ($users)
+					$item($what, $a, 'warn', 'Shared by several accounts on cPanel. Here it is the address of '.implode(', ', $users).', so only their sites answer on it.');
+				elseif ($k === 6)
+					$item($what, $a, 'skip', 'Shared on cPanel. Sites here answer on IPv6 only on an address of their own.');
+				elseif ($x || in_array($a, $local, true))
+					$item($what, $a, 'done', 'Shared by several accounts on cPanel. It is on this server, and every site answers on every address of this server.');
+				else
+					$item($what, $a, 'missing', 'Shared by several accounts on cPanel; it is not on this server. Once it is (Settings > IP addresses), the sites answer on it.');
+				continue;
+			}
+			if ($users)
+				$item($what, $a, 'taken', 'Its own on cPanel, but here it is the address of '.implode(', ', $users).'.');
+			elseif ($x) {
+				$own[$k] = $a;
+				$item($what, $a, 'ready', "Its own on cPanel: the restore gives it to $user (its sites answer on it, and its mail goes out from it once the reverse DNS of the address matches).",
+				      array('account' => $user, 'kind' => $k, 'address' => (string)$x['address']));
+			} elseif (in_array($a, $local, true))
+				$item($what, $a, $k === 4 ? 'done' : 'warn', $k === 4
+				      ? 'An address of this server outside Settings > IP addresses (its main one): every site answers on it.'
+				      : 'An address of this server outside Settings > IP addresses: '.($hp ? 'add it there to give it to the account.' : $add_text));
+			else
+				$item($what, $a, 'missing', 'Its own on cPanel; not on this server yet. '.$add_text);
+		}
+		/* mail: grouped by the address it went out from */
+		$mail = array();
+		foreach ($rs as $r)
+			if ($r['mail_from'] !== '' && $r['kind'] !== 'sub')
+				$mail[$r['mail_from']][] = $r['domain'];
+		foreach ($mail as $m => $doms) {
+			$k = strpos($m, ':') !== false ? 6 : 4;
+			if ($own[$k] === $m)
+				continue;   // it goes with the account's address
+			$x = $extra[$m] ?? null;
+			$what = 'Mail of '.implode(', ', $doms);
+			if ($m === $main['ipv'.$k] && $main['ipv'.$k.'_use'] === 'dedicated') {
+				/* the account's own address, which it does not get back: not
+				   another account's address for its mail either */
+				if ($x)
+					$item($what, $m, 'warn', 'Went out from the account\'s own address, which it does not have here; it keeps going out as now.');
+				continue;
+			}
+			if (!$x) {
+				if (!in_array($m, $local, true))
+					$item($what, $m, 'missing', "Went out from $m on cPanel, which is not on this server. ".($hp ? 'Once it is, add it in Settings > IP addresses and restore again; until then SPF records that name it must also allow this server.' : 'SPF records that name it must also allow this server.'));
+				continue;   // this server's main address: as it is now
+			}
+			$todo = array_values(array_diff($doms, (array)($x['mail_domains'] ?? array())));
+			if (!$todo)
+				$item($what, $m, 'done', "Goes out from $m.");
+			else
+				$item('Mail of '.implode(', ', $todo), $m, 'ready', "Went out from $m on cPanel: the restore adds outgoing mail rules for it (Settings > IP addresses > Outgoing mail).",
+				      array('domains' => $todo, 'address' => (string)$x['address'], 'kind' => $k));
+		}
+		$accounts[] = $acc;
+	}
+	return result_ok('', array('hosting' => $hp, 'accounts' => $accounts, 'counts' => $count));
+}
+
+/*
+ * Restore a map: do what transfer_ip_plan() marks ready. $source: what the map
+ * is (a transfer id or a file name), for the log. data: results [what, ok,
+ * text], plan (after).
+ */
+function transfer_ip_restore(array $rows, $source) {
+	$plan = transfer_ip_plan($rows)['data'];
+	if (!$plan['hosting'])
+		return result_error('Giving accounts their own addresses needs Reqad Hosting Pro (Settings > IP addresses).');
+	$results = array(); $warn = array();
+	$note = function ($what, $r) use (&$results, &$warn) {
+		$ok = is_array($r) && !empty($r['ok']);
+		$text = is_array($r) ? ($ok ? (string)$r['message'] : (string)$r['error']) : 'Hosting Pro did not answer.';
+		$results[] = array('what' => $what, 'ok' => $ok, 'text' => $text);
+		if ($ok)
+			foreach ((array)$r['warnings'] as $w)
+				$warn[] = "$what: $w";
+	};
+	foreach ($plan['accounts'] as $acc) {
+		$set = array(4 => null, 6 => null);
+		foreach ($acc['items'] as $it)
+			if ($it['state'] === 'ready' && isset($it['do']['account']))
+				$set[(int)$it['do']['kind']] = $it['do']['address'];
+		if ($set[4] !== null || $set[6] !== null)
+			$note($acc['account'], plugin_filter('account.ip.set', null, $acc['account'], $set[4], $set[6]));
+		foreach ($acc['items'] as $it)
+			if ($it['state'] === 'ready' && isset($it['do']['domains']))
+				foreach ($it['do']['domains'] as $d)
+					$note("mail of $d", plugin_filter('mail.ip.set', null, $d, $it['do']['kind'] === 4 ? $it['do']['address'] : '', $it['do']['kind'] === 6 ? $it['do']['address'] : ''));
+	}
+	$src = preg_replace('/[^\w .:@+-]/', '_', mb_substr((string)$source, 0, 120));
+	$log = array("Restore from $src by ".transfer_actor().': '.($results ? count($results).' change'.(count($results) === 1 ? '' : 's') : 'nothing to do'));
+	foreach ($results as $x)
+		$log[] = '  '.($x['ok'] ? 'ok  ' : 'FAIL').' '.$x['what'].': '.$x['text'];
+	foreach ($warn as $w)
+		$log[] = '  !    '.$w;
+	transfer_log_append(transfer_job_dir().'/ip-restores.log', implode("\n", $log));
+	if (preg_match('/^transfer ([a-f0-9]{16})$/', $src, $m))
+		transfer_job_log($m[1], 'IP addresses restored by '.transfer_actor().': '.(count(array_filter(array_column($results, 'ok')))).' of '.count($results).' changes made (details in ip-restores.log).');
+	route_log("transfer IP restore from $src: ".count($results).' changes');
+	$failed = count(array_filter($results, function ($x) { return !$x['ok']; }));
+	$msg = !$results ? 'Nothing to restore now.'
+	     : (count($results) - $failed).' of '.count($results).' change'.(count($results) === 1 ? '' : 's').' made.';
+	$data = array('results' => $results, 'plan' => transfer_ip_plan($rows)['data']);
+	if ($results && $failed === count($results))
+		return result_error($msg.' '.implode(' ', array_column($results, 'text')), $data);
+	return result_ok($msg, $data, $warn);
+}
+
+/* The latest restores, as text (newest last) */
+function transfer_ip_restore_log($bytes = 65536) {
+	$f = transfer_job_dir().'/ip-restores.log';
+	$size = is_file($f) ? (int)filesize($f) : 0;
+	if (!$size)
+		return '';
+	$t = (string)@file_get_contents($f, false, null, max(0, $size - $bytes));
+	return $size > $bytes ? substr($t, strpos($t, "\n") + 1) : $t;
 }

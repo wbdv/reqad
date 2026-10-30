@@ -262,26 +262,21 @@
 				<span class="set-hint mt-0">Available with the web login (<code>reqad auth mode web</code>).</span>
 <?php else: ?>
 <?php
-	/* No switch: the code follows from 2FA and the sending method. badge, class, hint */
+	/* The switch is the setting; the badge says whether the code is asked for now
+	   (it also follows 2FA and the sending method). badge, class, hint */
+	$nd_code = auth_email_code_on();
+	if (!$nd_code)
+		$nd_state = 'off';
 	$nd_status = array(
 		'active'   => array('Active', 'bg-green-lt', 'Two-factor authentication is off, so after the right password a new device must also enter a 6-digit code sent to your email. Stops someone who has your password but not your mailbox.'),
 		'2fa'      => array('Not needed', 'bg-secondary-lt', 'Two-factor authentication is on - the authenticator code already stops someone who only has your password. The email code comes back on by itself if you turn two-factor off.'),
 		'no-smtp'  => array('Waiting for email', 'bg-yellow-lt', 'Two-factor authentication is off, but the panel cannot send email yet, so new devices log in with the password only. Set up the sending method under <a href="/settings/">Settings</a> and the code is asked for from then on.'),
 		'no-email' => array('Waiting for email', 'bg-yellow-lt', 'Two-factor authentication is off, but there is no email address to send the code to. Enter it below.'),
-		'off'      => array('Off', 'bg-red-lt', 'Turned off on the server (<code>reqad auth email-code off</code>). With two-factor authentication off, a new device logs in with the password only.'),
+		'off'      => array('Off', 'bg-red-lt', 'Turned off. While two-factor authentication is off, a new device logs in with the password only. Turn on two-factor authentication, or this switch, to keep a second step.'),
 	);
 	list($nd_b, $nd_bc, $nd_hint) = $nd_status[$nd_state];
 ?>
-				<div class="d-flex align-items-center mb-1">
-					<span class="fw-medium">Email code</span>
-					<span class="badge border ms-2 <?=$nd_bc?>"><?=$nd_b?></span>
-<?php if ($nd_state === 'off'): ?>
-					<form method="post" action="/" class="ms-3">
-						<input type="hidden" name="action" value="security-email">
-						<button type="submit" name="op" value="code-on" class="btn btn-sm">Turn back on</button>
-					</form>
-<?php endif; ?>
-				</div>
+<?php $nd_switch('nd-code', $nd_code, 'Email code', 'code-on', 'code-off', array($nd_b, $nd_bc)); ?>
 				<span class="set-hint mb-3"><?=$nd_hint?></span>
 <?php $nd_switch('nd-alert', $nd_alert, 'Login alerts', 'alert-on', 'alert-off'); ?>
 				<span class="set-hint mb-3">An email after each login from a new device, with its IP address and browser.</span>

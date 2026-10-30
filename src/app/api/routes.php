@@ -257,10 +257,10 @@ function api_routes() {
 		      'mcp' => array('name' => 'php_sites', 'args' => array('account?' => 'string: The hosting account (server tokens only)', 'domain?' => 'string: Also return this site\'s PHP settings'),
 		                     'description' => 'PHP of a hosting account\'s sites (main domain and addon domains): the version each runs, the versions installed (with their end of life), and with domain the site\'s settings (memory_limit, upload_max_filesize, max_execution_time, max_input_vars, display_errors, date.timezone: the value set and the default).')),
 		array('method' => 'PATCH', 'path' => '/v1/php/{domain}', 'perm' => 'write', 'handler' => 'api_v1_php_edit',
-		      'summary' => 'Change a site\'s PHP', 'body' => 'version ("8.3"; "8.5:mod_php" / "8.3:fpm" on a mod_php server; "off" = no PHP, main domain only), settings ({"memory_limit": "512M", ...}; "" = the default)',
+		      'summary' => 'Change a site\'s PHP', 'body' => 'version ("8.3"; "8.5:mod_php" / "8.3:fpm" on a mod_php server; "off" = no PHP), settings ({"memory_limit": "512M", ...}; "" = the default)',
 		      'mcp' => array('name' => 'php_site_edit', 'args' => array(
 		          'domain' => 'string: The site: the account\'s main domain or an addon domain',
-		          'version?' => 'string: PHP version to run, one of those installed (php_sites); on a server with php_mode modphp add :mod_php (default version only) or :fpm; "off" turns PHP off (main domain only, its .php files then answer 403)',
+		          'version?' => 'string: PHP version to run, one of those installed (php_sites); on a server with php_mode modphp add :mod_php (default version only) or :fpm; "off" turns PHP off (its .php files then answer 403)',
 		          'settings?' => 'string: JSON object of settings to change, e.g. {"memory_limit":"512M","upload_max_filesize":"64M"}; "" puts one back to the default. Allowed values: memory_limit 128M/256M/512M/1G/2G, upload_max_filesize 8M-512M (also sets post_max_size), max_execution_time 30/60/120/300, max_input_vars 1000/3000/5000/10000, display_errors on/off, date.timezone a zone name'))),
 		/* an account's sites (main + addon domains, subdomains), aliases, certificates (app/functions/domains.php) */
 		array('method' => 'GET', 'path' => '/v1/domains', 'perm' => 'read', 'handler' => 'api_v1_domains',
@@ -398,13 +398,13 @@ function api_routes() {
 		array('method' => 'GET', 'path' => '/v1/backup-restores/{job}', 'perm' => 'read', 'feature' => 'backup', 'handler' => 'api_v1_backup_restore_get',
 		      'summary' => 'One restore: status (queued, running, ok, failed), what it said, where it kept what it replaced'),
 		array('method' => 'GET', 'path' => '/v1/ssl', 'perm' => 'read', 'handler' => 'api_v1_ssl',
-		      'summary' => 'The certificates of an account\'s sites: issuer, expiry, the names covered and missing (server tokens: ?account=; ?check=1 adds where each name points)',
+		      'summary' => 'The certificates of an account\'s sites: issuer, expiry, the names covered and missing, and whether it may get free ones (free_ssl) (server tokens: ?account=; ?check=1 adds where each name points)',
 		      'mcp' => array('name' => 'ssl_status', 'args' => array('account?' => 'string: The hosting account (server tokens only)', 'check?' => 'boolean: Also look up where each name points in DNS'),
-		                     'description' => 'The certificates of a hosting account\'s sites: who issued each, when it expires, the names it covers and the names of the site it does not cover yet.')),
+		                     'description' => 'The certificates of a hosting account\'s sites: who issued each, when it expires, the names it covers and the names of the site it does not cover yet. free_ssl false = its hosting package gives it no free Let\'s Encrypt certificates (ssl_issue is refused).')),
 		array('method' => 'POST', 'path' => '/v1/ssl/{domain}', 'perm' => 'write', 'handler' => 'api_v1_ssl_issue',
 		      'summary' => 'Get a free Let\'s Encrypt certificate for a site (its names that point here); it renews by itself',
 		      'mcp' => array('name' => 'ssl_issue', 'args' => array('domain' => 'string: The site: the main domain or an addon domain'),
-		                     'description' => 'Request a free Let\'s Encrypt certificate for one site of a hosting account, covering its names that already point to this server (the domain itself must). Takes up to a few minutes; renewals are automatic.')),
+		                     'description' => 'Request a free Let\'s Encrypt certificate for one site of a hosting account, covering its names that already point to this server (the domain itself must). Refused when the account\'s hosting package does not include free certificates. Takes up to a few minutes; renewals are automatic.')),
 		array('method' => 'GET', 'path' => '/v1/spam', 'perm' => 'read', 'handler' => 'api_v1_spam',
 		      'summary' => 'An account\'s spam settings: score, allow and block lists, spam to Junk (server tokens: ?account=)',
 		      'mcp' => array('name' => 'spam_settings', 'args' => array('account?' => 'string: The hosting account (server tokens only; an account token gets its own)'),
@@ -1593,7 +1593,9 @@ function api_v1_ssl(array $ctx) {
 	if ($e) return $e;
 	if (!account_get($db, $acct))
 		return api_error(404, "Account $acct not found.");
-	return result_ok('', array('sites' => ssl_sites($acct, (bool)api_bool($ctx['query'], 'check')), 'ip' => domain_site_ip($acct)));
+	$free = ssl_free_error($acct);
+	return result_ok('', array('sites' => ssl_sites($acct, (bool)api_bool($ctx['query'], 'check')), 'ip' => domain_site_ip($acct),
+	                           'free_ssl' => $free === '', 'free_ssl_note' => $free));
 }
 
 function api_v1_redirects(array $ctx) {

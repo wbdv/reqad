@@ -1,4 +1,4 @@
-#!/usr/bin/env php82
+#!/usr/bin/php82
 <?php
 /*
  * Look for WordPress installs in every account's site folders (main domain,

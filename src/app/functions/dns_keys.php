@@ -505,12 +505,18 @@ function dns_api_rrsets($zone, $sets, $patch) {
 			if ($type === 'NS' && $ct === 'REPLACE') {
 				$vals = array_map(function ($r) { return strtolower(rtrim($r['content'], '.')).'.'; }, $recs);
 				sort($vals);
-				if ($vals === $ns)
+				/* this server's name servers (a zone that named private ones goes
+				   back), or other names for them (a reseller's private ns1/ns2.<its
+				   domain>, pointing at the same addresses) */
+				if ($ns && ($vals === $ns || dns_ns_aliases($vals, $ns))) {
+					$out[] = array('name' => $n.'.', 'type' => 'NS', 'changetype' => 'REPLACE', 'ttl' => max(300, min(172800, (int)($s['ttl'] ?? 86400))),
+					               'records' => array_map(function ($v) { return array('content' => $v, 'disabled' => false); }, $vals));
 					continue;
+				}
 			}
 			return array(null, $type === 'SOA' ? "The SOA record of $zone is kept by this DNS server and can't be changed with a key."
 				: "The name servers of $zone are this DNS server's (".($ns ? implode(', ', array_map(function ($x) { return rtrim($x, '.'); }, $ns)) : 'none set yet')
-				  ."); they can't be changed with a key.");
+				  ."); a key can only set other names for them, whose A / AAAA records point at their addresses.");
 		}
 		if (isset($denied[$type]))
 			return array(null, "$type records can't be set with a DNS API key.");

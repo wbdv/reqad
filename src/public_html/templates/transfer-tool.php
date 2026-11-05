@@ -99,6 +99,7 @@ if(!$pubkey) {
       <div class="card-header">
         <h4 class="card-title">Accounts on <span id="acc-server"></span></h4>
         <div class="card-options">
+          <a href="#" id="btn-acc-zones" class="btn btn-sm btn-outline-primary me-2" title="Copy the server's DNS zones here, also those no account owns">DNS zones</a>
           <a href="#" id="btn-acc-back" class="btn btn-sm btn-outline-secondary">&#8592; Back</a>
         </div>
       </div>
@@ -132,6 +133,58 @@ if(!$pubkey) {
         </div>
         <div id="acc-error" class="alert alert-danger mt-3 mb-0" style="display:none"></div>
         <button class="btn btn-primary mt-3" id="btn-check-php" disabled>Check PHP versions</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- DNS zones on the cPanel server -->
+<div id="step-zones" style="display:none">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">
+        <h4 class="card-title">DNS zones on <span id="zn-server"></span></h4>
+        <div class="card-options">
+          <a href="#" id="btn-zn-back" class="btn btn-sm btn-outline-secondary">&#8592; Back to accounts</a>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="text-muted mb-3">Every zone on the cPanel server: those of its accounts and those no account owns (added in WHM,
+          or from a DNS cluster). Each chosen zone is made here with <strong>its records exactly as they are</strong> on cPanel,
+          addresses included; it keeps this server's SOA and name servers<span id="zn-ns"></span>. Zones already here are left as
+          they are. Nothing changes on the internet until a domain's name servers at its registrar are this server's, and nothing
+          is changed on the cPanel server.</p>
+        <div id="zn-alert" class="alert alert-danger mb-3" style="display:none"></div>
+        <div class="row g-2 mb-3 align-items-center">
+          <div class="col-md-4">
+            <input type="search" class="form-control" id="zn-filter" placeholder="Search zone or account">
+          </div>
+          <div class="col-md-3">
+            <select class="form-select" id="zn-kind">
+              <option value="">All zones</option>
+              <option value="acct">Zones of cPanel accounts</option>
+              <option value="none">Zones without an account</option>
+              <option value="here">Already on this server</option>
+            </select>
+          </div>
+          <div class="col-md-5 text-md-end text-muted" id="zn-count"></div>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm table-vcenter table-hover mb-0">
+            <thead>
+              <tr>
+                <th class="w-1"><input class="form-check-input" type="checkbox" id="zn-all" title="Select all shown"></th>
+                <th>Zone</th>
+                <th>cPanel account</th>
+                <th class="text-end">Zone file</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="zn-list"></tbody>
+          </table>
+        </div>
+        <div id="zn-error" class="alert alert-danger mt-3 mb-0" style="display:none"></div>
+        <button class="btn btn-primary mt-3" id="btn-zn-start" disabled>Copy zones</button>
       </div>
     </div>
   </div>
@@ -204,7 +257,8 @@ if(!$pubkey) {
         <p class="text-muted mb-3">Each account is made here with the <strong>same user name and password</strong>, its sites
           (addon domains, subdomains, aliases) with their PHP versions, its files, databases, mail and cron jobs, and its contact
           address (no message is sent to it; of the account's notifications only sign-ins from a new device are on). Nothing is changed on the
-          cPanel server, and <strong>DNS is not touched</strong>: the sites keep working there until their DNS points here.
+          cPanel server, and <strong>DNS is not touched</strong>: the sites keep working there until their DNS points here
+          (the zones can be copied here with <strong>DNS zones</strong> on the accounts list).
           The accounts are transferred one after the other in the background; you can close this page.</p>
         <div class="table-responsive mb-3">
           <table class="table table-sm table-vcenter mb-0">
@@ -335,10 +389,12 @@ jQuery(document).ready(function() {
 
     /* The cPanel server the page is connected to: {server, port, ruser} */
     var conn = null;
+    // what the add-ons take over from cPanel: packages (Hosting Pro), resellers (Reqad Reseller)
+    var transferCaps = <?=json_encode((object)transfer_caps())?>;
     var remoteAccounts = [];
 
     function showOnly(id) {
-        $('#step1, #step2, #step-accounts, #step-php, #step-pre, #step-plan, #step-run, #step-ips').hide();
+        $('#step1, #step2, #step-accounts, #step-zones, #step-php, #step-pre, #step-plan, #step-run, #step-ips').hide();
         $('#' + id).show();
     }
     function busy(text) {
@@ -450,6 +506,108 @@ jQuery(document).ready(function() {
     $('#btn-acc-back').click(function(e) {
         e.preventDefault();
         showOnly('step1');
+    });
+
+    // DNS zones: every zone on the cPanel server, copied here in a job
+    var remoteZones = [];
+    function fmtSize(n) {
+        n = +n || 0;
+        return n < 1024 ? n + ' B' : (n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
+    }
+    $('#btn-acc-zones').click(function(e) {
+        e.preventDefault();
+        busy('Listing the DNS zones on the cPanel server');
+        $.ajax({
+            url: '/', method: 'POST', dataType: 'json', timeout: 180000,
+            data: $.extend({ action: 'ajax-transfer-zones' }, conn),
+            success: function(d) {
+                showOnly('step-zones');
+                $('#zn-server').text(conn.server);
+                $('#zn-error').hide();
+                if(d.error) {
+                    remoteZones = [];
+                    $('#zn-list').html('');
+                    $('#zn-alert').text(d.error).show();
+                    updateZoneCount();
+                    return;
+                }
+                remoteZones = d.zones || [];
+                var alert = !d.managed ? 'This server has no DNS provider: choose one under Settings > DNS Settings before copying zones.' : (d.error || '');
+                $('#zn-alert').text(alert).toggle(!!alert);
+                $('#zn-ns').text(d.nameservers && d.nameservers.length ? ' (' + d.nameservers.join(', ') + ')' : '');
+                var users = {};
+                $.each(remoteAccounts, function(i, a) { users[a.user] = a; });
+                var rows = '';
+                $.each(remoteZones, function(i, z) {
+                    var note = '';
+                    if(z.here) note = '<span class="badge bg-secondary-lt" title="A zone of this name is on this server already: it is left as it is">here</span>';
+                    else if(!z.file) note = '<span class="badge bg-red-lt" title="Its zone file was not found in /var/named">no zone file</span>';
+                    var acct = z.account ? escHtml(z.account) + (users[z.account] && users[z.account].domain !== z.zone ? ' <span class="text-muted small">(' + escHtml(users[z.account].domain) + ')</span>' : '')
+                                         : '<span class="badge bg-blue-lt" title="No cPanel account owns this zone">no account</span>';
+                    var can = d.managed && !d.error && !z.here && !!z.file;
+                    rows += '<tr class="zn-row" data-kind="' + (z.here ? 'here' : (z.account ? 'acct' : 'none')) + '"' +
+                        ' data-text="' + escHtml((z.zone + ' ' + z.account).toLowerCase()) + '">' +
+                        '<td><input class="form-check-input zn-check" type="checkbox" id="zn-' + i + '" value="' + escHtml(z.zone) + '"' + (can ? '' : ' disabled') + '></td>' +
+                        '<td><label for="zn-' + i + '" style="cursor:pointer">' + escHtml(z.zone) + '</label></td>' +
+                        '<td>' + acct + '</td>' +
+                        '<td class="text-end text-nowrap text-muted small">' + (z.file ? fmtSize(z.size) : '') + '</td>' +
+                        '<td>' + note + '</td></tr>';
+                });
+                $('#zn-list').html(rows || '<tr><td colspan="5" class="text-muted">No DNS zones on this server.</td></tr>');
+                $('#zn-filter').val('');
+                $('#zn-kind').val('');
+                $('#zn-all').prop('checked', false);
+                filterZones();
+            },
+            error: function() {
+                showOnly('step-accounts');
+                $('#acc-error').text('Listing the DNS zones failed. Check server logs.').show();
+            }
+        });
+    });
+    function filterZones() {
+        var q = $.trim($('#zn-filter').val()).toLowerCase(), k = $('#zn-kind').val();
+        $('#zn-list .zn-row').each(function() {
+            var $r = $(this);
+            $r.toggle((!k || $r.attr('data-kind') === k) && (!q || String($r.attr('data-text')).indexOf(q) !== -1));
+        });
+        updateZoneCount();
+    }
+    function updateZoneCount() {
+        var shown = $('#zn-list .zn-row:visible').length, sel = $('.zn-check:checked').length;
+        var none = remoteZones.filter(function(z) { return !z.account; }).length;
+        var here = remoteZones.filter(function(z) { return z.here; }).length;
+        $('#zn-count').text(shown + ' of ' + remoteZones.length + ' shown (' + none + ' without an account, ' + here + ' here already), ' + sel + ' selected');
+        $('#btn-zn-start').prop('disabled', sel === 0).text(sel ? 'Copy ' + sel + ' zone' + (sel === 1 ? '' : 's') : 'Copy zones');
+        var $vis = $('#zn-list .zn-row:visible .zn-check:not(:disabled)');
+        $('#zn-all').prop('checked', $vis.length > 0 && $vis.filter(':checked').length === $vis.length);
+    }
+    $('#zn-filter').on('input', filterZones);
+    $('#zn-kind').on('change', filterZones);
+    $(document).on('change', '.zn-check', updateZoneCount);
+    $('#zn-all').on('change', function() {
+        $('#zn-list .zn-row:visible .zn-check:not(:disabled)').prop('checked', this.checked);
+        updateZoneCount();
+    });
+    $('#btn-zn-back').click(function(e) { e.preventDefault(); showOnly('step-accounts'); });
+    $('#btn-zn-start').click(function() {
+        var zones = $('.zn-check:checked').map(function() { return $(this).val(); }).get();
+        if(!zones.length) return;
+        $('#zn-error').hide();
+        $('#btn-zn-start').prop('disabled', true);
+        $.ajax({
+            url: '/', method: 'POST', dataType: 'json', timeout: 180000,
+            data: $.extend({ action: 'ajax-transfer-zones-start', zones: JSON.stringify(zones) }, conn),
+            success: function(r) {
+                $('#btn-zn-start').prop('disabled', false);
+                if(r.error) { $('#zn-error').text(r.error).show(); return; }
+                showJob(r.id);
+            },
+            error: function() {
+                $('#btn-zn-start').prop('disabled', false);
+                $('#zn-error').text('Request failed. Check server logs.').show();
+            }
+        });
     });
 
     // 2. PHP version of each site of the chosen accounts
@@ -706,18 +864,31 @@ jQuery(document).ready(function() {
             var acc = remoteAccounts.filter(function(r) { return r.user === a.user; })[0] || {};
             var c = preResult[a.user];
             var badName = !/^[a-z][a-z0-9]{1,15}$/.test(a.user);
+            // its domain on an account of the same name is that account (a transfer continued), not another one's site
+            var otherSite = acc.domain_here && acc.domain_here !== a.user ? acc.domain_here : '';
             var note = '';
             if(badName) note = '<span class="text-danger small">the user name cannot be used here</span>';
             else if(acc.user_here) note = '<span class="text-warning small">exists here: continued only if a transfer made it</span>';
-            else if(acc.domain_here) note = '<span class="text-danger small">' + escHtml(a.domain) + ' is a site of ' + escHtml(acc.domain_here) + ' here</span>';
+            else if(otherSite) note = '<span class="text-danger small">' + escHtml(a.domain) + ' is a site of ' + escHtml(otherSite) + ' here</span>';
             var check = !c ? '<span class="text-muted small">not checked</span>' :
                 (c.block ? '<span class="badge bg-red-lt">' + c.block + ' blocker' + (c.block === 1 ? '' : 's') + '</span> ' : '') +
                 (c.warn ? '<span class="badge bg-yellow-lt">' + c.warn + ' to check</span>' : '') +
                 (!c.block && !c.warn ? '<span class="badge bg-green-lt">ready</span>' : '');
-            var on = !badName && !acc.user_here && !acc.domain_here;
+            var on = !badName && !acc.user_here && !otherSite;
+            // a cPanel reseller: its privileges come along; sign-in codes of its panel go to this address
+            var rsl = '';
+            if(acc.is_reseller) {
+                rsl = ' <span class="badge bg-purple-lt" title="A reseller on cPanel">reseller</span>';
+                if(transferCaps.resellers)
+                    rsl += '<div class="plan-rsl mt-1 d-flex align-items-center gap-2"><span class="small text-muted text-nowrap">Reseller panel sign-in codes to</span>' +
+                        '<input type="email" class="form-control form-control-sm plan-rsl-email" style="max-width:260px" maxlength="254" data-user="' + escHtml(a.user) + '"' +
+                        ' value="' + escHtml(acc.email || '') + '" placeholder="office@example.com"></div>';
+                else
+                    rsl += '<div class="small text-muted mt-1">This server has no resellers (Reqad Reseller): it becomes an ordinary account.</div>';
+            }
             rows += '<tr><td><input class="form-check-input plan-check" type="checkbox" value="' + escHtml(a.user) + '"' +
-                (on ? ' checked' : '') + (badName || acc.domain_here ? ' disabled' : '') + '></td>' +
-                '<td>' + escHtml(a.domain || a.user) + ' <span class="text-muted">(' + escHtml(a.user) + ')</span></td>' +
+                (on ? ' checked' : '') + (badName || otherSite ? ' disabled' : '') + '></td>' +
+                '<td>' + escHtml(a.domain || a.user) + ' <span class="text-muted">(' + escHtml(a.user) + ')</span>' + rsl + '</td>' +
                 '<td class="text-end">' + a.sites.length + '</td>' +
                 '<td class="text-end text-nowrap">' + escHtml(acc.diskused || '') + '</td>' +
                 '<td>' + check + '</td><td>' + note + '</td></tr>';
@@ -727,6 +898,7 @@ jQuery(document).ready(function() {
         $('#plan-php').html(swaps.length ? '<span class="badge bg-blue-lt">PHP</span> <span class="small">' + swaps.join(', ') +
             ' (not installed here; change it on the PHP versions step).</span>' : '').toggle(swaps.length > 0);
         $('#plan-error').hide();
+        planRsl();
         planCount();
         showOnly('step-plan');
     });
@@ -738,6 +910,9 @@ jQuery(document).ready(function() {
         $('#btn-start').prop('disabled', n === 0).text(n ? 'Start transfer of ' + n + ' account' + (n === 1 ? '' : 's') : 'Start transfer');
     }
     $(document).on('change', '.plan-check', planCount);
+    // the reseller's address only matters when packages and resellers are taken
+    function planRsl() { $('.plan-rsl').toggleClass('d-none', !$('.plan-part[value="packages"]').prop('checked')).toggleClass('d-flex', $('.plan-part[value="packages"]').prop('checked')); }
+    $(document).on('change', '.plan-part', planRsl);
     $('#plan-all').on('change', function() {
         $('.plan-check:not(:disabled)').prop('checked', this.checked);
         planCount();
@@ -749,10 +924,18 @@ jQuery(document).ready(function() {
         var parts = $('.plan-part:checked').map(function() { return $(this).val(); }).get();
         if(!users.length) return;
         if(!parts.length) { $('#plan-error').text('Choose at least one thing to transfer.').show(); return; }
+        var takePkgs = parts.indexOf('packages') >= 0, missing = '';
         var accounts = users.map(function(u) {
             var acc = remoteAccounts.filter(function(r) { return r.user === u; })[0] || {};
-            return { user: u, domain: acc.domain || '', diskused: acc.diskused || '' };
+            var o = { user: u, domain: acc.domain || '', diskused: acc.diskused || '' };
+            if(acc.is_reseller) {
+                o.reseller = 1;
+                o.reseller_email = $.trim($('.plan-rsl-email[data-user="' + u + '"]').val() || '');
+                if(takePkgs && transferCaps.resellers && !o.reseller_email) missing = u;
+            }
+            return o;
         });
+        if(missing) { $('#plan-error').text('Reseller ' + missing + ': type the address its sign-in codes go to (its reseller panel always asks for a second step).').show(); return; }
         $('#btn-start').prop('disabled', true);
         $.ajax({
             url: '/', method: 'POST', dataType: 'json',
@@ -821,7 +1004,7 @@ jQuery(document).ready(function() {
             if(!$r.length) {
                 $('#run-list').append(
                     '<tr class="run-row" data-user="' + escHtml(a.user) + '" style="cursor:pointer">' +
-                    '<td>' + escHtml(a.domain || a.user) + ' <span class="text-muted">(' + escHtml(a.user) + ')</span></td>' +
+                    '<td>' + (a.user === '_dns' ? escHtml(a.domain) : escHtml(a.domain || a.user) + ' <span class="text-muted">(' + escHtml(a.user) + ')</span>') + '</td>' +
                     '<td class="run-st"></td><td class="run-step small"></td>' +
                     '<td class="text-end"><a href="#" class="small run-toggle">log</a></td></tr>' +
                     '<tr class="run-logrow" data-user="' + escHtml(a.user) + '" style="display:none"><td colspan="4" class="p-0">' +
@@ -904,6 +1087,7 @@ jQuery(document).ready(function() {
                     ? (j.failed ? runBadge.failed.replace('failed', 'done, ' + j.failed + ' failed') : (j.warn ? runBadge.warn : runBadge.done))
                     : (runBadge[j.status] || escHtml(j.status)));
                 var acc = j.users.slice(0, 4).join(', ') + (j.users.length > 4 ? ' +' + (j.users.length - 4) : '');
+                if(j.zones) acc += (acc ? '; ' : '') + j.zones + ' DNS zone' + (j.zones === 1 ? '' : 's');
                 rows += '<tr><td class="text-nowrap">' + escHtml(new Date(j.created * 1000).toLocaleString()) + '</td>' +
                     '<td>' + escHtml(j.server) + '</td>' +
                     '<td><span title="' + escHtml(j.users.join(', ')) + '">' + escHtml(acc) + '</span>' +
@@ -1028,11 +1212,16 @@ jQuery(document).ready(function() {
     function loadLatest() {
         $.post('/', { action: 'ajax-transfer-status', id: '', offsets: '{}' }, null, 'json').done(function(d) {
             if(!d || d.none || d.error) { $('#tf-latest').attr('style', 'display:none !important'); return; }
-            var n = d.accounts.length, ok = 0;
-            $.each(d.accounts, function(i, a) { if(a.status === 'done' || a.status === 'warn') ok++; });
+            var n = 0, ok = 0, zn = '';
+            $.each(d.accounts, function(i, a) {
+                if(a.user === '_dns') { zn = '; ' + a.domain + ': ' + (a.status === 'running' ? 'copying' : a.status); return; }
+                n++;
+                if(a.status === 'done' || a.status === 'warn') ok++;
+            });
             $('#tf-latest').removeClass('alert-info alert-secondary').addClass(d.active ? 'alert-info' : 'alert-secondary').attr('style', '')
                 .html('<div>' + (d.active ? '<strong>A transfer is running</strong>' : 'Last transfer') + ' from ' + escHtml(d.server) +
-                      ': ' + ok + ' of ' + n + ' account' + (n === 1 ? '' : 's') + ' done (' + new Date(d.created * 1000).toLocaleString() + ').</div>' +
+                      ': ' + (n ? ok + ' of ' + n + ' account' + (n === 1 ? '' : 's') + ' done' : '') + (n ? zn : zn.substr(2)) +
+                      ' (' + new Date(d.created * 1000).toLocaleString() + ').</div>' +
                       '<a href="#" class="btn btn-sm btn-outline-primary ms-auto" id="btn-latest" data-id="' + escHtml(d.id) + '">View</a>');
         });
     }

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.1.3 - Oct 30, 2026'
+VERSION='0.1.6 - Oct 30, 2026'
 
 # Merged from install-el8.sh (0.0.27) + install-el9.sh (0.0.30). One script for
 # every Enterprise Linux release; EL-specific bits are switched on ${EL} below.
@@ -20,7 +20,7 @@ NC='\033[0m' # No Color
 
 echo -ne "${YELLOW}"
 echo -e "┌──────────────────────────────────────────────────────────────────────────────┐"
-echo "│ Reqad install script version ${VERSION}                             │"
+echo "│ Reqad install script version ${VERSION}                            │"
 echo -e "└──────────────────────────────────────────────────────────────────────────────┘\n"
 echo -ne "${NC}"
 
@@ -260,10 +260,12 @@ fi
 
 #=[ ssh ]=============================================================================================================
 (dnf install -y openssh-server) >> ./install_reqad.log 2>&1
-if [ ! -f "/root/.ssh/authorized_keys" ]; then
+# Absolute paths: the installer runs from its own folder (/var/tmp/reqad-install)
+install -d -m 0700 /root/.ssh
+if [ -n "${SSH_KEY}" ] && ! grep -qxF "${SSH_KEY}" /root/.ssh/authorized_keys 2>/dev/null; then
     echo "${SSH_KEY}" >> /root/.ssh/authorized_keys
-    chmod go-rwx .ssh/authorized_keys
 fi
+[ -f /root/.ssh/authorized_keys ] && chmod 0600 /root/.ssh/authorized_keys
 
 if [ ! -f "/root/.ssh/id_rsa" ]; then
     (ssh-keygen -f /root/.ssh/id_rsa -N "") >> ./install_reqad.log 2>&1
@@ -272,18 +274,36 @@ fi
 (mkdir -p /var/log/sssd/) >> ./install_reqad.log 2>&1
 sed -i 's/#Port 22/Port '"${SSH_PORT}"'/' /etc/ssh/sshd_config
 sed -i 's/#ListenAddress 0.0.0.0/ListenAddress 0.0.0.0/' /etc/ssh/sshd_config
-sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/#PermitRootLogin yes/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/#PasswordAuthentication no/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/#UseDNS no/UseDNS no/' /etc/ssh/sshd_config
 sed -i 's/#UseDNS yes/UseDNS no/' /etc/ssh/sshd_config
 
+# Password logins go off only when root can still get in with a key: with no
+# key in authorized_keys (none given, none there before) that would lock root
+# out of SSH. ssh-keygen -l fails on a file with no valid key in it.
+if ssh-keygen -l -f /root/.ssh/authorized_keys >/dev/null 2>&1; then
+    sed -i 's/#PermitRootLogin yes/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+    sed -i 's/#PasswordAuthentication no/PasswordAuthentication no/' /etc/ssh/sshd_config
+    SSH_KEYS=1
+else
+    SSH_KEYS=0
+fi
+
 (systemctl enable sshd) >> ./install_reqad.log 2>&1
 (systemctl restart sshd) >> ./install_reqad.log 2>&1
-echo "Note: SSH port changed to ${SSH_PORT} and password authentication is disabled."
+
+# Say what sshd really does: files in /etc/ssh/sshd_config.d/ (cloud-init, the
+# OS installer's root login choice) are read first and win over sshd_config.
+SSH_PW=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
+if [ "${SSH_KEYS}" == "1" ]; then
+    echo "Note: SSH port ${SSH_PORT}, password authentication: ${SSH_PW:-unknown}."
+else
+    echo -e "${YELLOW}Note: SSH port ${SSH_PORT}. root has no SSH key in /root/.ssh/authorized_keys, so"
+    echo -e "      password authentication was left as it was (${SSH_PW:-unknown}). Add a key, then set"
+    echo -e "      PasswordAuthentication no in /etc/ssh/sshd_config.${NC}"
+fi
 
 #=[ disable ipv6 ]====================================================================================================
 #echo "net.ipv6.conf.all.disable_ipv6 = 1
@@ -436,13 +456,19 @@ fi
 
 
 #==[ reqad ]==================================================
-if ! systemctl is-active --quiet reqad; then
+# "Running" needs the package too: after the rpm is removed, the old panel nginx
+# can still be running, and systemd then calls reqad active with nothing installed.
+reqad_ok() { rpm -q --quiet reqad && systemctl is-active --quiet reqad; }
+
+if rpm -q --quiet reqad && ! systemctl is-active --quiet reqad; then
     if [ "$(systemctl list-unit-files "reqad.service" | grep "reqad.service" | awk {'print $2'})" == "enabled" ]; then
         (systemctl start reqad) >> ./install_reqad.log 2>&1
     fi
 fi
 
-if ! systemctl is-active --quiet reqad; then
+if ! reqad_ok; then
+	# A leftover panel nginx from a removed package would keep 2087 busy
+	rpm -q --quiet reqad || (systemctl stop reqad) >> ./install_reqad.log 2>&1
 
 	(dnf install -y https://rpms.remirepo.net/enterprise/remi-release-${EL}.rpm) >> ./install_reqad.log 2>&1
 	(dnf install -y https://repo.reqad.net/el${EL}/RPMS/x86_64/reqad-repo-1.0.2-1.el${EL}.noarch.rpm) >> ./install_reqad.log 2>&1
@@ -467,6 +493,8 @@ if ! systemctl is-active --quiet reqad; then
 	) >> ./install_reqad.log 2>&1
 
 	(dnf -y install reqad) >> ./install_reqad.log 2>&1
+	# A rerun over an older reqad: bring it to the newest (a no-op when it is)
+	(dnf -y upgrade reqad) >> ./install_reqad.log 2>&1
 	#echo -e "[ ${GREEN}DONE${NC} ]"
 
     (systemctl enable reqad --now) >> ./install_reqad.log 2>&1

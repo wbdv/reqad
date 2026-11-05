@@ -26,6 +26,7 @@
 	$raw     = (string)mail_config_read($which);
 	$rbls    = ($which === 'exim') ? exim_dnslists_read() : array();
 	$dead    = exim_dnslist_dead();
+	$dbl_on  = ($which === 'exim') ? exim_dbl_status($raw) : false;
 
 	/* Skip-RBL: the exemption list the blocklist checks consult first. Read
 	   from the generated file rather than from the catalogue, so the page
@@ -447,7 +448,7 @@
           </div>
           <div class="card-body" style="padding:5px;">
             <div class="mb-2">
-              <?php foreach ($list['hosts'] as $hst) { ?>
+              <?php foreach ($list['names'] as $hst) { ?>
                 <span class="badge <?=(in_array($hst, $dead, true) ? 'bg-red-lt' : 'bg-green-lt');?> me-1"><?=h($hst);?><?=(in_array($hst, $dead, true) ? ' — dead' : '');?></span>
               <?php } ?>
             </div>
@@ -456,7 +457,7 @@
               <input type="hidden" name="list" value="<?=(int)$i;?>">
               <div class="mb-3">
                 <label class="form-label">Blocklist hostnames, one per line</label>
-                <textarea class="form-control" name="hosts" rows="<?=max(4, count($list['hosts']) + 1);?>"><?=h(implode("\n", $list['hosts']));?></textarea>
+                <textarea class="form-control" name="hosts" rows="<?=max(4, count($list['names']) + 1);?>"><?=h(implode("\n", $list['names']));?></textarea>
                 <small class="form-hint">Leave empty to disable this check entirely (the condition is commented out, not deleted).</small>
               </div>
               <button type="submit" class="btn btn-primary">Save blocklist</button>
@@ -469,6 +470,30 @@
       <?php if (!$rbls) { ?>
         <div class="alert alert-info">No DNS blocklists are configured in <code><?=h($target['path']);?></code>.</div>
       <?php } ?>
+
+      <?php if ($rbls) { ?>
+      <p class="text-muted" style="margin:0 0 6px 0;">
+        Spamhaus lists only count real listings: their error answers (sent when they refuse a DNS
+        resolver) are ignored, so they never reject all mail. Spamhaus does not answer public
+        resolvers such as 8.8.8.8 or 1.1.1.1, so this server needs a resolver of its own.
+      </p>
+      <?php } ?>
+
+      <hr style="margin:22px 0 18px 0;">
+
+      <h3 style="font-weight:bold;margin-bottom:4px;">Sender domain check</h3>
+      <p class="text-muted" style="margin-bottom:10px;">
+        Refuses incoming mail when the sender's domain is on the Spamhaus Domain Block List as spam,
+        phishing, malware or botnet. It catches a spammer that moves to new IP addresses no blocklist
+        knows yet. Real sites that were hacked are not refused, and neither are bounces, your own
+        users or the trusted senders below. The sender gets a bounce that names Spamhaus.
+      </p>
+      <form method="post" action="/email-config/exim/?tab=blocklists" class="d-flex align-items-center" style="gap:12px;">
+        <input type="hidden" name="action" value="save-mail-dbl">
+        <input type="hidden" name="dbl" value="<?=$dbl_on ? 'off' : 'on';?>">
+        <span class="badge <?=$dbl_on ? 'bg-green-lt' : 'bg-secondary-lt';?>"><?=$dbl_on ? 'on' : 'off';?></span>
+        <button type="submit" class="btn <?=$dbl_on ? 'btn-outline-secondary' : 'btn-primary';?>"><?=$dbl_on ? 'Turn off' : 'Turn on';?></button>
+      </form>
 
       <hr style="margin:22px 0 18px 0;">
 

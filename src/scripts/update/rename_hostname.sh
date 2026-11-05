@@ -6,7 +6,7 @@
 # Handles: hostnamectl / /etc/hosts, nginx vhost, reqad panel vhost, apache
 # vhost, log files, monit, exim primary_hostname, exim+dovecot SNI, certbot
 # certificate for the new name, the 2083 account panel (its server block and
-# the /cpanel links), Git deploy webhooks, the Pure-FTPd certificate, motd.
+# the /cpanel links), the 2085 reseller panel, Git deploy webhooks, the Pure-FTPd certificate, motd.
 #
 # Every file it touches is copied to /root/reqad-hostname-rename-<timestamp>/ first.
 
@@ -17,6 +17,7 @@ ASSUME_YES=0
 DO_CERT=1
 DELETE_OLD_CERT=0
 NEW=""
+FROM=""
 
 usage() {
     cat <<EOF
@@ -27,6 +28,10 @@ Options:
   -y, --yes           Do not ask for confirmation
   --no-cert           Do not try to obtain a Let's Encrypt cert for the new name
   --delete-old-cert   Also run 'certbot delete' for the old hostname cert
+  --from=OLD.NAME     The name to rename from, when the system hostname was
+                      already changed by hand (hostnamectl): the config files
+                      still carry the old one. Without it, the name of the
+                      2087 panel vhost is used when it differs.
   -h, --help          This help
 EOF
 }
@@ -37,6 +42,7 @@ while [ $# -gt 0 ]; do
         -y|--yes)          ASSUME_YES=1 ;;
         --no-cert)         DO_CERT=0 ;;
         --delete-old-cert) DELETE_OLD_CERT=1 ;;
+        --from=*)          FROM="${1#--from=}" ;;
         -h|--help)         usage; exit 0 ;;
         -*)                echo "  Unknown option: $1"; usage; exit 1 ;;
         *)
@@ -71,6 +77,22 @@ if [ ${#NEW} -gt 253 ]; then
 fi
 
 OLD=$(hostname -f 2>/dev/null || hostname)
+# The hostname changed by hand (hostnamectl) leaves every config file on the
+# old name: take it from --from, else from the 2087 panel vhost's name.
+if [ -n "$FROM" ]; then
+    OLD=$(echo "$FROM" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+elif [ "$OLD" = "$NEW" ]; then
+    for f in /etc/reqad/conf.d/*.conf; do
+        [ -f "$f" ] && grep -qE '^[[:space:]]*listen[[:space:]].*2087' "$f" || continue
+        n=$(basename "$f" .conf)
+        if [ "$n" != "$NEW" ] && echo "$n" | grep -qE '^[a-z0-9-]+(\.[a-z0-9-]+)+$'; then
+            OLD="$n"
+            echo "  The system hostname is already '$NEW', but the panel vhost is still $f:"
+            echo "  renaming the config files from '$OLD'."
+        fi
+        break
+    done
+fi
 OLD_SHORT="${OLD%%.*}"
 NEW_SHORT="${NEW%%.*}"
 
@@ -386,16 +408,9 @@ else
     fi
 fi
 
-# Old renewal config
-if [ -f "/etc/letsencrypt/renewal/${OLD}.conf" ]; then
-    if [ $DELETE_OLD_CERT -eq 1 ]; then
-        echo "    deleting the old certificate for ${OLD}..."
-        run certbot delete -n --cert-name "$OLD"
-    else
-        echo "    the certificate for ${OLD} was left in place"
-        echo "    (remove it with: certbot delete --cert-name ${OLD})"
-    fi
-fi
+# The old certificate is deleted at the very end (--delete-old-cert), once
+# nothing uses it: the 2083 / 2085 setups below run nginx -t, which fails
+# while any server block still names a certificate that is gone.
 
 # Make sure the renewal config for the new name uses the right plugin
 if [ -x /usr/local/reqad/scripts/update/update_certbot_hostname.sh ]; then
@@ -465,6 +480,16 @@ else
     echo "    account panel (2083) not installed, skipping"
 fi
 
+# 2085 reseller panel: the same, its server block copied from the 2087 one.
+RSL_SETUP=/usr/local/reqad-reseller/setup/reqad-reseller-setup.sh
+RSL_CONF=/etc/reqad/conf.d/reqad-reseller.conf
+if [ -f "$RSL_CONF" ] && [ -x "$RSL_SETUP" ]; then
+    backup "$RSL_CONF"
+    rerun "reseller panel (2085)" "$RSL_SETUP" --no-firewall
+else
+    echo "    reseller panel (2085) not installed, skipping"
+fi
+
 # Git deploy webhooks: the location passes Host / SNI = the hostname.
 HOOK_SETUP=/usr/local/reqad/scripts/update/setup_deploy_webhook.sh
 HOOK_CONF=/etc/nginx/reqad-deploy-hook.conf
@@ -525,6 +550,23 @@ if [ -n "$LEFTOVERS" ]; then
 else
     echo "    none found"
 fi
+fi
+
+# Old certificate: only when no configuration names its files any more
+if [ -f "/etc/letsencrypt/renewal/${OLD}.conf" ]; then
+    USERS=$(grep -rlI "/etc/letsencrypt/live/${OLD}/" /etc 2>/dev/null \
+            | grep -vE '/letsencrypt/|\.bak|dovecot\.backup-|/reqad-hostname-rename-' | sort -u)
+    if [ $DELETE_OLD_CERT -eq 1 ] && [ -z "$USERS" ]; then
+        echo "    deleting the old certificate for ${OLD}..."
+        run certbot delete -n --cert-name "$OLD"
+    elif [ $DELETE_OLD_CERT -eq 1 ]; then
+        echo "    WARNING: the certificate for ${OLD} was NOT deleted: these files still use it"
+        echo "$USERS" | sed 's/^/      /'
+        echo "    (fix them, then: certbot delete --cert-name ${OLD})"
+    else
+        echo "    the certificate for ${OLD} was left in place"
+        echo "    (remove it with: certbot delete --cert-name ${OLD})"
+    fi
 fi
 
 echo

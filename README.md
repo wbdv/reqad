@@ -10,7 +10,7 @@
 and RHEL - manage hosting, email, DNS, SSL, WordPress and multiple PHP versions from one
 clean dashboard.
 
-cPanel-like ease without the licensing. Built for running your own domains or client sites
+Easy to use, with no license fees. Built for running your own domains or client sites
 on a single VPS, with predictable costs.
 
 ![Reqad screenshot](screenshot.jpg)
@@ -76,17 +76,46 @@ Try Reqad without installing anything - a live demo panel is available at
 
 - **OS:** Rocky Linux, AlmaLinux or RHEL 8 / 9 - a fresh, clean install
 - **Architecture:** x86_64
+- **Memory:** 1 GB RAM minimum, 2 GB or more recommended
 - **Access:** root over SSH
 - **Hostname:** a fully qualified name (e.g. `srv1.example.com`) with a DNS A record
-  pointing to the server - see [Hostname and reverse DNS](#hostname-and-reverse-dns)
-- **A reqad.com account** - free registration at [reqad.com](https://www.reqad.com/)
+  pointing to the server - see [Step 2](#step-2---hostname-and-reverse-dns)
+- **A free reqad.com account with the server's IP added** - needed before you install,
+  see [Step 1](#step-1---register-and-add-your-servers-ip)
 
 **Stack it manages:** Nginx / Apache · MariaDB · Exim / Dovecot · PHP / Roundcube ·
 PowerDNS / Cloudflare · Let's Encrypt · WordPress · Monit · CSF firewall.
 
 ## Installation
 
-### Hostname and reverse DNS
+Installing takes three steps, in this order:
+
+1. [Register and add your server's IP](#step-1---register-and-add-your-servers-ip) at reqad.com
+2. [Set the hostname and reverse DNS](#step-2---hostname-and-reverse-dns)
+3. [Run the installer](#step-3---install)
+
+### Step 1 - Register and add your server's IP
+
+> **Do this first.** Reqad is in early access and its package repository
+> (`repo.reqad.net`) only answers servers whose IP address is on the allow-list. Until
+> your server's IP is added, the install command fails and opening the `install.sh` link
+> in a browser asks you to sign in. That is expected; it is not a bug.
+
+1. **Register** a free account at [reqad.com](https://www.reqad.com/#signup) and confirm
+   your email address.
+2. **Add your server's public IP** on your [account page](https://www.reqad.com/account).
+   If you don't know the IP, run this on the server:
+
+   ```bash
+   curl -4 ifconfig.me
+   ```
+
+3. **Wait a minute or two.** The IP is allow-listed shortly after you add it; then the
+   installer can reach the repository.
+
+See [reqad.com/download](https://www.reqad.com/download) for the same steps.
+
+### Step 2 - Hostname and reverse DNS
 
 Set the server's hostname before you install. Reqad needs a fully qualified name that
 resolves in public DNS to the server's IP address: the panel is reached at that name and
@@ -110,9 +139,10 @@ and tells you what to fix. Behind NAT the name may point to a public address the
 doesn't see itself: the installer only warns about that, and the certificate for the name
 works as long as ports 80 and 443 on that address reach the server.
 
-### Install
+### Step 3 - Install
 
-One command on a fresh EL8 or EL9 server - the same command for both, it detects which
+Once your server's IP is allow-listed ([Step 1](#step-1---register-and-add-your-servers-ip)),
+run one command on a fresh EL8 or EL9 server - the same command for both, it detects which
 one you are on:
 
 ```bash
@@ -160,7 +190,7 @@ bash <(curl -sSL https://repo.reqad.net/install.sh) \
 | `--template` | `nginx_php-fpm` | Web server stack: `nginx_php-fpm` or `apache_modphp` |
 | `--php` | `8.3` | PHP version: `7.4`, `8.2`, `8.3`, `8.4` or `8.5` |
 | `--email` / `--no-email` | *off* | Install Exim, Dovecot and Roundcube |
-| `--ssh-port` | `22` | Moves SSH to another port and disables password auth |
+| `--ssh-port` | `22` | Moves SSH to another port; turns off password logins once root has an SSH key |
 | `--timezone` | *server's current* | Sets the server clock, e.g. `Europe/Bucharest` |
 | `--skip-update` | — | Skips the initial system update and package install |
 | `-y`, `--yes` | — | Runs with every default, no UI |
@@ -172,9 +202,9 @@ bash <(curl -sSL https://repo.reqad.net/install.sh) \
 > `TEMPLATE` / `PHP_VERSION` / `WITH_EMAIL` variables they used, are replaced by the
 > single `install.sh` and the options above.
 
-During early access the package repository is access-controlled: register at
-[reqad.com](https://www.reqad.com/) and send the server's public IP so it can be
-allow-listed before running the installer.
+If the installer can't download anything or asks for authorization, the server's IP is
+not allow-listed yet: check that the IP on your
+[account page](https://www.reqad.com/account) is the one `curl -4 ifconfig.me` shows.
 
 ## Premium
 
@@ -191,7 +221,8 @@ Reqad stays open source and free to self-host. A Premium subscription, per serve
 - **Other add-ons** - WireGuard VPN, Minecraft Java server
 - **Priority email support** and help with migrations and setup
 
-Premium has its own installer, which sets up the base system as above and then the
+Premium has its own installer. As with the free version, register and add the server's
+IP first ([Step 1](#step-1---register-and-add-your-servers-ip)). The installer sets up the base system as above and then the
 add-ons:
 
 ```bash

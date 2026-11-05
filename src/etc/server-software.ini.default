@@ -17,6 +17,7 @@ deployments=0
 api=0
 mcp=0
 dnscluster=0
+reseller=0
 
 [web]
 php_versions=8.3

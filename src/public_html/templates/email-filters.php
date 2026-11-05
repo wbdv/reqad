@@ -196,7 +196,7 @@
       produce a second copy).
     <?php } else { ?>
       These are the mailbox owner's own filters, stored as a Sieve script in the mailbox.
-      They are the same filters shown in <a href="/webmail/" target="_blank">Webmail</a> and in
+      They are the same filters shown in <a href="<?=h(webmail_url() ?: '/webmail/');?>" target="_blank">Webmail</a> and in
       any IMAP client that speaks ManageSieve, so a change made there appears here and vice
       versa. Reqad re-reads the script before every save.
     <?php } ?>
@@ -530,10 +530,10 @@ $(function() {
   /* What the message is tested against, using cP***'s labels so the list reads
      the same to anyone coming from there. Every entry is something the renderer
      AND the parser can round-trip; "body" and "size" are special-cased, "to,cc"
-     becomes a single Sieve header list, the rest are plain header names. */
+     and "any header" become Sieve header lists, the rest are plain header names. */
   var FIELDS = [
     ['from','From'], ['subject','Subject'], ['to','To'],
-    ['to,cc','Any Recipient'], ['cc','Cc'], ['reply-to','Reply'],
+    ['to,cc','Any Recipient'], ['any header','Any Header'], ['cc','Cc'], ['reply-to','Reply'],
     ['body','Body'], ['size','Message size'], ['list-id','List ID'],
     ['X-Spam-Status','Spam Status'], ['X-Spam-Bar','Spam Bar'],
     ['X-Spam-Score','Spam Score'], ['X-Spam-Flag','Spam Flag']

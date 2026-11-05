@@ -34,7 +34,13 @@
 #   session_limits.sh setup  [--dry-run|--apply|--remove]
 #                            server pieces + default limits for every account
 #                            without a drop-in (and refresh of 'default' ones)
+#   session_limits.sh defaults                      the server defaults changed:
+#                            rewrite the drop-ins of accounts in mode default
 #   session_limits.sh boot                          swappiness for user.slice (the unit)
+#
+# The server defaults are Settings > Default limits (settings table:
+# limits-default-cpu, -memory (MB, empty = automatic), -processes); without
+# them CPU 100%, memory a quarter of the RAM up to 2 GB, 512 processes.
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root"
@@ -44,6 +50,7 @@ fi
 DEF_CPU=100
 DEF_TASKS=512
 DEF_MEM_CAP=2048                       # MB; less on small servers (25% of RAM)
+DEF_MEM=                               # MB from the settings; empty = automatic
 LOG=/var/log/reqad/session-limits.log
 RSYSLOG_CONF=/etc/rsyslog.d/reqad-session-limits.conf
 LOGROTATE_CONF=/etc/logrotate.d/reqad-session-limits
@@ -53,11 +60,52 @@ SELF=/usr/local/reqad/scripts/session_limits.sh
 
 cgroup2() { [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ]; }
 
+# Settings > Default limits; a value out of range keeps the built-in one
+load_defaults() {
+    local name value cores
+    [ -r "$DB" ] || return 0
+    cores=$(nproc)
+    while IFS='|' read -r name value; do
+        [[ "$value" =~ ^[0-9]+$ ]] || continue
+        case "$name" in
+            limits-default-cpu)       [ "$value" -ge 5 ] && DEF_CPU=$(( value > cores * 100 ? cores * 100 : value )) ;;
+            limits-default-memory)    [ "$value" -ge 64 ] && DEF_MEM=$value ;;
+            limits-default-processes) [ "$value" -ge 16 ] && [ "$value" -le 100000 ] && DEF_TASKS=$value ;;
+        esac
+    done < <(/usr/bin/sqlite3 -init /dev/null -batch -noheader -list "$DB" \
+        "SELECT name, value FROM settings WHERE name IN ('limits-default-cpu', 'limits-default-memory', 'limits-default-processes')" 2>/dev/null)
+}
+load_defaults
+
 def_mem() {
     local total
+    [ -n "$DEF_MEM" ] && { echo "$DEF_MEM"; return; }
     # whole GB (MemTotal is a little under the RAM size), a quarter of it
     total=$(awk '/^MemTotal:/ {print int(($2 / 1024 + 512) / 1024) * 256}' /proc/meminfo)
     [ "$total" -gt 0 ] && [ "$total" -lt "$DEF_MEM_CAP" ] && echo "$total" || echo "$DEF_MEM_CAP"
+}
+
+# every hosting account in mode default (or without a drop-in) gets the
+# current defaults; prints "<changed> <kept>". $1 = dry: change nothing.
+apply_defaults() {
+    local u uid mode c n=0 kept=0 users
+    users=$(/usr/bin/sqlite3 -init /dev/null -batch -noheader -list "$DB" 'SELECT user FROM accounts ORDER BY user' 2>/dev/null)
+    for u in $users; do
+        uid=$(acct_uid "$u") || continue
+        read -r mode _ _ _ <<< "$(read_dropin "$uid")"
+        if [ "$mode" = custom ] || [ "$mode" = none ]; then
+            kept=$((kept + 1)); continue
+        fi
+        if [ "$1" = dry ]; then
+            [ "$mode" = missing ] && { echo "  $u: would get the default limits" >&2; n=$((n + 1)); }
+            continue
+        fi
+        c=$(write_dropin "$uid" "$u" default "$DEF_CPU" "$(def_mem)" "$DEF_TASKS")
+        n=$((n + c))
+    done
+    [ "$1" != dry ] && [ "$n" -gt 0 ] && systemctl daemon-reload
+    [ "$1" != dry ] && set_swappiness
+    echo "$n $kept"
 }
 
 dropin()  { echo "/etc/systemd/system/user-$1.slice.d/50-reqad-limits.conf"; }
@@ -344,27 +392,17 @@ WantedBy=multi-user.target"
     fi
 
     # 2. every hosting account: default limits unless it has its own
-    n=0; kept=0
-    users=$(/usr/bin/sqlite3 -init /dev/null -batch -noheader -list "$DB" 'SELECT user FROM accounts ORDER BY user' 2>/dev/null)
-    for u in $users; do
-        uid=$(acct_uid "$u") || continue
-        read -r mode _ _ _ <<< "$(read_dropin "$uid")"
-        if [ "$mode" = custom ] || [ "$mode" = none ]; then
-            kept=$((kept + 1)); continue
-        fi
-        if [ "$MODE" = dry ]; then
-            [ "$mode" = missing ] && { echo "  $u: would get the default limits"; n=$((n + 1)); }
-            continue
-        fi
-        c=$(write_dropin "$uid" "$u" default "$DEF_CPU" "$(def_mem)" "$DEF_TASKS")
-        n=$((n + c))
-    done
+    read -r n kept <<< "$(apply_defaults "$MODE")"   # dry-run lines go to stderr
     if [ "$MODE" = dry ]; then
         echo "Would set $n account(s); $kept with their own limits left alone. Run with --apply."
     else
-        [ "$n" -gt 0 ] && systemctl daemon-reload
         echo "session limits: $n account(s) set to the defaults, $kept with their own limits left alone"
     fi
+    ;;
+
+defaults)
+    read -r n kept <<< "$(apply_defaults apply)"
+    echo "Default session limits CPU ${DEF_CPU}%, memory $(def_mem) MB, ${DEF_TASKS} processes: $n account(s) changed, $kept with their own limits left alone"
     ;;
 
 *)

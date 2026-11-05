@@ -453,8 +453,10 @@ function database_password($dbuser, $password) {
    absent = the default), applied when a database user is created and by
    database_conn_sync() (post-install, `reqad account limits --sync-db`). */
 
+/* Settings > Default limits (limits-default-db-conn), else 30; 0 = no limit */
 function database_conn_default() {
-	return 30;
+	$v = (string)setting_get('limits-default-db-conn');
+	return ctype_digit($v) && (int)$v <= 10000 ? (int)$v : 30;
 }
 
 /* The account's limit per database user; 0 = no limit. */

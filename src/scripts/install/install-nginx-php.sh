@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION='0.0.7 - Jul 28, 2026'
+VERSION='0.0.8 - Oct 30, 2026'
 
 # Default php version
 if [ "$PHP_VERSION" == "" ]
@@ -73,6 +73,9 @@ if ! systemctl is-active --quiet nginx; then
 	    #cat /usr/local/reqad/scripts/install/config/nginx-fastcgi_params.txt > /etc/nginx/fastcgi_params
 	    cat /usr/local/reqad/scripts/install/config/nginx-hostname.txt > /etc/nginx/conf.d/${HOSTNAME}.conf
 		sed -i "s/%HOSTNAME%/${HOSTNAME}/" /etc/nginx/conf.d/${HOSTNAME}.conf
+		# The template names the hostname's Let's Encrypt certificate; when there
+		# is none (it failed earlier: port 80 or DNS) nginx would not start at all.
+		bash /usr/local/reqad/scripts/update/update_hostname_cert.sh
 	) >> ./install_reqad.log 2>&1
     (systemctl enable nginx --now) >> ./install_reqad.log 2>&1
 
@@ -80,8 +83,8 @@ if ! systemctl is-active --quiet nginx; then
         echo -ne "[ ${GREEN}OK${NC} ]"
     else
         echo -e "[ ${RED}ERROR${NC} ]"
-        systemctl status nginx
-        exit
+        systemctl status nginx --no-pager -l
+        exit 1
     fi
 else
 	if [ ! "$(grep 'brotli on' /etc/nginx/nginx.conf)" ]; then
@@ -93,6 +96,7 @@ else
 		    cat /usr/local/reqad/scripts/install/config/nginx.txt > /etc/nginx/nginx.conf
 		    cat /usr/local/reqad/scripts/install/config/nginx-hostname.txt > /etc/nginx/conf.d/${HOSTNAME}.conf
 			sed -i "s/%HOSTNAME%/${HOSTNAME}/" /etc/nginx/conf.d/${HOSTNAME}.conf
+			bash /usr/local/reqad/scripts/update/update_hostname_cert.sh
 			nginx -t
 		) >> ./install_reqad.log 2>&1
 		echo "Restarting nginx";

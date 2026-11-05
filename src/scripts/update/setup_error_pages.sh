@@ -17,10 +17,20 @@
 #   PHP-FPM down).
 #   Vhosts that already have an error_page of their own are left alone.
 #
+# Home page of a site with no files (no index page): empty.html ("This
+#   website is coming soon") instead of the 404 page (nginx) or the
+#   distribution's "HTTP Server Test Page" (Apache). Only for the home page
+#   itself; other missing paths keep the 404 page.
+#
 # Apache
 #   /etc/httpd/conf.d/00-reqad-error-pages.conf: ErrorDocument + Alias,
 #   ServerTokens Prod, ServerSignature Off. Apache cannot change the status
-#   code of an ErrorDocument, so 403 keeps its own page there.
+#   code of an ErrorDocument, so 403 keeps its own page there (and the empty
+#   site's home page answers 403, as before).
+#   The httpd package's conf.d/welcome.conf (its test page on `/`, plus
+#   /.noindex.html and /poweredby.png on every site) loads after our file and
+#   would win, so its lines are commented out - the way the file itself says
+#   to turn it off; an rpm update keeps the edited file (noreplace).
 #
 # Idempotent. Changed vhosts are backed up to /var/lib/reqad/vhost-backups/;
 # if `nginx -t` (or `httpd -t`) fails, everything is put back.
@@ -68,6 +78,12 @@ error_page 504 /reqad-error/504.html;
 location ^~ /reqad-error/ {
     internal;
     alias $PAGES/;
+    # The home page of a site with no files yet: "coming soon" instead of
+    # the 404 page. \$request_uri is still the visitor's own request here.
+    # 'last' (not 'break'): alias cannot serve a URI rewritten in place.
+    if (\$request_uri ~ "^/+(\?.*)?\$") {
+        rewrite ^/reqad-error/40[34]\.html\$ /reqad-error/empty.html last;
+    }
 }
 EOF
 )
@@ -167,14 +183,35 @@ ErrorDocument 500 /reqad-error/500.html
 ErrorDocument 502 /reqad-error/502.html
 ErrorDocument 503 /reqad-error/503.html
 ErrorDocument 504 /reqad-error/504.html
+
+# The home page of a site with no files yet (no index page): "coming soon".
+<LocationMatch "^/+\$">
+    Options -Indexes
+    ErrorDocument 403 /reqad-error/empty.html
+</LocationMatch>
 EOF
 )
     OLD_A=$(cat "$ACONF" 2>/dev/null)
-    if [ "$NEW_A" = "$OLD_A" ]; then
+
+    # The distribution's test page (see the header): comment out its lines.
+    WELCOME=/etc/httpd/conf.d/welcome.conf
+    WELCOME_ON=0
+    [ -f "$WELCOME" ] && grep -qEv '^[[:space:]]*(#|$)' "$WELCOME" && WELCOME_ON=1
+
+    if [ "$NEW_A" = "$OLD_A" ] && [ "$WELCOME_ON" = "0" ]; then
         echo "  error pages: apache already up to date"
     elif [ "$DRY" = "1" ]; then
-        echo "  error pages: would write $ACONF"
+        [ "$NEW_A" != "$OLD_A" ] && echo "  error pages: would write $ACONF"
+        [ "$WELCOME_ON" = "1" ] && echo "  error pages: would turn off $WELCOME"
     else
+        WELCOME_BAK=
+        if [ "$WELCOME_ON" = "1" ]; then
+            WELCOME_BAK=$(mktemp)
+            cp -a "$WELCOME" "$WELCOME_BAK"
+            { echo "# Turned off by Reqad (scripts/update/setup_error_pages.sh): a site with"
+              echo "# no files shows Reqad's \"coming soon\" page instead of this test page."
+              sed -E 's/^([[:space:]]*[^#[:space:]])/#\1/' "$WELCOME_BAK"; } > "$WELCOME"
+        fi
         printf '%s\n' "$NEW_A" > "$ACONF"
         if httpd -t >/dev/null 2>&1; then
             systemctl is-active --quiet httpd && systemctl reload httpd
@@ -182,8 +219,10 @@ EOF
         else
             echo "  error pages: httpd -t failed, restoring"
             if [ -n "$OLD_A" ]; then printf '%s\n' "$OLD_A" > "$ACONF"; else rm -f "$ACONF"; fi
+            [ -n "$WELCOME_BAK" ] && cp -a "$WELCOME_BAK" "$WELCOME"
             httpd -t
         fi
+        [ -n "$WELCOME_BAK" ] && rm -f "$WELCOME_BAK"
     fi
 fi
 exit 0

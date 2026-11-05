@@ -10,7 +10,9 @@
  * whose it is.
  *
  *   scope_check($scope, $type, $id)   '' = allowed, else the reason. $scope is
- *                                     null for the admin, else an account name.
+ *                                     null for the admin, an account name, or
+ *                                     'reseller:<name>' for a reseller (2085,
+ *                                     reseller tokens): the accounts it owns.
  *   scope_owns($account, $type, $id)  the rule behind it, per resource type.
  *   limit_allows($account, $resource) '' = may create one more, else the
  *                                     reason. Core allows everything; a plugin
@@ -148,6 +150,68 @@ function scope_owns($account, $type, $id) {
 	return false;
 }
 
+/* The reseller of a 'reseller:<name>' scope, '' when it is not one. Account
+   names cannot hold ':', so the two kinds of scope never mix. */
+function scope_reseller($scope) {
+	if (!is_string($scope) || strncmp($scope, 'reseller:', 9) !== 0)
+		return '';
+	$r = substr($scope, 9);
+	return valid_username($r) ? $r : '';
+}
+
+/* The account a resource belongs to, '' = none (the server's), null = no
+   quick answer for this type (scope_reseller_owns() then asks every account
+   of the reseller through scope_owns()). */
+function scope_resource_account($type, $id) {
+	global $db;
+	$id = trim((string)$id);
+	switch ($type) {
+	case 'account':
+		return account_get($db, $id) ? $id : '';
+	case 'domain':
+		return scope_domain_owner($id);
+	case 'mailbox':
+	case 'forwarder':
+		$parts = email_split($id);
+		return $parts[0] !== '' ? scope_domain_owner($parts[1]) : '';
+	case 'db':
+		return (string)database_owner($id);
+	case 'cron':
+	case 'ssh_key':
+		return account_get($db, $id) ? $id : '';
+	case 'health_item':
+		$r = health_item_get($db, $id);
+		return $r ? (string)$r['account'] : '';
+	case 'deployment':
+		$r = deploy_get($id);
+		return $r ? (string)$r['account'] : '';
+	case 'app':
+		$r = app_get($id);
+		return $r ? (string)$r['account'] : '';
+	}
+	return null;
+}
+
+/* May reseller $reseller act on the resource? Only while the add-on says it
+   is a reseller (filter 'reseller.active'; without the add-on nobody is), and
+   only on the accounts it owns - its own one included - and what is theirs. */
+function scope_reseller_owns($reseller, $type, $id) {
+	if (!isset(scope_types()[$type]) || trim((string)$id) === '')
+		return false;
+	if (plugin_filter('reseller.active', false, (string)$reseller) !== true)
+		return false;
+	$accounts = account_owned_by($reseller);
+	if (!$accounts)
+		return false;
+	$owner = scope_resource_account($type, $id);
+	if ($owner !== null)
+		return $owner !== '' && in_array($owner, $accounts, true);
+	foreach ($accounts as $a)
+		if (scope_owns($a, $type, $id))
+			return true;
+	return false;
+}
+
 /* '' when $scope may act on the resource, else why not. $scope null (or '')
    = the admin, who may act on anything. */
 function scope_check($scope, $type, $id) {
@@ -155,6 +219,13 @@ function scope_check($scope, $type, $id) {
 		return '';
 	if (!isset(scope_types()[$type]))
 		return "Unknown resource type '$type'.";
+	if (($r = scope_reseller($scope)) !== '' || strncmp((string)$scope, 'reseller:', 9) === 0) {
+		if ($r !== '' && scope_reseller_owns($r, $type, $id))
+			return '';
+		return $type === 'account'
+			? "Account '$id' does not belong to reseller $r."
+			: "'$id' does not belong to an account of reseller $r.";
+	}
 	if (scope_owns($scope, $type, $id))
 		return '';
 	if ($type === 'account')

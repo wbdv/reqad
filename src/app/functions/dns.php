@@ -347,12 +347,30 @@ function dns_record_find($account, $zone, array $sets, array $r) {
 		return array('', '', '', 'Say which record: its name, type and value.');
 	if (($why = dns_name_locked($account, $zone, $fq)) !== '')
 		return array('', '', '', "$fq cannot be changed here. $why");
-	list($values) = dns_set_of($sets, $fq, $type);
 	$want = trim((string)($r['value'] ?? ''));
-	foreach ($values as $v)
-		if ($v === $want || strtolower($v) === strtolower($want))
-			return array($fq, $type, $v, '');
+	/* a name that ends with the zone is taken as the full name, but the zone's
+	   list shows a name with the zone in it twice (a.example.com.example.com)
+	   as a.example.com (and example.com.example.com as example.com, the apex
+	   being @): so without a final dot it may also be that one */
+	$try = array($fq);
+	$typed = trim((string)($r['name'] ?? ''));
+	if ($typed !== '' && $typed !== '@' && substr($typed, -1) !== '.' && strlen($fq) + strlen($zone) < 253)
+		$try[] = $fq.'.'.$zone;
+	foreach ($try as $n) {
+		list($values) = dns_set_of($sets, $n, $type);
+		foreach ($values as $v)
+			if ($v === $want || strtolower($v) === strtolower($want))
+				return ($why = dns_name_locked($account, $zone, $n)) !== '' ? array('', '', '', "$n cannot be changed here. $why") : array($n, $type, $v, '');
+	}
 	return array('', '', '', "There is no such $type record at $fq (it may have been changed meanwhile: reload the page).");
+}
+
+/* The name left as it was in the edit dialog stays the old record's name
+   (it may hold the zone twice, see dns_record_find). */
+function dns_record_same_name(array $r, array $old, $ofq) {
+	if (strtolower(trim((string)($r['name'] ?? ''))) === strtolower(trim((string)($old['name'] ?? ''))))
+		$r['name'] = $ofq.'.';
+	return $r;
 }
 
 function dns_put_error($e) {
@@ -388,6 +406,7 @@ function dns_record_edit($account, $zone, array $old, array $r) {
 	list($ofq, $otype, $ov, $e) = dns_record_find($account, $zone, $sets, $old);
 	if ($e !== '')
 		return result_error($e);
+	$r = dns_record_same_name($r, $old, $ofq);
 	list($fq, $type, $ttl, $v, $e) = dns_record_input($account, $zone, $sets, $r, array('fqdn' => $ofq, 'type' => $otype));
 	if ($e !== '')
 		return result_error($e);

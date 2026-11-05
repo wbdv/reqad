@@ -51,8 +51,11 @@ fi
 
 # Scratch file lives in a root-only directory — /tmp is writable by every
 # hosting account, and a predictable name there is a symlink attack.
-TMPDIR_SAFE=/var/lib/reqad
-mkdir -p "$TMPDIR_SAFE" && chmod 0700 "$TMPDIR_SAFE" 2>/dev/null
+# Its own subfolder: /var/lib/reqad itself must stay 0711 (Dovecot LMTP runs
+# as the mailbox owner and has to pass through it to the Sieve scripts).
+[ -d /var/lib/reqad ] || install -d -m 0711 /var/lib/reqad
+TMPDIR_SAFE=/var/lib/reqad/cron-tmp
+install -d -m 0700 "$TMPDIR_SAFE" || exit 4
 TMPFILE=$(mktemp "$TMPDIR_SAFE/crontab.XXXXXX") || exit 4
 trap 'rm -f "$TMPFILE"' EXIT
 

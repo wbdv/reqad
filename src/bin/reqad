@@ -85,6 +85,7 @@ Commands:
   logs             A site's web server log, a day at a time: its requests and errors
   resources        CPU, memory and processes of each account, the limits it reached
   shelllog         Commands run by hosting accounts (SSH, terminal, cron, sites): on/off, list
+  ssl              Certificates of the sites: who renews each, replace free ones from elsewhere
   dns              DNS cluster health, and the zones this server's sites need (dns zones)
   transfer         cPanel transfers: the history, their logs, the IP map and restoring its addresses
   mcp              AI assistants (MCP): turn on or off, tokens, the server they connect to
@@ -100,12 +101,14 @@ Usage: {$prog} account list
        {$prog} account show   <user>
        {$prog} account create <user> <domain> [--dns] [--letsencrypt] [--email] [--www]
                                           [--quota=MB] [--php=VERSION|off] [--shell=MODE] [--package=NAME]
+                                          [--owner=RESELLER]
                                           [password option]
        {$prog} account edit   <user> [--password] [--php=VERSION[:fpm|mod_php]|off] [--email=on|off]
-                                          [--shell=full|jailed|none]
+                                          [--shell=full|jailed|none] [--contact=EMAIL|''] [--quota=MB]
        {$prog} account delete <user> [--yes]
        {$prog} account limits [<user>] [--cpu=%] [--memory=MB|G] [--processes=N] [--default|--none]
                                           [--db-connections=N|default] [--sync-db]
+       {$prog} account limits --server [--cpu=%] [--memory=MB|G|auto] [--processes=N] [--db-connections=N]
        {$prog} account can-create <user|-> <resource> [--domain=DOMAIN]
        {$prog} account perms  <user> [--fix] [--keep-root]
 
@@ -119,6 +122,8 @@ create:
                     site or app); with mod_php also 8.2:fpm
   --shell=MODE      Shell access, see edit (default: Settings > Security)
   --package=NAME    Hosting package (Reqad Hosting Pro; default: its default package)
+  --owner=RESELLER  The reseller that owns the new account (Reqad Reseller;
+                    default: the server admin)
 
 edit:
   --password        Set a new password (prompt, or --password-stdin)
@@ -129,6 +134,7 @@ edit:
                     jailed (sandbox: own home only) or none (SFTP only; cron
                     jobs still run, jailed). New accounts get the default from
                     Settings > Security unless create gets --shell too.
+  --quota=MB        Disk quota, 0 = none (only when quotas are on)
 
 limits:
   CPU, memory and processes for the account's SSH, cron and web-terminal
@@ -148,6 +154,10 @@ limits:
                     of 30); MariaDB counts per database user, not per account
   --sync-db         Apply the stored database limits again (e.g. after users
                     were made in phpMyAdmin); without <user>: every account
+  --server          The server defaults (Settings > Default limits) instead of
+                    one account: shows them, or with --cpu/--memory/--processes/
+                    --db-connections changes them for every account that follows
+                    them (--memory=auto = a quarter of the RAM, at most 2 GB)
 
 perms checks the owners and permissions of everything in the account's home:
 files of other users or of root, foreign groups, world-writable files,
@@ -207,6 +217,7 @@ function usage_email($prog) {
 Usage: {$prog} email list   [--domain=DOMAIN]
        {$prog} email create <address> [--size=SIZE] [password option]
        {$prog} email edit   <address> [--password] [--enable|--disable] [--size=SIZE]
+                            [--refuse-incoming[=TEXT]|--accept-incoming]
        {$prog} email delete <address> [--yes]
        {$prog} email sites  <account>
        {$prog} email site   <domain> on|off [--no-cert]
@@ -216,6 +227,11 @@ edit:
   --password        Set a new password (prompt, or --password-stdin)
   --disable         Block IMAP/POP3/SMTP login (mail is still delivered)
   --enable          Allow login again
+  --refuse-incoming[=TEXT]
+                    Refuse all incoming mail: senders get "550 TEXT" from
+                    their own server (default text: "This address does not
+                    accept mail."); the mailbox still logs in and sends
+  --accept-incoming Accept incoming mail again
 
 create and edit:
   --size=SIZE       Mailbox size, e.g. 500M or 2G; default = the account's
@@ -234,7 +250,7 @@ site              Turn email on or off for an addon domain or subdomain (the mai
                   sends no mail. A Let's Encrypt certificate is issued again to
                   add or drop mail.<domain> (--no-cert: leave it as it is).
 webmail-links     Every site of an account with email sends /webmail to
-                  https://<hostname>:2087/webmail/ (Settings > Webmail address,
+                  https://<hostname>:2096/webmail/ (Settings > Webmail address,
                   on by default; runs every hour). --remove takes it out of
                   every site.
 
@@ -432,6 +448,29 @@ that cannot be turned back into an address.
 HELP);
 }
 
+function usage_ssl($prog) {
+    cli_help(<<<HELP
+Usage: {$prog} ssl list  [--account=USER] [--due]
+       {$prog} ssl renew [--dry-run] [--domain=DOMAIN [--force]] [--max=N] [--quiet]
+
+list            Every site's certificate: issuer, expiry and how it renews -
+                certbot (issued here, renews by itself), auto (a free one from
+                elsewhere, e.g. copied by a transfer: replaced with Let's
+                Encrypt when fewer than 30 days are left), manual (bought:
+                renew it where it was bought). --due: only those to replace now.
+renew           Replace the free certificates from elsewhere that expire within
+                30 days with Let's Encrypt ones, so certbot renews them from
+                then on; certificates with more time left are not touched. Only
+                for domains that point here and active accounts whose package
+                gives free certificates. Cron runs it daily.
+  --dry-run     Only list what is due.
+  --domain      Just this site; --force asks now even with more than 30 days left.
+  --max         Requests a run (default 20); the rest wait for the next run.
+  --quiet       Print only what was asked for (for cron).
+
+HELP);
+}
+
 function usage_shelllog($prog) {
     cli_help(<<<HELP
 Usage: {$prog} shelllog status
@@ -470,15 +509,18 @@ Usage: {$prog} transfer list
        {$prog} transfer log        <transfer> [<account>]
        {$prog} transfer ip-map     <transfer>
        {$prog} transfer ip-restore <transfer>|<file> [--apply]
+       {$prog} transfer cpanel-files <account>...|--all [--apply]
 
 Transfers from cPanel are made on the panel's Transfer tool page; each one is
 kept with its logs in /usr/local/reqad/transfers/. <transfer> is the id that
 'list' shows (or 'latest').
 
-list            Every transfer, newest first: when, from where, its accounts, how it ended.
-show            One transfer: each account's state and its own log.
+list            Every transfer, newest first: when, from where, its accounts (and DNS
+                zones), how it ended.
+show            One transfer: each account's state and its own log. DNS zones copied
+                from the page's DNS zones list are the row _dns.
 log             The whole log of a transfer (its own, then each account's), or one
-                account's.
+                account's ('_dns' = the DNS zones' log).
 ip-map          The IP map of a transfer: the address each site had on the cPanel
                 server and the address its mail went out from, one line per site.
                 Save it ('> file') to keep it; lines can be edited or removed.
@@ -490,6 +532,18 @@ ip-restore      What restoring an IP map would do, and with --apply do it: once 
                 shared by several accounts are not given to one: every site answers
                 on every address of this server. Needs Hosting Pro. Logged in
                 /usr/local/reqad/transfers/ip-restores.log.
+cpanel-files    cPanel settings in an account's files that do not work here:
+                PHP settings naming cPanel's folders (session.save_path =
+                /var/cpanel/php/sessions/ea-php74, written by its MultiPHP INI
+                Editor) in every .user.ini and the php_* lines of every .htaccess
+                (sessions, so logins, fail), and .htaccess Options Apache does not
+                allow here (FollowSymLinks, ExecCGI, Includes, All: every page of
+                the folder gives error 500; FollowSymLinks becomes
+                SymLinksIfOwnerMatch). With --apply the lines are changed; the
+                file as it was is kept beside it as <name>.from-cpanel. Read and
+                written as the account. A transfer does this itself after copying
+                the files; this is for accounts transferred before it did.
+                --all = every account.
 
 HELP);
 }
@@ -1013,10 +1067,10 @@ function cli_spec() {
         'account' => array(
             'list'   => array('opts' => array(),                                                                          'arg' => ''),
             'show'   => array('opts' => array(),                                                                          'arg' => 'account'),
-            'create' => array('opts' => array_merge($pw, array('dns', 'letsencrypt', 'email', 'www', 'quota', 'php', 'shell', 'package')), 'arg' => ''),
-            'edit'   => array('opts' => array_merge($pw, array('php', 'email', 'shell')),                                 'arg' => 'account'),
+            'create' => array('opts' => array_merge($pw, array('dns', 'letsencrypt', 'email', 'www', 'quota', 'php', 'shell', 'package', 'owner')), 'arg' => ''),
+            'edit'   => array('opts' => array_merge($pw, array('php', 'email', 'shell', 'contact', 'quota')),                        'arg' => 'account'),
             'delete' => array('opts' => array('yes'),                                                                     'arg' => 'account'),
-            'limits' => array('opts' => array('cpu', 'memory', 'processes', 'default', 'none', 'db-connections', 'sync-db', 'quiet'), 'arg' => 'account'),
+            'limits' => array('opts' => array('cpu', 'memory', 'processes', 'default', 'none', 'db-connections', 'sync-db', 'quiet', 'server'), 'arg' => 'account'),
             'can-create' => array('opts' => array('domain'),                                                           'arg' => 'account'),
             'perms'  => array('opts' => array('fix', 'keep-root', 'quiet'),                                               'arg' => 'account'),
         ),
@@ -1129,11 +1183,16 @@ function cli_spec() {
             'log'        => array('opts' => array(),                                                                'arg' => ''),
             'ip-map'     => array('opts' => array(),                                                                'arg' => ''),
             'ip-restore' => array('opts' => array('apply'),                                                         'arg' => ''),
+            'cpanel-files' => array('opts' => array('all', 'apply'),                                                  'arg' => ''),
         ),
         'dns' => array(
             'status'   => array('opts' => array(),                                                                  'arg' => ''),
             'check'    => array('opts' => array('wait', 'registry', 'quiet'),                                       'arg' => ''),
             'zones'    => array('opts' => array('all', 'plain', 'export'),                                          'arg' => ''),
+        ),
+        'ssl' => array(
+            'list'  => array('opts' => array('account', 'due'),                                                     'arg' => ''),
+            'renew' => array('opts' => array('dry-run', 'domain', 'force', 'max', 'quiet'),                         'arg' => ''),
         ),
         'shelllog' => array(
             'status'   => array('opts' => array(),                                                                  'arg' => ''),
@@ -1155,7 +1214,7 @@ function cli_spec() {
         'email' => array(
             'list'   => array('opts' => array('domain'),                                                                  'arg' => ''),
             'create' => array('opts' => array_merge($pw, array('size')),                                                  'arg' => ''),
-            'edit'   => array('opts' => array_merge($pw, array('enable', 'disable', 'size')),                             'arg' => 'mailbox'),
+            'edit'   => array('opts' => array_merge($pw, array('enable', 'disable', 'size', 'refuse-incoming', 'accept-incoming')), 'arg' => 'mailbox'),
             'delete' => array('opts' => array('yes'),                                                                     'arg' => 'mailbox'),
             'sites'  => array('opts' => array(),                                                                          'arg' => 'account'),
             'site'   => array('opts' => array('no-cert'),                                                                 'arg' => ''),
@@ -1669,6 +1728,60 @@ function cmd_resources($prog, $sub, array $pos, array $opts) {
     }
 }
 
+/* ---- ssl ----------------------------------------------------------------- */
+
+function cmd_ssl($prog, $sub, array $pos, array $opts) {
+    cli_allow($opts, cli_opts('ssl', $sub));
+    cli_need($pos, 0, '');
+    $day = function ($t) { return $t ? date('Y-m-d', (int)$t) : '-'; };
+    switch ($sub) {
+    case 'list':
+        $acct = isset($opts['account']) ? (string)$opts['account'] : '';
+        global $db;
+        if ($acct !== '' && !account_get($db, $acct))
+            cli_die("No hosting account '$acct'.", 1);
+        $rows = array();
+        foreach (ssl_renew_sites($acct) as $s) {
+            if (!empty($opts['due']) && !$s['due'])
+                continue;
+            $c = $s['cert'];
+            $how = array('certbot' => 'certbot', 'auto' => 'auto (Let\'s Encrypt)', 'manual' => 'manual', '' => '-')[$s['kind']];
+            $note = $s['error'] !== '' ? 'failed '.$day($s['tried']).': '.$s['error'] : (!$s['active'] ? 'account suspended' : '');
+            $rows[] = array('domain' => $s['domain'], 'account' => $s['account'],
+                            'issuer' => !$c ? '(none)' : ($c['self_signed'] ? '(self-signed)' : $c['issuer']),
+                            'until' => $c ? $day($c['until']).($c['expired'] ? ' EXPIRED' : '') : '-', 'days' => $c ? $s['days'] : '',
+                            'renew' => $how, 'renew_at' => $s['renew_at'] ? $day($s['renew_at']) : '', 'due' => $s['due'],
+                            'note' => mb_strimwidth($note, 0, 70, '…'), 'error' => $s['error']);
+        }
+        cli_list($rows, $opts, array('DOMAIN' => 'domain', 'ACCOUNT' => 'account', 'ISSUER' => 'issuer', 'UNTIL' => 'until',
+                                     'DAYS' => 'days', 'RENEWS' => 'renew', 'FROM' => 'renew_at', 'NOTE' => 'note'));
+
+    case 'renew':
+        $r = ssl_renew_run(array('dry_run' => !empty($opts['dry-run']), 'domain' => $opts['domain'] ?? '',
+                                 'force' => !empty($opts['force']), 'max' => $opts['max'] ?? 20));
+        if (!empty($opts['json']) || !$r['ok'])
+            cli_result($r, $opts);
+        $sites = $r['data']['sites'];
+        if (!empty($opts['quiet'])) {
+            foreach ($sites as $x)
+                echo date('Y-m-d H:i').' '.$x['domain'].' ('.$x['issuer'].', until '.$day($x['until']).'): '.$x['result']
+                    .($x['message'] !== '' ? ' - '.$x['message'] : '')."\n";
+            exit(0);
+        }
+        $rows = array();
+        foreach ($sites as $x)
+            $rows[] = array('d' => $x['domain'], 'a' => $x['account'], 'i' => $x['issuer'], 'u' => $day($x['until']),
+                            'r' => $x['result'], 'm' => mb_strimwidth(preg_replace('/\s+/', ' ', $x['message']), 0, 90, '…'));
+        if ($rows)
+            cli_table($rows, array('DOMAIN' => 'd', 'ACCOUNT' => 'a', 'ISSUER' => 'i', 'UNTIL' => 'u', 'RESULT' => 'r', 'MESSAGE' => 'm'));
+        echo ($rows ? $r['message'] : 'Nothing is due: no free certificate from elsewhere expires within '.ssl_renew_days().' days.')."\n";
+        exit(0);
+
+    default:
+        cli_die("unknown ssl command '$sub'; see '$prog ssl --help'");
+    }
+}
+
 /* ---- shelllog ------------------------------------------------------------ */
 
 function cmd_shelllog($prog, $sub, array $pos, array $opts) {
@@ -1784,8 +1897,8 @@ function cmd_transfer($prog, $sub, array $pos, array $opts) {
         printf("%-16s  %-16s  %-28s  %-9s  %-24s  %s\n", 'TRANSFER', 'STARTED', 'FROM', 'STATUS', 'RESULT', 'ACCOUNTS');
         foreach ($l as $j)
             printf("%-16s  %-16s  %-28s  %-9s  %-24s  %s\n", $j['id'], $when($j['created']), $j['server'], $j['active'] ? 'running' : $j['status'],
-                   ($j['done'] + $j['warn']).'/'.$j['accounts'].' done'.($j['warn'] ? ", {$j['warn']} to check" : '').($j['failed'] ? ", {$j['failed']} failed" : ''),
-                   implode(' ', $j['users']));
+                   ($j['done'] + $j['warn']).'/'.($j['accounts'] + ($j['zones'] ? 1 : 0)).' done'.($j['warn'] ? ", {$j['warn']} to check" : '').($j['failed'] ? ", {$j['failed']} failed" : ''),
+                   implode(' ', $j['users']).($j['zones'] ? ($j['users'] ? ' + ' : '').$j['zones'].' DNS zone'.($j['zones'] === 1 ? '' : 's') : ''));
         exit(0);
     case 'show':
         cli_need($pos, 1, '<transfer>');
@@ -1864,6 +1977,42 @@ function cmd_transfer($prog, $sub, array $pos, array $opts) {
             .($c['taken'] ? ", {$c['taken']} given to another account" : '').($c['warn'] ? ", {$c['warn']} to look at" : '').'.'
             .($c['ready'] && $p['hosting'] ? " Run again with --apply to restore." : '')."\n";
         exit(0);
+    case 'cpanel-files':
+        $users = !empty($opts['all']) ? array_column(account_list($GLOBALS['db']), 'user') : $pos;
+        if (!$users)
+            cli_result(result_error("Name the accounts, or --all."), $opts);
+        $fix = !empty($opts['apply']);
+        $all = array();
+        $found = $fixed = $failed = 0;
+        foreach ($users as $u) {
+            if (!account_get($GLOBALS['db'], $u))
+                cli_result(result_error("There is no account '$u'."), $opts);
+            $r = transfer_cpanel_paths($u, $fix);
+            $all[$u] = $r['ok'] ? $r['data'] : array('error' => $r['error']);
+            if ($json)
+                continue;
+            if (!$r['ok']) {
+                echo "$u: {$r['error']}\n";
+                $failed++;
+                continue;
+            }
+            foreach ($r['data']['files'] as $x) {
+                $found++;
+                $state = $x['fixed'] ? 'fixed ' : ($fix ? 'FAIL  ' : 'found ');
+                $x['fixed'] && $fixed++;
+                ($fix && !$x['fixed']) && $failed++;
+                echo $state.$u.'  ~/'.$x['path'].($x['error'] !== '' ? '  ('.$x['error'].')' : '')."\n";
+                foreach ($x['lines'] as $l)
+                    echo '        '.$l."\n";
+            }
+            if (!$r['data']['complete'])
+                echo "$u: more than 30,000 folders, only the first were looked at.\n";
+        }
+        if ($json)
+            cli_result(result_ok('', $all), $opts);
+        echo "\n".count($users).' account'.(count($users) === 1 ? '' : 's').": $found file".($found === 1 ? '' : 's').' with cPanel settings that do not work here'
+            .($fix ? ", $fixed fixed".($failed ? ", $failed failed" : '') : '').'.'.(!$fix && $found ? ' Run again with --apply to change them.' : '')."\n";
+        exit($failed ? 1 : 0);
     }
     usage_transfer($prog);
     exit(2);
@@ -2272,7 +2421,18 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
             foreach ($rows as &$r) unset($r['email_flag']);
             unset($r);
         }
-        cli_list($rows, $opts, array('UID' => 'id', 'USER' => 'user', 'DOMAIN' => 'domain', 'EMAIL' => 'email_flag', 'STATUS' => 'status', 'CREATED' => 'created_at'));
+        $cols = array('UID' => 'id', 'USER' => 'user', 'DOMAIN' => 'domain', 'EMAIL' => 'email_flag', 'STATUS' => 'status', 'CREATED' => 'created_at');
+        /* the owner column only once a reseller owns something */
+        if (array_filter(array_column($rows, 'owner'))) {
+            foreach ($rows as &$r) $r['owner_col'] = $r['owner'] === '' ? '-' : $r['owner'];
+            unset($r);
+            if (empty($opts['json']))
+                $cols = array_slice($cols, 0, 3, true) + array('OWNER' => 'owner_col') + array_slice($cols, 3, null, true);
+            else
+                foreach ($rows as &$r) unset($r['owner_col']);
+            unset($r);
+        }
+        cli_list($rows, $opts, $cols);
 
     case 'show':
         cli_allow($opts, cli_opts('account', 'show'));
@@ -2320,6 +2480,7 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
             'shell' => isset($opts['shell']) && is_string($opts['shell']) ? $opts['shell'] : '',
             'php'   => isset($opts['php']) && is_string($opts['php']) ? $opts['php'] : '',
             'package' => isset($opts['package']) && is_string($opts['package']) ? $opts['package'] : '',
+            'owner' => isset($opts['owner']) && is_string($opts['owner']) ? $opts['owner'] : '',
         ));
         cli_result($r, $opts, $gen ? $pw : null);
 
@@ -2341,6 +2502,14 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
         if (isset($opts['shell'])) {
             if (!in_array($opts['shell'], array('full', 'jailed', 'none'), true)) cli_die("--shell must be full, jailed or none");
             $o['shell'] = $opts['shell'];
+        }
+        if (isset($opts['contact'])) {
+            if ($opts['contact'] === true) cli_die("--contact needs an email address, or --contact='' to remove it");
+            $o['contact'] = $opts['contact'];
+        }
+        if (isset($opts['quota'])) {
+            if ($opts['quota'] === true) cli_die("--quota needs a size in MB, 0 = none");
+            $o['disk_quota'] = $opts['quota'];
         }
         if (count($o) == 1)
             cli_die("nothing to change; see '$prog account --help'");
@@ -2384,6 +2553,37 @@ function cmd_account($prog, $sub, array $pos, array $opts) {
 
     case 'limits':
         cli_allow($opts, cli_opts('account', 'limits'));
+        if (!empty($opts['server'])) {
+            if ($pos)
+                cli_die("--server sets the server defaults; it takes no <user>");
+            $d = limits_defaults();
+            $set = array_intersect_key($opts, array_flip(array('cpu', 'memory', 'processes', 'db-connections')));
+            if (!$set) {
+                if (!empty($opts['json']))
+                    cli_result(result_ok('', $d), $opts);
+                $use = limits_defaults_usage();
+                printf("%-13s CPU %d%%, memory %s, %d processes (%d of %d accounts follow them)\n", 'sessions:', $d['cpu'],
+                    $d['memory_mb'] ? $d['memory_mb'].' MB' : 'automatic ('.$d['memory_effective_mb'].' MB)', $d['processes'], $use['session'], $use['accounts']);
+                printf("%-13s %s (%d of %d accounts follow it)\n", 'databases:',
+                    $d['db_conn'] ? $d['db_conn'].' connections per database user' : 'no connection limit', $use['db'], $use['accounts']);
+                exit(0);
+            }
+            $v = array('cpu' => $d['cpu'], 'memory' => $d['memory_mb'], 'processes' => $d['processes'], 'db-connections' => $d['db_conn']);
+            foreach ($set as $k => $val) {
+                $val = is_string($val) ? strtoupper(trim($val)) : '';
+                if ($k === 'memory' && $val === 'AUTO')
+                    $v[$k] = 0;
+                else if ($k === 'memory' && preg_match('/^([0-9]+(?:\.[0-9]+)?)(G|GB|M|MB)?$/', $val, $m))
+                    $v[$k] = (int)round($m[1] * (isset($m[2]) && $m[2][0] === 'G' ? 1024 : 1));
+                else if ($k === 'cpu' && preg_match('/^([0-9]+)%?$/', $val, $m))
+                    $v[$k] = (int)$m[1];
+                else if (($k === 'processes' || $k === 'db-connections') && ctype_digit($val))
+                    $v[$k] = (int)$val;
+                else
+                    cli_die("--$k: bad value '".(is_string($opts[$k]) ? $opts[$k] : '')."'");
+            }
+            cli_result(limits_defaults_set($v['cpu'], $v['memory'], $v['processes'], $v['db-connections']), $opts);
+        }
         if (!empty($opts['sync-db'])) {
             $r = database_conn_sync($pos ? $pos[0] : '');
             if (!empty($opts['quiet']) && $r['ok'] && empty($opts['json'])) exit(0);
@@ -2582,7 +2782,7 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
         $on = !$remove && webmail_link_enabled();
         cli_result(result_ok(!$on ? 'No site sends /webmail here'.($remove ? ' now.' : ' (email is off, or the setting webmail-link is 0).')
                                   : (webmail_link_host() === '' ? 'The server has no usable hostname (hostname -f), so no site sends /webmail here.'
-                                                                : 'Every site of an account with email sends /webmail to https://'.webmail_link_host().':2087/webmail/.'),
+                                                                : 'Every site of an account with email sends /webmail to '.webmail_url().'.'),
             array('on' => $on), $warn), $opts);
     }
     if (!feature_enabled($ini, 'email'))
@@ -2595,7 +2795,7 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
         if (cli_scope() !== null)
             $rows = array_values(array_filter($rows, function ($r) { return scope_owns(cli_scope(), 'mailbox', $r['email']); }));
         if (empty($opts['json'])) {
-            foreach ($rows as &$r) $r['enabled'] = $r['enabled'] ? 'active' : 'disabled';
+            foreach ($rows as &$r) $r['enabled'] = ($r['enabled'] ? 'active' : 'disabled').($r['refuse_incoming'] ? ', refuses mail' : '');
             unset($r);
         }
         cli_list($rows, $opts, array('EMAIL' => 'email', 'SYSTEM USER' => 'account', 'STATUS' => 'enabled'));
@@ -2620,6 +2820,14 @@ function cmd_email($prog, $sub, array $pos, array $opts) {
         if (!empty($opts['disable'])) $o['enabled'] = false;
         if (isset($opts['size']))
             $o['size'] = is_string($opts['size']) && $opts['size'] !== '' ? $opts['size'] : cli_die('--size needs a value (--size=500M or --size=default)');
+        if (isset($opts['refuse-incoming']) && !empty($opts['accept-incoming']))
+            cli_die("--refuse-incoming and --accept-incoming are mutually exclusive");
+        if (isset($opts['refuse-incoming'])) {
+            $o['refuse_incoming'] = true;
+            if (is_string($opts['refuse-incoming']))
+                $o['refuse_message'] = $opts['refuse-incoming'];
+        }
+        if (!empty($opts['accept-incoming'])) $o['refuse_incoming'] = false;
         if (isset($opts['password']) || isset($opts['password-stdin']) || isset($opts['generate-password']))
             list($o['password'], $gen) = cli_password($opts, 'mailbox');
         if (count($o) == 1)
@@ -3786,6 +3994,7 @@ switch ($arg) {
     case 'logs':
     case 'resources':
     case 'shelllog':
+    case 'ssl':
     case 'dns':
     case 'transfer':
         break;

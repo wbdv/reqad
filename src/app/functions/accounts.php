@@ -123,9 +123,11 @@ function account_get($db, $user = '', $domain = '') {
 /* All accounts, ordered by username. */
 function account_list($db) {
 	$rows = array();
+	$owners = account_owners();
 	$res  = $db->query('SELECT id, user, domain, disk_usage, disk_quota, has_email, status, created_at FROM accounts ORDER BY user');
 	while ($res && ($row = $res->fetchArray(SQLITE3_ASSOC))) {
 		$row['has_email'] = ($row['has_email'] === 'true' || $row['has_email'] == 1);
+		$row['owner'] = $owners[$row['user']] ?? '';   /* '' = the server admin's */
 		$rows[] = $row;
 	}
 	return $rows;
@@ -141,6 +143,8 @@ function account_info($db, $user) {
 	$data = array(
 		'uid' => $row['id'], 'user' => $row['user'], 'domain' => $row['domain'],
 		'status' => $row['status'], 'created_at' => $row['created_at'],
+		'owner' => account_owner($row['user']),
+		'contact' => function_exists('auth_ready') && auth_ready() ? account_contact($row['user']) : '',
 		'email' => ($row['has_email'] === 'true' || $row['has_email'] == 1),
 		'disk_usage' => $row['disk_usage'], 'disk_quota' => $row['disk_quota'],
 		'php' => $php, 'php_handler' => $handler, 'shell' => account_shell_get($row['user']),
@@ -284,6 +288,9 @@ function account_email_disable($domain, $user) {
  *   www          bool  add the www.<domain> alias
  *   php, shell   '' = the server defaults
  *   package      hosting package name (the Hosting Pro plugin); '' = its default
+ *   owner        reseller that will own the account ('' = the server admin);
+ *                the reseller add-on checks it ('account.owner.check') and its
+ *                limits before anything is made
  *   ssl_msg_token  web only: message-queue token the background certificate
  *                  job posts its result to (the accounts page polls it)
  *
@@ -313,7 +320,16 @@ function account_create($db, array $o) {
 	$limit = isset($ini['accounts']) ? (int)$ini['accounts'] : 0;
 	if ($limit > 0 && count(account_list($db)) >= $limit)
 		return result_error("Account limit reached ($limit), see 'accounts' in etc/server-software.ini.");
-	if (($e = limit_allows('', 'account', array('user' => $user, 'domain' => $domain))) !== '')
+	$owner = trim((string)($o['owner'] ?? ''));
+	if ($owner !== '') {
+		if (!valid_username($owner) || !account_get($db, $owner))
+			return result_error("There is no hosting account '$owner' to own the new account.");
+		if (!account_owners_ready())
+			return result_error('Accounts cannot have an owner yet: database update 1056 has not run.');
+		if (($e = account_owner_error($owner, $user)) !== '')
+			return result_error($e);
+	}
+	if (($e = limit_allows('', 'account', array('user' => $user, 'domain' => $domain, 'owner' => $owner))) !== '')
 		return result_error($e);
 	/* a hosting package (plugin) checks the one asked for; without the plugin
 	   there are no packages to ask for */
@@ -389,7 +405,18 @@ function account_create($db, array $o) {
 	$stmt->bindValue(':domain', $domain, SQLITE3_TEXT);
 	$stmt->bindValue(':quota', $disk_quota, SQLITE3_INTEGER);
 	$stmt->bindValue(':email', $has_email ? 1 : 0, SQLITE3_INTEGER);
-	$stmt->execute();
+	/* a busy database must not leave a system user with no account (every
+	   later step would say "there is no account"): it was made just above,
+	   with an empty home, so it is taken back */
+	$saved = @$stmt->execute();
+	$e = $db->lastErrorMsg();
+	if (!$saved || !account_get($db, $user)) {
+		shell_exec('sudo userdel -r '.escapeshellarg($user).' 2>&1');
+		route_log("create account $user: not saved ($e), system user removed");
+		return result_error("The account was not saved in the panel's database ($e); nothing was made. Try again.");
+	}
+	if ($owner !== '')
+		account_owner_write($user, $owner);
 
 	/* Seed the www alias when requested, and pass the alias list to the vhost
 	   template so the initial server_name matches (empty = no www). */
@@ -443,10 +470,10 @@ function account_create($db, array $o) {
 	if ($ssl_started)
 		$message .= " Please wait one minute until Let's Encrypt Certificate will be installed.";
 
-	plugin_hook('account.created', array('user' => $user, 'domain' => $domain, 'uid' => $uid, 'package' => $package));
+	plugin_hook('account.created', array('user' => $user, 'domain' => $domain, 'uid' => $uid, 'package' => $package, 'owner' => $owner));
 	return result_ok($message, array(
 		'uid' => $uid, 'user' => $user, 'domain' => $domain, 'disk_quota' => $disk_quota,
-		'email' => $has_email, 'www' => $create_www, 'letsencrypt_started' => $ssl_started,
+		'email' => $has_email, 'www' => $create_www, 'letsencrypt_started' => $ssl_started, 'owner' => $owner,
 		'php' => implode(':', account_php($domain)), 'shell' => account_shell_get($user),
 	), $warnings);
 }
@@ -629,6 +656,14 @@ function nginx_backend_root() {
     # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
     location ~ /\. {
         deny all;
+    }
+    # An ACME client other than certbot (certbot adds its own challenge location)
+    # needs /.well-known/: use this line instead of the block above
+    # location ~ /\.(?!well-known/) { deny all; }
+
+    # Instruction files of AI coding assistants (CLAUDE.md, AGENTS.md, GEMINI.md)
+    location ~* /(claude[^/]*|agents|gemini)\.md$ {
+        return 404;
     }
 
     # Deny access to any files with a .php extension in the uploads directory
@@ -1412,6 +1447,9 @@ function account_switch_php($domain, $user, $old_version, $old_handler, $new_ver
  *   password   new system password ('' or absent = unchanged)
  *   php        "8.2" or "8.2:fpm" / "8.2:mod_php" (Apache), or "off" to disable PHP
  *   email      bool -- enable / disable mail for the domain
+ *   contact    the account's contact address (account_contact_set(): stored as
+ *              confirmed), '' removes it, absent = unchanged
+ *   disk_quota MB, 0 = unlimited; refused when quota is off in the ini
  */
 function account_edit($db, array $o) {
 	global $ini;
@@ -1434,6 +1472,19 @@ function account_edit($db, array $o) {
 	$want_shell = isset($o['shell']) ? trim((string)$o['shell']) : '';
 	if ($want_shell !== '' && !isset(account_shell_modes()[$want_shell]))
 		return result_error(account_shell_mode_error($want_shell));
+	/* the contact address: null / not given = leave it, '' = remove */
+	$contact = isset($o['contact']) && is_string($o['contact']) ? strtolower(trim($o['contact'])) : null;
+	if ($contact !== null && ($e = account_contact_error($contact)) !== '')
+		return result_error($e);
+	/* the disk quota: null / not given = leave it */
+	$quota = null;
+	if (isset($o['disk_quota']) && $o['disk_quota'] !== '') {
+		if (empty($ini['quota']))
+			return result_error('Disk quotas are off on this server (quota=0 in server-software.ini).');
+		if (!preg_match('/^\d{1,9}$/', (string)$o['disk_quota']))
+			return result_error('The disk quota must be a number of MB, 0 for none.');
+		$quota = (int)$o['disk_quota'];
+	}
 	/* a hosting package (plugin) checks the one asked for, before anything changes */
 	$package = trim((string)($o['package'] ?? ''));
 	$e = plugin_filter('account.edit.check', $package !== '' ? 'Hosting packages need the Reqad Hosting Pro add-on.' : '', $o);
@@ -1551,6 +1602,20 @@ function account_edit($db, array $o) {
 		else          $warnings[] = $r['error'];
 	}
 
+	if ($contact !== null) {
+		$r = account_contact_set($user, $contact);
+		if (!$r['ok'])                 $warnings[] = $r['error'];
+		elseif (!empty($r['changed'])) $changes[] = 'contact';
+	}
+
+	if ($quota !== null && $quota !== (int)$row['disk_quota']) {
+		$stmt = $db->prepare('UPDATE accounts SET disk_quota = :q WHERE user = :u');
+		$stmt->bindValue(':q', $quota, SQLITE3_INTEGER);
+		$stmt->bindValue(':u', $user, SQLITE3_TEXT);
+		if ($stmt->execute()) $changes[] = 'disk quota '.($quota ? $quota.' MB' : 'none');
+		else                  $warnings[] = 'The disk quota was not saved: '.$db->lastErrorMsg();
+	}
+
 	/* plugins apply theirs last (hosting package: its shell wins over the one above) */
 	$more = plugin_filter('account.edit.apply', array('changes' => array(), 'warnings' => array()), $user, $o);
 	if (is_array($more)) {
@@ -1602,6 +1667,7 @@ function account_delete($db, $user) {
 		}
 	/* its addon domains first: their vhosts and php-fpm pools name the user,
 	   and a pool whose user is gone stops php-fpm from starting */
+	$addons_gone = array();
 	foreach (addon_domain_list($ini) as $addon)
 		if ($addon['user'] === $user) {
 			/* its mail (mailboxes included: the account and its files go) */
@@ -1611,8 +1677,10 @@ function account_delete($db, $user) {
 			exec('sudo '._PATH.'/scripts/deldomain --domain='.escapeshellarg($addon['domain']).' 2>&1', $out, $rc);
 			if ($rc !== 0)
 				$warnings[] = 'Addon domain '.$addon['domain'].' could not be removed: '.trim(implode(' ', array_slice($out, -2)));
-			else
+			else {
 				wp_cache_rules_forget($addon['domain']);
+				$addons_gone[] = $addon['domain'];
+			}
 			$out = array();
 		}
 	domain_mail_forget('', $user);
@@ -1624,6 +1692,10 @@ function account_delete($db, $user) {
 	/* aliases.alias is UNIQUE: a leftover row made re-creating the same domain
 	   with its www alias silently skip the alias insert. */
 	$db->exec('DELETE FROM aliases WHERE account_id='.(int)$row['id']);
+	/* the addon domains' own zones, now that none of its names is listed */
+	foreach ($addons_gone as $d)
+		if (($e = domain_dns_forget($user, $d)['error']) !== '')
+			$warnings[] = "The DNS zone of $d was not removed: $e";
 	$db->exec("DELETE FROM settings WHERE name = 'db-conn-limit-".$db->escapeString($user)."'");
 
 	$output = '';
@@ -1701,6 +1773,12 @@ function account_delete($db, $user) {
 		$stmt->execute();
 	}
 	backup_exclude_forget($user);
+	/* its owner row; accounts it owned as a reseller go back to the server admin */
+	$orphans = array_values(array_diff(account_owned_by($user), array($user)));
+	account_owner_forget($user);
+	if ($orphans)
+		$warnings[] = count($orphans).' account'.(count($orphans) == 1 ? '' : 's').' that reseller '.$user.' owned now belong'
+			.(count($orphans) == 1 ? 's' : '').' to the server admin: '.implode(', ', $orphans).'.';
 	/* its Git deployments (the files went with the home directory) */
 	if (function_exists('deploy_list'))
 		foreach (deploy_list($user) as $dep)
@@ -1711,17 +1789,240 @@ function account_delete($db, $user) {
 			.' assigned to '.$user.' '.(count($released_dbs) > 1 ? 'were' : 'was').' kept and '
 			.(count($released_dbs) > 1 ? 'are' : 'is').' now unassigned.';
 
-	plugin_hook('account.deleted', array('user' => $user, 'domain' => $domain));
+	plugin_hook('account.deleted', array('user' => $user, 'domain' => $domain, 'owned' => $orphans));
 	return result_ok("Account $user successfully removed.", array(
 		'user' => $user, 'domain' => $domain, 'databases_dropped' => $dropped_dbs,
 		'databases_released' => $released_dbs,
 	), $warnings);
 }
 
+/* ---- account owners (resellers, db 1056) ----------------------------------
+   No row in account_owners = the server admin's account. A reseller's own
+   account owns itself, so it counts in the reseller's limits like the rest.
+   Who may own accounts (and how many) is the reseller add-on's answer through
+   the filter 'account.owner.check'; without the add-on nobody but the admin
+   owns accounts. Scope rule for resellers: scope_reseller_owns(). */
+
+function account_owners_ready() {
+	global $db;
+	static $ok = null;
+	if ($ok === null)
+		$ok = $db instanceof SQLite3
+			&& (bool)$db->querySingle("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'account_owners'");
+	return $ok;
+}
+
+/* user => owner, for every account a reseller owns (one query). */
+function account_owners() {
+	global $db;
+	$out = array();
+	if (!account_owners_ready())
+		return $out;
+	$res = $db->query('SELECT user, owner FROM account_owners');
+	while ($res && ($r = $res->fetchArray(SQLITE3_ASSOC)))
+		$out[$r['user']] = $r['owner'];
+	return $out;
+}
+
+/* The reseller that owns $user, '' = the server admin. */
+function account_owner($user) {
+	global $db;
+	if (!account_owners_ready() || !valid_username((string)$user))
+		return '';
+	$stmt = $db->prepare('SELECT owner FROM account_owners WHERE user = :u');
+	$stmt->bindValue(':u', (string)$user, SQLITE3_TEXT);
+	$res = $stmt->execute();
+	$r = $res ? $res->fetchArray(SQLITE3_ASSOC) : false;
+	return $r ? (string)$r['owner'] : '';
+}
+
+/* The accounts $owner owns, its own included, by name. */
+function account_owned_by($owner) {
+	global $db;
+	$out = array();
+	if (!account_owners_ready() || !valid_username((string)$owner))
+		return $out;
+	$stmt = $db->prepare('SELECT o.user FROM account_owners o JOIN accounts a ON a.user = o.user WHERE o.owner = :o ORDER BY o.user');
+	$stmt->bindValue(':o', (string)$owner, SQLITE3_TEXT);
+	$res = $stmt->execute();
+	while ($res && ($r = $res->fetchArray(SQLITE3_ASSOC)))
+		$out[] = $r['user'];
+	return $out;
+}
+
+/* '' when $owner may own $user (an existing account, or one about to be
+   made), else why not. The add-on answers; without it only the admin owns. */
+function account_owner_error($owner, $user) {
+	if ($owner === '')
+		return '';
+	$e = plugin_filter('account.owner.check', "$owner is not a reseller: accounts can only be given to a reseller (Reqad Reseller add-on).", $owner, $user);
+	return is_string($e) ? $e : "$owner cannot own accounts.";
+}
+
+/* The row itself, no checks: account_create() and the add-on. */
+function account_owner_write($user, $owner) {
+	global $db;
+	if (!account_owners_ready())
+		return false;
+	if ($owner === '') {
+		$stmt = $db->prepare('DELETE FROM account_owners WHERE user = :u');
+	} else {
+		$stmt = $db->prepare('INSERT OR REPLACE INTO account_owners (user, owner, since) VALUES (:u, :o, :t)');
+		$stmt->bindValue(':o', $owner, SQLITE3_TEXT);
+		$stmt->bindValue(':t', time(), SQLITE3_INTEGER);
+	}
+	$stmt->bindValue(':u', $user, SQLITE3_TEXT);
+	return (bool)$stmt->execute();
+}
+
+/* A deleted account: its own row and the rows of what it owned. */
+function account_owner_forget($user) {
+	global $db;
+	if (!account_owners_ready())
+		return;
+	$stmt = $db->prepare('DELETE FROM account_owners WHERE user = :u OR owner = :u');
+	$stmt->bindValue(':u', (string)$user, SQLITE3_TEXT);
+	$stmt->execute();
+}
+
+/*
+ * Give $user to reseller $owner ('' = back to the server admin). The add-on
+ * checks the reseller and its limits ('account.owner.check'). A reseller's
+ * own account keeps owning itself: only the add-on, removing the reseller,
+ * passes $force to give it back to the admin.
+ */
+function account_owner_set($user, $owner, $force = false) {
+	global $db;
+	$user = trim((string)$user);
+	$owner = trim((string)$owner);
+	if (!valid_username($user) || !account_get($db, $user))
+		return result_error("There is no hosting account '$user'.");
+	if ($owner !== '' && (!valid_username($owner) || !account_get($db, $owner)))
+		return result_error("There is no hosting account '$owner'.");
+	if (!account_owners_ready())
+		return result_error('Accounts cannot have an owner yet: database update 1056 has not run.');
+	$old = account_owner($user);
+	if ($old === $owner)
+		return result_ok($owner === '' ? "$user already belongs to the server admin." : "$user already belongs to reseller $owner.",
+			array('user' => $user, 'owner' => $owner, 'old' => $old));
+	if ($old === $user && !$force)
+		return result_error("$user is a reseller and owns its own account. Remove it as a reseller first.");
+	if (!$force && ($e = account_owner_error($owner, $user)) !== '')
+		return result_error($e);
+	if (!account_owner_write($user, $owner))
+		return result_error("Could not save the owner of $user.");
+	route_log("account $user: owner ".($old === '' ? 'admin' : $old).' -> '.($owner === '' ? 'admin' : $owner));
+	plugin_hook('account.owner_changed', array('user' => $user, 'owner' => $owner, 'old' => $old));
+	return result_ok($owner === '' ? "$user now belongs to the server admin." : "$user now belongs to reseller $owner.",
+		array('user' => $user, 'owner' => $owner, 'old' => $old));
+}
+
 /* ---- session limits ------------------------------------------------------
    CPU, memory and process caps for an account's SSH, cron and web-terminal
    sessions (systemd slice user-<uid>.slice). scripts/session_limits.sh owns
    the drop-in and the hit log; these are the web/CLI front ends. */
+
+/* ---- server default limits (Settings > Default limits) --------------------
+   What accounts on "Server defaults" get: session CPU / memory / processes
+   (read by session_limits.sh from the same settings) and database
+   connections per MySQL user (database_conn_default()). Nothing stored = the
+   built-in values; memory empty = automatic (a quarter of the RAM, at most
+   2 GB). Accounts with their own limits (or a package's) are not touched. */
+
+function limits_builtin() {
+	return array('cpu' => 100, 'memory_mb' => 0, 'processes' => 512, 'db_conn' => 30);
+}
+
+function limits_auto_memory_mb() {
+	$q = (int)floor(((int)resources_ram()[0] + 512) / 1024) * 256;
+	return $q > 0 && $q < 2048 ? $q : 2048;
+}
+
+/* The defaults now: cpu %, memory_mb (0 = automatic), processes, db_conn
+   (0 = no limit), plus memory_effective_mb and the built-in values. */
+function limits_defaults() {
+	$b = limits_builtin();
+	$cores = resources_cores();
+	$num = function ($name) { $v = (string)setting_get($name); return ctype_digit($v) ? (int)$v : null; };
+	$cpu = $num('limits-default-cpu');
+	$mem = $num('limits-default-memory');
+	$pr  = $num('limits-default-processes');
+	$out = array(
+		'cpu'       => $cpu !== null && $cpu >= 5 ? min($cpu, $cores * 100) : $b['cpu'],
+		'memory_mb' => $mem !== null && $mem >= 64 ? $mem : 0,
+		'processes' => $pr !== null && $pr >= 16 && $pr <= 100000 ? $pr : $b['processes'],
+		'db_conn'   => database_conn_default(),
+	);
+	$out['memory_effective_mb'] = $out['memory_mb'] ?: limits_auto_memory_mb();
+	$out['builtin'] = $b + array('memory_auto_mb' => limits_auto_memory_mb());
+	$out['cores'] = $cores;
+	$out['ram_mb'] = (int)resources_ram()[0];
+	return $out;
+}
+
+/* How many accounts follow each default: session (drop-in mode default or
+   none yet) and databases (no db-conn-limit-<account> setting). */
+function limits_defaults_usage() {
+	global $db;
+	$n = array('accounts' => 0, 'session' => 0, 'db' => 0);
+	$res = $db->query('SELECT user FROM accounts');
+	while ($res && ($row = $res->fetchArray(SQLITE3_NUM))) {
+		$n['accounts']++;
+		$pw = posix_getpwnam($row[0]);
+		if ($pw) {
+			$c = (string)@file_get_contents('/etc/systemd/system/user-'.(int)$pw['uid'].'.slice.d/50-reqad-limits.conf');
+			if ($c === '' || preg_match('/mode: *default\b/', $c))
+				$n['session']++;
+		}
+		if (database_conn_is_default($row[0]))
+			$n['db']++;
+	}
+	return $n;
+}
+
+/* Save the defaults and apply them to every account that follows them.
+   $memory_mb 0 = automatic, $db_conn 0 = no limit. */
+function limits_defaults_set($cpu, $memory_mb, $processes, $db_conn) {
+	$cores = resources_cores();
+	$cpu = (int)$cpu; $memory_mb = (int)$memory_mb; $processes = (int)$processes; $db_conn = (int)$db_conn;
+	if ($cpu < 5 || $cpu > $cores * 100)
+		return result_error('CPU must be 5-'.($cores * 100).'% (100% = one core, this server has '.$cores.').');
+	if ($memory_mb !== 0 && $memory_mb < 64)
+		return result_error('Memory must be at least 64 MB, or empty for automatic.');
+	$ram = (int)resources_ram()[0];
+	if ($ram > 0 && $memory_mb > $ram)
+		return result_error('Memory cannot be more than the server\'s RAM ('.number_format($ram).' MB).');
+	if ($processes < 16 || $processes > 100000)
+		return result_error('Processes must be 16-100000.');
+	if ($db_conn < 0 || $db_conn > 10000)
+		return result_error('Database connections must be 0 (no limit) to 10000.');
+
+	$old = limits_defaults();
+	setting_put('limits-default-cpu', (string)$cpu);
+	setting_put('limits-default-memory', $memory_mb ? (string)$memory_mb : '');
+	setting_put('limits-default-processes', (string)$processes);
+	setting_put('limits-default-db-conn', (string)$db_conn);
+
+	$msgs = array(); $warn = array();
+	if ($old['cpu'] !== $cpu || $old['memory_mb'] !== $memory_mb || $old['processes'] !== $processes) {
+		exec('sudo '._PATH.'/scripts/session_limits.sh defaults 2>&1', $out, $rc);
+		$o = trim(implode(' ', $out));
+		if ($rc !== 0)
+			$warn[] = 'Saved, but the session limits could not be applied: '.($o !== '' ? $o : 'session_limits.sh failed').'.';
+		else
+			$msgs[] = $o;
+	}
+	if ($old['db_conn'] !== $db_conn) {
+		$r = database_conn_sync();
+		$users = count($r['data']['users'] ?? array());
+		$msgs[] = 'Database connections '.($db_conn ? "$db_conn per database user" : 'not limited').": $users database user(s) updated.";
+		if (!$r['ok'])
+			$warn[] = 'Some database users could not be updated: '.$r['error'];
+	}
+	route_log("default limits: cpu $cpu%, memory ".($memory_mb ?: 'auto').", processes $processes, db connections $db_conn");
+	return result_ok($msgs ? implode(' ', $msgs) : 'Default limits saved, nothing changed.',
+		limits_defaults(), $warn);
+}
 
 /* Current limits, usage and recent hits of an account (null = not a hosting
    account). mode: default | custom | none | missing. */

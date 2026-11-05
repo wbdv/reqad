@@ -19,6 +19,7 @@ $r = account_create($db, array(
 	'php'           => trim($_POST['phpversion'] ?? ''),   // '' = server default
 	'shell'         => trim($_POST['shell'] ?? ''),        // '' = Settings > Security default
 	'package'       => trim($_POST['package'] ?? ''),      // hosting package (plugin), '' = its default
+	'owner'         => trim($_POST['owner'] ?? ''),        // reseller (reseller add-on), '' = the server admin
 	'ssl_msg_token' => $sslmsgtoken,
 ));
 

@@ -54,11 +54,13 @@ function email_domain_exists($domain) {
 /*
  * List mailboxes from /etc/dovecot/users.
  * $domain: only this domain ('' = all).
- * Returns array of array('email', 'domain', 'account', 'enabled').
+ * Returns array of array('email', 'domain', 'account', 'enabled',
+ * 'refuse_incoming', 'refuse_message').
  */
 function email_list($domain = '') {
 	$domain = strtolower(trim((string)$domain));
 	$list   = array();
+	$refuse = email_refuse_list();
 	foreach (explode("\n", (string)shell_exec('sudo cat /etc/dovecot/users 2>/dev/null')) as $line) {
 		$f = explode(':', trim($line));
 		if (count($f) < 6 || strpos($f[0], '@') === false)
@@ -73,6 +75,8 @@ function email_list($domain = '') {
 			'domain'  => $d,
 			'account' => isset($parts[2]) ? $parts[2] : '',
 			'enabled' => !mailbox_login_disabled($f[1]),
+			'refuse_incoming' => isset($refuse[strtolower($f[0])]),
+			'refuse_message'  => $refuse[strtolower($f[0])] ?? '',
 		);
 	}
 	usort($list, function($a, $b) { return strcmp($a['email'], $b['email']); });
@@ -125,6 +129,8 @@ function email_create(array $o) {
 	$err = mailbox_create($user, $domain, $password);
 	if ($err !== '')
 		return result_error($err);
+	/* a new mailbox accepts mail, whatever an old one of that address did */
+	email_refuse_set($email, null);
 
 	/* plugins apply theirs (Hosting Pro: the mailbox size) */
 	$more = plugin_filter('email.create.apply', array('changes' => array(), 'warnings' => array()), $email, $owner, $o);
@@ -167,6 +173,10 @@ function mailbox_set_hash($email, $hash) {
  *   enabled   bool -- allow / block IMAP, POP3 and SMTP login (delivery continues)
  *   size      mailbox size (Reqad Hosting Pro), e.g. "500M"; 'default' = the
  *             account's default; '' or absent = unchanged
+ *   refuse_incoming  bool -- refuse all incoming mail (senders get "550
+ *             <refuse_message>" from their own server; login and sending go on)
+ *   refuse_message   the text senders get ('' = "This address does not accept
+ *             mail."); absent = unchanged
  */
 function email_edit(array $o) {
 	list($user, $domain) = email_split($o['email'] ?? '');
@@ -196,6 +206,19 @@ function email_edit(array $o) {
 	$e = plugin_filter('email.edit.check', $size !== '' ? 'Mailbox sizes need the Reqad Hosting Pro add-on.' : '', $o, $sysuser);
 	if (is_string($e) && $e !== '')
 		return result_error($e);
+
+	/* refuse incoming mail: what it is now and what is asked */
+	$refusals   = email_refuse_list();
+	$refuse_was = $refusals[strtolower($email)] ?? null;
+	$refuse_on  = array_key_exists('refuse_incoming', $o) && $o['refuse_incoming'] !== null
+		? filter_var($o['refuse_incoming'], FILTER_VALIDATE_BOOLEAN) : $refuse_was !== null;
+	$refuse_txt = array_key_exists('refuse_message', $o) && $o['refuse_message'] !== null
+		? trim(preg_replace('/\s+/', ' ', (string)$o['refuse_message'])) : (string)$refuse_was;
+	if ($refuse_txt === '')
+		$refuse_txt = EMAIL_REFUSE_DEFAULT;
+	if ($refuse_on && ($e = email_refuse_text_error($refuse_txt)) !== '')
+		return result_error($e);
+	$refuse_new = $refuse_on ? $refuse_txt : null;
 
 	$oldhash     = mailbox_hash($email);
 	$was_enabled = !mailbox_login_disabled($oldhash);
@@ -230,20 +253,34 @@ function email_edit(array $o) {
 	$changes  = array_values(array_filter((array)($more['changes'] ?? array()), 'is_string'));
 	$warnings = array_values(array_filter((array)($more['warnings'] ?? array()), 'is_string'));
 
+	if ($refuse_new !== $refuse_was) {
+		if (($e = email_refuse_set($email, $refuse_new)) !== '')
+			$warnings[] = 'Incoming mail setting not changed: '.$e;
+		elseif ($refuse_new === null)
+			$changes[] = 'it accepts incoming mail again';
+		else {
+			$changes[] = $refuse_was === null ? 'it refuses incoming mail' : 'new text for refused mail';
+			if (!email_refuse_ready())
+				$warnings[] = 'The mail server does not read the list of refusing mailboxes yet: run scripts/update/setup_exim_refuse_incoming.sh as root.';
+		}
+		route_log("edit email $email: ".($refuse_new === null ? 'accepts incoming mail' : 'refuses incoming mail'));
+	}
+
 	/* Same Active/Disabled wording as the Status column and the modal switch. */
 	$state = $enabled ? "Active" : "Disabled";
 	if ($password !== '') {
 		$message = "Password changed successfully for $email.";
 		if ($was_enabled != $enabled)
 			$message .= " The account is now $state.";
-	} else if ($was_enabled != $enabled || !$changes)
+	} else if ($was_enabled != $enabled || (!$changes && array_key_exists('enabled', $o) && $o['enabled'] !== null))
 		$message = "Email account $email is now $state.";
 	else
 		$message = "Email account $email saved.";
 	if ($changes)
 		$message .= ' '.ucfirst(implode(', ', $changes)).'.';
 
-	return result_ok($message, array('email' => $email, 'enabled' => $enabled, 'password_changed' => $password !== '', 'changes' => $changes), $warnings);
+	return result_ok($message, array('email' => $email, 'enabled' => $enabled, 'password_changed' => $password !== '', 'changes' => $changes,
+		'refuse_incoming' => $refuse_new !== null, 'refuse_message' => (string)$refuse_new), $warnings);
 }
 
 /* Delete a mailbox: dovecot passdb line, exim local part, the Maildir and the
@@ -272,10 +309,80 @@ function email_delete($db, $email) {
 	   script and row do not, so they are removed explicitly. */
 	foreach (ef_purge_mailbox($db, $email) as $line)
 		route_log("delete email $email: $line");
+	email_refuse_set($email, null);
 	mailbox_list(true);
 
 	plugin_hook('mailbox.deleted', array('email' => $email));
 	return result_ok("Email account $email was deleted.", array('email' => $email));
+}
+
+/* ---- Refuse incoming mail ---------------------------------------------------
+   /etc/exim/refuse_incoming: one "address: text" line per mailbox that refuses
+   all incoming mail. Exim's refuse_incoming router (scripts/update/
+   setup_exim_refuse_incoming.sh) fails a listed address while the sending
+   server names the recipient, so it gets "550 <text>" and this server sends
+   no bounce. The mailbox stays: it can still log in and send. */
+
+define('EMAIL_REFUSE_FILE', '/etc/exim/refuse_incoming');
+define('EMAIL_REFUSE_DEFAULT', 'This address does not accept mail.');
+
+/* address => text of every refusing mailbox. */
+function email_refuse_list() {
+	$map = array();
+	foreach (explode("\n", (string)shell_exec('sudo -n cat '.EMAIL_REFUSE_FILE.' 2>/dev/null')) as $l) {
+		if (!preg_match('/^([^\s:#]+@[^\s:]+):\s*(.*)$/', trim($l), $m))
+			continue;
+		$map[strtolower($m[1])] = $m[2] !== '' ? $m[2] : EMAIL_REFUSE_DEFAULT;
+	}
+	return $map;
+}
+
+/* Why $text cannot be the answer senders get, or ''. It goes into an SMTP
+   reply, which is ASCII on one line. */
+function email_refuse_text_error($text) {
+	if (strlen($text) > 200)
+		return 'The text senders get can have up to 200 characters.';
+	if (!preg_match('/^[\x20-\x7e]*$/', $text))
+		return 'The text senders get must be plain letters without accents (SMTP answers are ASCII), on one line.';
+	if (strpbrk($text, '"\\$') !== false)
+		return 'The text senders get cannot contain " \\ or $.';
+	return '';
+}
+
+/* Refuse ($text = the answer, '' = the default one) or accept again
+   ($text = null) incoming mail for $email. '' or the error. */
+function email_refuse_set($email, $text) {
+	$email = strtolower(trim((string)$email));
+	if (!preg_match('/^[^\s:@#]+@[a-z0-9.-]+$/', $email))
+		return 'Not an email address.';
+	$map = email_refuse_list();
+	if ($text === null) {
+		if (!isset($map[$email]))
+			return '';
+		unset($map[$email]);
+	} else {
+		$text = trim(preg_replace('/\s+/', ' ', (string)$text));
+		if (($e = email_refuse_text_error($text)) !== '')
+			return $e;
+		$map[$email] = $text !== '' ? $text : EMAIL_REFUSE_DEFAULT;
+	}
+	ksort($map);
+	$body = '';
+	foreach ($map as $a => $t)
+		$body .= $a.': '.$t."\n";
+	/* a whole new file moved in place: exim reads it on every recipient */
+	$tmp = EMAIL_REFUSE_FILE.'.new';
+	shell_exec('printf %s '.escapeshellarg($body).' | sudo -n tee '.escapeshellarg($tmp).' > /dev/null'
+	          .' && sudo -n chmod 0644 '.escapeshellarg($tmp).' && sudo -n mv -f '.escapeshellarg($tmp).' '.EMAIL_REFUSE_FILE);
+	$now = email_refuse_list();
+	if ($text === null ? isset($now[$email]) : ($now[$email] ?? null) !== $map[$email])
+		return 'Could not write '.EMAIL_REFUSE_FILE.'.';
+	return '';
+}
+
+/* Is the exim router that reads the list there (the update script ran)? */
+function email_refuse_ready() {
+	return trim((string)shell_exec('sudo -n grep -c '.escapeshellarg('^refuse_incoming:').' /etc/exim/exim.conf 2>/dev/null')) === '1';
 }
 
 /* ---- Forwarders -------------------------------------------------------------
@@ -658,7 +765,7 @@ function autoresponder_delete($key) {
 
 /*
  * Every site of an account with email sends /webmail (and /webmail/) to
- * https://<hostname>:2087/webmail/, the server's Roundcube, so mailbox owners
+ * webmail_url() (https://<hostname>:2096/webmail/), the server's Roundcube, so mailbox owners
  * can use the address they know from other hosts. Like the account panel's
  * /cpanel link, it is a marker block "reqad-webmail-link" at the top of each
  * server of the account's vhosts (account_vhost_marker()): a rewrite there
@@ -672,12 +779,48 @@ function autoresponder_delete($key) {
  */
 define('WEBMAIL_LINK_MARKER', 'webmail-link');
 
+/*
+ * Webmail's own port. scripts/update/setup_webmail_port.sh (every update)
+ * serves Roundcube on 2096 in a server of its own, so mailbox owners never
+ * need the panel's 2087 (which can then be closed to all but the admin), and
+ * 2087's /webmail/ only redirects there. Until it has run (or after its
+ * --remove), webmail is still the panel's /webmail/ on 2087. The marker in
+ * the panel's vhost is the state.
+ */
+define('WEBMAIL_PORT', 2096);
+
+function webmail_port_ready() {
+	static $r = null;
+	if ($r === null) {
+		$r = false;
+		foreach ((array)glob('/etc/reqad/conf.d/*.conf') as $f)
+			if (strpos((string)@file_get_contents($f), '# reqad-webmail-port BEGIN') !== false) {
+				$r = true;
+				break;
+			}
+	}
+	return $r;
+}
+
+function webmail_port() {
+	return webmail_port_ready() ? WEBMAIL_PORT : 2087;
+}
+
+/* https://<host>:2096/webmail/ ($host: default the hostname), '' when there
+   is no usable name. */
+function webmail_url($host = null) {
+	$h = $host === null ? webmail_link_host() : strtolower(trim((string)$host));
+	if ($h === '' || !valid_domain($h))
+		return '';
+	return 'https://'.$h.':'.webmail_port().'/webmail/';
+}
+
 function webmail_link_enabled() {
 	global $ini;
 	return feature_enabled($ini, 'email') && setting_get('webmail-link', '1') !== '0';
 }
 
-/* The name the panel on 2087 answers to (hostname -f, as the account panel's
+/* The name the panel and webmail answer to (hostname -f, as the account panel's
    link), '' when the server has no usable one. */
 function webmail_link_host() {
 	static $h = null;
@@ -693,10 +836,9 @@ function webmail_link_host() {
 
 /* array(nginx lines, Apache lines); nulls when there is no usable hostname. */
 function webmail_link_lines() {
-	$h = webmail_link_host();
-	if ($h === '')
+	$to = webmail_url();
+	if ($to === '')
 		return array(null, null);
-	$to = 'https://'.$h.':2087/webmail/';
 	return array("rewrite ^/webmail/?\$ $to? redirect;", "RedirectMatch 302 ^/webmail/?\$ $to");
 }
 

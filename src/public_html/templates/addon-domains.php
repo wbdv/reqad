@@ -42,6 +42,31 @@
 	while ($rs && ($r = $rs->fetchArray(SQLITE3_ASSOC)))
 		$add_accounts[] = $r;
 
+	/* whole-site redirects (from "/") of each addon domain, and where each
+	   account's sites can be sent: its main domain first, then its other
+	   addon domains (https when the site has a certificate that is not
+	   self-signed) */
+	$redirects = array();
+	$targets   = array();
+	if ($nb_addons) {
+		$front = web_front($ini);
+		$mains = array_column($add_accounts, 'domain', 'user');
+		foreach ($addons as $d => $a) {
+			$u = $a['user'];
+			if (!isset($targets[$u]) && isset($mains[$u])) {
+				$m = strtolower($mains[$u]);
+				$k = addon_domain_ssl_kind($m, account_vhost_file_read(account_vhost_path($m, $front)));
+				$targets[$u] = array(array('domain' => $m, 'main' => true, 'url' => ($k === 'letsencrypt' || $k === 'custom' ? 'https' : 'http').'://'.$m));
+			}
+			$redirects[$d] = array_values(array_filter(redirect_rules_parse(account_vhost_file_read($a['vhost'])),
+			                                          function ($x) { return $x['from'] === '/'; }));
+		}
+		foreach ($addons as $d => $a)
+			if (isset($targets[$a['user']]))
+				$targets[$a['user']][] = array('domain' => $d, 'main' => false,
+				                               'url' => ($a['ssl'] === 'letsencrypt' || $a['ssl'] === 'custom' ? 'https' : 'http').'://'.$d);
+	}
+
 	if(!isset($errmsg))
 		$errmsg = '';
 	include('templates/header.php');
@@ -90,11 +115,12 @@
                         <th style="background-color:#DEF;">Email</th>
 					<? endif; ?>
                         <th style="background-color:#DEF;">Document Root</th>
+                        <th style="background-color:#DEF;">Redirect</th>
                         <th style="background-color:#DEF;">PHP Version</th>
 					<? if($modphp): ?>
                         <th style="background-color:#DEF;">Handler</th>
 					<? endif; ?>
-                        <th style="background-color:#DEF;">Created At</th>
+                        <th style="background-color:#DEF;">Created</th>
                         <th class="w-5" style="background-color:#DEF;"></th>
                       </tr>
 					<? if($nb_addons > 1 ) { ?>
@@ -106,7 +132,7 @@
                             <button id="addon-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
                           </div>
 						</td>
-                        <td colspan="<?=5 + ($modphp ? 1 : 0) + ($mail_col ? 1 : 0);?>" style="padding:4px 8px;"></td>
+                        <td colspan="<?=6 + ($modphp ? 1 : 0) + ($mail_col ? 1 : 0);?>" style="padding:4px 8px;"></td>
                       </tr>
 					<? } ?>
                     </thead>
@@ -166,12 +192,23 @@
                         <td class="text-muted" data-label="Document Root">
                           <span style="font-family:monospace;white-space:nowrap;"><?=h($row["docroot"]);?></span>
                         </td>
+                        <td data-label="Redirect">
+						<? $rd = $redirects[$domain] ?? array(); ?>
+						<? if(!$rd): ?>
+							<span class="text-muted">-</span>
+						<? else: foreach($rd as $x): ?>
+							<div style="white-space:nowrap;" title="<?=$x['code'] == 301 ? 'Permanent (301)' : 'Temporary (302)';?><?=$x['keep'] ? ', keeps the rest of the address' : '';?>">
+								<?=$x['host'] !== '' ? '<span class="text-muted">'.h($x['host']).'</span> ' : '';?>&rarr; <?=h(preg_replace('#^https?://#', '', $x['to']));?>
+								<span class="badge bg-secondary-lt" style="font-size:.7em;"><?=(int)$x['code'];?></span>
+							</div>
+						<? endforeach; endif; ?>
+                        </td>
                         <td class="text-muted" data-label="PHP Version">
 							<? $php_color = $php_version_colors[$row["version"]] ?? '#aaa'; ?>
 							<? if($row["handler"] == 'none') { ?>
 							<span class="badge bg-danger" title="No php-fpm pool for this domain — PHP requests will fail">no pool</span>
 							<? } elseif($row["version"] == 'off') { ?>
-							<span class="badge bg-grey-lt border badge-muted" title="PHP is off: .php files are not run (they answer 403)">PHP disabled</span>
+							<span class="badge bg-grey-lt border badge-muted" title="PHP is off: .php files are not run (they answer 403)">No PHP</span>
 							<? } else { ?>
 							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($row["version"]);?></span>
 							<? } ?>
@@ -182,11 +219,13 @@
                         </td>
 					<? endif; ?>
                         <td data-label="Created on" class="text-muted">
-                          <div class="font-weight-medium"><?=date("M jS, Y - H:i", strtotime($row["created"]));?></div>
+                              <span title="<?=date("j M Y, H:i", strtotime($row["created"]));?>"><?=date("j M Y", strtotime($row["created"]));?></span>
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-addon" data-bs-domain="<?=h($domain);?>" data-bs-user="<?=h($row["user"]);?>" data-bs-phpversion="<?=h($row["version"]);?>" data-bs-phphandler="<?=h($row["handler"]);?>">Manage</a>
+<? $rd0 = null; foreach(($redirects[$domain] ?? array()) as $x) if($x['host'] === '') $rd0 = $x; ?>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-redirect-addon" data-bs-domain="<?=h($domain);?>" data-bs-user="<?=h($row["user"]);?>" data-bs-count="<?=count($redirects[$domain] ?? array());?>"<? if($rd0): ?> data-bs-to="<?=h($rd0['to']);?>" data-bs-code="<?=(int)$rd0['code'];?>" data-bs-keep="<?=$rd0['keep'] ? '1' : '0';?>"<? endif; ?>>Redirect</a>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-addon" data-bs-domain="<?=h($domain);?>" data-bs-docroot="<?=h($row["docroot"]);?>">Delete</a>
                           </div>
                         </td>
@@ -331,6 +370,54 @@
               Cancel
             </a>
             <button id="addon-submit-edit" class="btn btn-primary" type="submit">Save changes</button>
+          </div>
+        </div>
+      </div>
+    </div>
+</form>
+
+<form method="post" action="/" id="redirect-addon" class="needs-validation" novalidate>
+    <input type="hidden" name="action" value="addon-domain-redirect">
+    <input type="hidden" name="domain" id="addon-redirect-domain" value="">
+    <input type="hidden" name="op" id="addon-redirect-op" value="set">
+    <div class="modal modal-blur fade" id="modal-redirect-addon" tabindex="-1" role="dialog" aria-hidden="true">
+      <div class="modal-dialog modal-lg" role="document">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Redirect <span id="addon-redirect-title"></span></h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <p>Send every visitor of this domain (with or without www.) to another address. The site's files stay; Let's Encrypt checks still reach it, so its certificate keeps renewing.</p>
+            <div class="mb-3">
+              <label class="form-label">Redirect to</label>
+              <select id="addon-redirect-target" class="form-select"></select>
+            </div>
+            <div class="mb-3" id="addon-redirect-to-row" style="display:none;">
+              <label class="form-label required">Target address</label>
+              <input type="text" name="to" id="addon-redirect-to" class="form-control" placeholder="https://example.com" pattern="https?://\S+" autocomplete="off" required>
+              <div class="invalid-feedback">A full address such as https://example.com or https://example.com/page.</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Type</label>
+              <select name="code" id="addon-redirect-code" class="form-select">
+                <option value="301">Permanent (301) - search engines move to the new address</option>
+                <option value="302">Temporary (302)</option>
+              </select>
+            </div>
+            <label class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" name="keep" id="addon-redirect-keep" value="1" checked>
+              <span class="form-check-label">Keep the rest of the address</span>
+            </label>
+            <small class="form-hint mb-2">For example <code id="addon-redirect-example"></code></small>
+            <small class="form-hint" id="addon-redirect-replace" style="display:none;">This replaces the domain's current redirect of the whole site. Redirects of single addresses stay.</small>
+          </div>
+          <div class="modal-footer">
+            <a href="#" class="btn btn-link link-secondary me-auto" data-bs-dismiss="modal">
+              Cancel
+            </a>
+            <button id="addon-redirect-remove" class="btn btn-outline-danger" type="button" style="display:none;">Stop redirecting</button>
+            <button id="addon-submit-redirect" class="btn btn-primary" type="submit">Redirect</button>
           </div>
         </div>
       </div>
@@ -517,6 +604,77 @@ jQuery(document).ready(function () {
 		$('#addon-docroot-title').text(docroot);
 		$('#addon-delete-docroot').prop('checked', false);
   	});
+
+	/* redirect the whole site */
+	var redirectTargets = <?=json_encode($targets, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);?>;
+	function redirectExample() {
+		var d = $('#addon-redirect-domain').val();
+		var to = $('#addon-redirect-to').val().trim() || 'https://example.com';
+		$('#addon-redirect-example').text(d + '/page goes to ' + ($('#addon-redirect-keep').is(':checked')
+			? to.replace(/\/+$/, '') + '/page' : to));
+	}
+	$('#modal-redirect-addon').on('show.bs.modal', function (event) {
+		var b = event.relatedTarget;
+		var d = b.getAttribute('data-bs-domain'), u = b.getAttribute('data-bs-user');
+		var to = b.getAttribute('data-bs-to'), count = parseInt(b.getAttribute('data-bs-count') || '0', 10);
+		$('#redirect-addon').removeClass('was-validated');
+		$('#addon-redirect-domain').val(d);
+		$('#addon-redirect-op').val('set');
+		$('#addon-redirect-title').text(d);
+		var sel = $('#addon-redirect-target').empty();
+		$.each(redirectTargets[u] || [], function (i, t) {
+			if (t.domain === d) return;
+			sel.append($('<option>').val(t.url).text(t.url + (t.main ? ' (main domain)' : '')));
+		});
+		sel.append($('<option>').val('').text('Another address…'));
+		if (to) {
+			var m = sel.find('option').filter(function () { return this.value !== '' && to.replace(/\/+$/, '') === this.value; });
+			sel.val(m.length ? m.first().val() : '');
+			$('#addon-redirect-to').val(to);
+			$('#addon-redirect-code').val(b.getAttribute('data-bs-code') || '301');
+			$('#addon-redirect-keep').prop('checked', b.getAttribute('data-bs-keep') === '1');
+		} else {
+			sel.prop('selectedIndex', 0);
+			$('#addon-redirect-to').val(sel.val());
+			$('#addon-redirect-code').val('301');
+			$('#addon-redirect-keep').prop('checked', true);
+		}
+		$('#addon-redirect-to-row').toggle(sel.val() === '');
+		$('#addon-redirect-remove').toggle(count > 0);
+		$('#addon-redirect-replace').toggle(count > 0);
+		$('#addon-submit-redirect').prop('disabled', false).text(count > 0 ? 'Save redirect' : 'Redirect');
+		redirectExample();
+	});
+	/* the address field only for "Another address…"; a site of the list fills it in */
+	$('#addon-redirect-target').on('change', function () {
+		var other = $(this).val() === '';
+		$('#addon-redirect-to-row').toggle(other);
+		$('#addon-redirect-to').val(other ? '' : $(this).val());
+		if (other) $('#addon-redirect-to').trigger('focus');
+		redirectExample();
+	});
+	$('#addon-redirect-to').on('input', redirectExample);
+	$('#addon-redirect-keep').on('change', redirectExample);
+	$('#addon-redirect-remove').on('click', function () {
+		if (!confirm('Stop redirecting ' + $('#addon-redirect-domain').val() + '? Visitors see the site\'s own files again.'))
+			return;
+		$('#addon-redirect-op').val('remove');
+		$('#addon-redirect-to').prop('required', false);
+		$(this).prop('disabled', true);
+		$('#redirect-addon').unbind('submit').submit();
+	});
+	$('#redirect-addon').submit(function (event) {
+		var f = $('#redirect-addon')[0];
+		$('#addon-redirect-to').val($('#addon-redirect-to').val().trim());
+		if (f.checkValidity() === false) {
+			event.preventDefault();
+			event.stopPropagation();
+			$('#redirect-addon').addClass('was-validated');
+			return;
+		}
+		$('#addon-submit-redirect').prop('disabled', true).text('Saving …');
+		$('#redirect-addon').unbind('submit').submit();
+	});
 
 	/* email on / off for a site */
 	$('.addon-mail-btn').on('click', function (e) {

@@ -256,8 +256,15 @@ function get_server_url() {
 	#echo '<pre>#'; print_r($json); exit;
 	if($json["success"]==1 && isset($json[0]['url']))
 		return $json[0]['url'];
-	else
-		return 'Error: '.$json["reason"].' '.$json["error"];
+	global $powerdns_server;
+	$code = (int)($json["reason"] ?? 0);
+	if (trim((string)$powerdns_server) === '')
+		return 'Error: no PowerDNS server address is set (Settings > DNS Settings).';
+	if ($code === 0)
+		return 'Error: no answer from the PowerDNS server '.$powerdns_server.'.';
+	if ($code === 401 || $code === 403)
+		return 'Error: the PowerDNS server refused the API key (HTTP '.$code.'; Settings > DNS Settings).';
+	return trim('Error: HTTP '.$code.' '.(is_string($json["error"] ?? null) ? $json["error"] : ''));
 }
 
 function get_zones() {

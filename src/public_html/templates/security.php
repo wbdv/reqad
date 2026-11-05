@@ -426,6 +426,13 @@
 					<button type="submit" class="btn text-nowrap">Add address</button>
 				</form>
 <?php endif; ?>
+<?php if (feature_enabled($ini, 'email')): ?>
+<?php if (webmail_port_ready()): ?>
+				<span class="set-hint d-block mt-2">Webmail has a port of its own, <?=(int)WEBMAIL_PORT?>, which stays open to everyone: mailbox owners can still reach it with the restriction on.</span>
+<?php else: ?>
+				<span class="set-hint d-block mt-2 text-warning">Webmail is still served on port <?=(int)$sec_fw['port']?>: with the restriction on, mailbox owners cannot reach it. Run <code>bash /usr/local/reqad/scripts/update/setup_webmail_port.sh</code> as root to move it to port <?=(int)WEBMAIL_PORT?>.</span>
+<?php endif; ?>
+<?php endif; ?>
 			</div>
 		</div>
 <?php endif; /* csf */ ?>

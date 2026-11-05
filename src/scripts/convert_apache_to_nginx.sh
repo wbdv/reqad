@@ -434,6 +434,14 @@ EOF
         location ~ /\\. {
             deny all;
         }
+        # An ACME client other than certbot (certbot adds its own challenge location)
+        # needs /.well-known/: use this line instead of the block above
+        # location ~ /\\.(?!well-known/) { deny all; }
+
+        # Instruction files of AI coding assistants (CLAUDE.md, AGENTS.md, GEMINI.md)
+        location ~* /(claude[^/]*|agents|gemini)\\.md\$ {
+            return 404;
+        }
 
         # Deny access to any files with a .php extension in the uploads directory
         # Works in sub-directory installs and also in multisite network
@@ -498,6 +506,14 @@ nginx_addon_body() {
         # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
         location ~ /\\. {
             deny all;
+        }
+        # An ACME client other than certbot (certbot adds its own challenge location)
+        # needs /.well-known/: use this line instead of the block above
+        # location ~ /\\.(?!well-known/) { deny all; }
+
+        # Instruction files of AI coding assistants (CLAUDE.md, AGENTS.md, GEMINI.md)
+        location ~* /(claude[^/]*|agents|gemini)\\.md\$ {
+            return 404;
         }
 
         # Deny access to any files with a .php extension in the uploads directory

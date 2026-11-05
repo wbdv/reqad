@@ -36,10 +36,10 @@ function api_routes() {
 		return $routes;
 	$pw = 'password (omit to get a generated one in data.password)';
 	$mpw = 'string: Password. Leave it out to have a strong one generated and returned';
-	$fbody = 'name, conditions [{field (from, to, subject, to,cc, body, size or a header), op (contains, is, begins, ends, matches, regex, not-..., over, under), value}], actions [{type (fileinto, redirect, reject, discard, keep, seen, flagged), value}], match (all|any), enabled, stop (no later filter runs)';
+	$fbody = 'name, conditions [{field (from, to, subject, to,cc, any header, body, size or a header), op (contains, is, begins, ends, matches, regex, not-..., over, under), value}], actions [{type (fileinto, redirect, reject, discard, keep, seen, flagged), value}], match (all|any), enabled, stop (no later filter runs)';
 	$fargs = array('email' => 'string: The mailbox',
 		'name' => 'string: A name for the filter',
-		'conditions' => 'string: JSON list of conditions, e.g. [{"field":"from","op":"contains","value":"news@"}]. field: from, to, subject, to,cc (any recipient), body, size (bytes, op over/under) or a header name; op: contains, is, begins, ends, matches (* and ?), regex, or not-contains etc. Empty list = every message',
+		'conditions' => 'string: JSON list of conditions, e.g. [{"field":"from","op":"contains","value":"news@"}]. field: from, to, subject, to,cc (any recipient), any header (senders, recipients, Received, Subject, List-Id), body, size (bytes, op over/under) or a header name; op: contains, is, begins, ends, matches (* and ?), regex, or not-contains etc. Empty list = every message',
 		'actions' => 'string: JSON list of actions, e.g. [{"type":"fileinto","value":"Newsletters"}]. type: fileinto (a folder), redirect (an address), reject (a text for the sender), discard, keep, seen, flagged',
 		'match?' => 'enum(all,any): all conditions must match (default) or any one',
 		'enabled?' => 'boolean: false = keep the filter but do not run it',
@@ -85,13 +85,15 @@ function api_routes() {
 		                     'description' => 'One hosting account in detail: domains, PHP version, shell, mailboxes, databases, limits.')),
 		array('method' => 'PATCH', 'path' => '/v1/accounts/{user}', 'perm' => 'write', 'handler' => 'api_v1_account_edit',
 		      'summary' => 'Change an account',
-		      'body' => 'password, php ("8.3", "off"); whole-server tokens also: email (true|false), shell (full|jailed|none)',
+		      'body' => 'password, php ("8.3", "off"); whole-server tokens also: email (true|false), shell (full|jailed|none), contact (email address, "" removes it), quota (MB, 0 = none; when quotas are on)',
 		      'mcp' => array('name' => 'account_edit', 'args' => array(
 		          'user' => 'string: Account name',
 		          'password?' => 'string: New password for the account',
 		          'php?' => 'string: PHP version such as "8.3", or "off" to turn PHP off',
 		          'email?' => 'boolean: Enable or disable mail for the domain',
-		          'shell?' => 'enum(full,jailed,none): Shell access'))),
+		          'shell?' => 'enum(full,jailed,none): Shell access',
+		          'contact?' => 'string: Contact email address of the account (empty removes it)',
+		          'quota?' => 'integer: Disk quota in MB, 0 = none'))),
 		array('method' => 'DELETE', 'path' => '/v1/accounts/{user}', 'perm' => 'delete', 'admin' => true, 'handler' => 'api_v1_account_delete',
 		      'summary' => 'Delete an account with its files, mail and databases',
 		      'mcp' => array('name' => 'account_delete', 'args' => array('user' => 'string: Account name'),
@@ -154,18 +156,20 @@ function api_routes() {
 		array('method' => 'GET', 'path' => '/v1/mailboxes', 'perm' => 'read', 'handler' => 'api_v1_mailboxes',
 		      'summary' => 'Mailboxes (?domain=<domain>)',
 		      'mcp' => array('name' => 'mailboxes_list', 'args' => array('domain?' => 'string: Only this domain\'s mailboxes'),
-		                     'description' => 'Mailboxes with their size and whether they can log in.')),
+		                     'description' => 'Mailboxes with their size, whether they can log in and whether they refuse incoming mail.')),
 		array('method' => 'POST', 'path' => '/v1/mailboxes', 'perm' => 'write', 'handler' => 'api_v1_mailbox_create',
 		      'summary' => 'Create a mailbox', 'body' => "email, $pw, size (Hosting Pro)",
 		      'mcp' => array('name' => 'mailbox_create', 'args' => array(
 		          'email' => 'string: The address, e.g. office@example.com (the domain must have mail on)', 'password?' => $mpw,
 		          'size?' => 'string: Mailbox size, e.g. 500M or 2G (needs Reqad Hosting Pro); left out = the account\'s default'))),
 		array('method' => 'PATCH', 'path' => '/v1/mailboxes/{email}', 'perm' => 'write', 'handler' => 'api_v1_mailbox_edit',
-		      'summary' => 'Change a mailbox', 'body' => 'password, enabled (true|false), size (Hosting Pro: e.g. 500M, or default)',
+		      'summary' => 'Change a mailbox', 'body' => 'password, enabled (true|false), size (Hosting Pro: e.g. 500M, or default), refuse_incoming (true|false: senders get "550 <refuse_message>" from their own server, the mailbox still logs in and sends), refuse_message (ASCII, up to 200 characters; "" = the default)',
 		      'mcp' => array('name' => 'mailbox_edit', 'args' => array(
 		          'email' => 'string: The address',
 		          'password?' => 'string: New password',
 		          'enabled?' => 'boolean: false = the mailbox cannot log in (mail is still delivered)',
+		          'refuse_incoming?' => 'boolean: true = all incoming mail is refused while the sending server names the recipient (no bounce from this server); the mailbox can still log in and send',
+		          'refuse_message?' => 'string: The text senders get when refused (plain ASCII, up to 200 characters); empty = "This address does not accept mail."',
 		          'size?' => 'string: Mailbox size, e.g. 500M or 2G, or "default" = the account\'s default (needs Reqad Hosting Pro)'))),
 		array('method' => 'DELETE', 'path' => '/v1/mailboxes/{email}', 'perm' => 'delete', 'handler' => 'api_v1_mailbox_delete',
 		      'summary' => 'Delete a mailbox and its mail',
@@ -277,7 +281,7 @@ function api_routes() {
 		          'account?' => 'string: The hosting account (server tokens only)'),
 		          'description' => 'Add a website to a hosting account: an addon domain or a subdomain with its own folder, web server site and PHP (the main site\'s version). Its DNS A record is made when the zone is at the server\'s DNS provider; otherwise the result says where to point it.')),
 		array('method' => 'DELETE', 'path' => '/v1/domains/{domain}', 'perm' => 'delete', 'handler' => 'api_v1_domain_delete',
-		      'summary' => 'Remove an addon domain or subdomain (files=true also deletes its folder)', 'body' => 'files (true|false)',
+		      'summary' => 'Remove an addon domain or subdomain (files=true also deletes its folder; refused while it has mailboxes unless mailboxes=true, which deletes their addresses and keeps their mail in ~/mail/<domain> unless mail_files=true)', 'body' => 'files, mailboxes, mail_files (true|false)',
 		      'mcp' => array('name' => 'domain_delete', 'args' => array('domain' => 'string: The addon domain or subdomain', 'files?' => 'boolean: Also delete its folder and everything in it (default: keep the files)'),
 		                     'description' => 'Remove an addon domain or subdomain of a hosting account: its web server site, PHP pool and certificate. Its files stay unless files is true. The main domain cannot be removed.')),
 		array('method' => 'POST', 'path' => '/v1/domains/{domain}/mail', 'perm' => 'write', 'handler' => 'api_v1_domain_mail',
@@ -389,14 +393,29 @@ function api_routes() {
 		      'mcp' => array('name' => 'backups_list', 'args' => array('account?' => 'string: The hosting account (server tokens only)'),
 		                     'description' => 'The backups of a hosting account, newest first: the nightly ones on the backup server and archives made on the server, with their date, size and whether that night\'s backup of the account succeeded.')),
 		array('method' => 'GET', 'path' => '/v1/backups/{id}', 'perm' => 'read', 'feature' => 'backup', 'handler' => 'api_v1_backup',
-		      'summary' => 'What one backup holds: parts (website, email, databases), databases, mailboxes, the home folder\'s top entries, what it left out'),
+		      'summary' => 'What one backup holds: parts (website, email, databases), databases, mailboxes, the home folder\'s top entries, what it left out',
+		      'mcp' => array('name' => 'backup_show', 'args' => array('id' => 'string: Backup id from backups_list', 'account?' => 'string: The hosting account (server tokens only)'),
+		                     'description' => 'What one backup of a hosting account holds: its parts (website, email, databases), the databases and mailboxes in it, the top entries of the home folder, and what it left out. Read it before restoring from it.')),
 		array('method' => 'POST', 'path' => '/v1/backups/{id}/restore', 'perm' => 'write', 'feature' => 'backup', 'handler' => 'api_v1_backup_restore',
 		      'summary' => 'Put files, a database or a mailbox back from a backup (in the background; GET /v1/backup-restores/{job})',
-		      'body' => 'kind (files|database|email), target (files: a path in the home folder, "" = all of it; database: the backup\'s database; email: the mailbox), mode (files: missing|overwrite|replace; database: tables|replace|new; email: missing|replace), name + grant (database mode new); account (server tokens)'),
+		      'body' => 'kind (files|database|email), target (files: a path in the home folder, "" = all of it; database: the backup\'s database; email: the mailbox), mode (files: missing|overwrite|replace; database: tables|replace|new; email: missing|replace), name + grant (database mode new); account (server tokens)',
+		      'mcp' => array('name' => 'backup_restore', 'args' => array(
+		          'id' => 'string: Backup id from backups_list',
+		          'kind' => 'enum(files,database,email): What to restore',
+		          'target' => 'string: files: a path relative to the home folder (public_html/wp-content, "" = the whole home folder); database: a database name in the backup; email: a mailbox address in the backup',
+		          'mode' => 'enum(missing,overwrite,replace,tables,new): files: missing (only what is gone comes back, nothing now is changed), overwrite (the backup\'s files replace those with the same name, files only there now stay) or replace (exactly as in the backup: files added since are deleted; not for the whole home folder); database: tables (each table in the backup replaces the same table, tables made since stay), replace (emptied first, exactly as in the backup) or new (into a new database beside it); email: missing (deleted messages and folders come back) or replace (exactly as in the backup: messages that came in since are taken out)',
+		          'name?' => 'string: database mode new: name of the new database, without the account prefix',
+		          'grant?' => 'string: database mode new: a database user to give it to',
+		          'account?' => 'string: The hosting account (server tokens only)'),
+		          'description' => 'Put files, a database or a mailbox back from a backup. Runs in the background (a few seconds to many minutes); check it with backup_restore_status. Files and databases it replaces are kept first in ~/backup-restores/. Only one restore of an account runs at a time.')),
 		array('method' => 'GET', 'path' => '/v1/backup-restores', 'perm' => 'read', 'feature' => 'backup', 'handler' => 'api_v1_backup_restores',
-		      'summary' => 'The latest restores of an account from its backups (server tokens: ?account=)'),
+		      'summary' => 'The latest restores of an account from its backups (server tokens: ?account=)',
+		      'mcp' => array('name' => 'backup_restores', 'args' => array('account?' => 'string: The hosting account (server tokens only)'),
+		                     'description' => 'The latest restores of a hosting account from its backups, newest first, with their status (queued, running, ok, failed) and message.')),
 		array('method' => 'GET', 'path' => '/v1/backup-restores/{job}', 'perm' => 'read', 'feature' => 'backup', 'handler' => 'api_v1_backup_restore_get',
-		      'summary' => 'One restore: status (queued, running, ok, failed), what it said, where it kept what it replaced'),
+		      'summary' => 'One restore: status (queued, running, ok, failed), what it said, where it kept what it replaced',
+		      'mcp' => array('name' => 'backup_restore_status', 'args' => array('job' => 'integer: Restore id from backup_restore or backup_restores', 'account?' => 'string: The hosting account (server tokens only)'),
+		                     'description' => 'One restore from a backup: its status (queued, running, ok, failed), what it did, and the folder in ~/backup-restores/ where it kept what it replaced.')),
 		array('method' => 'GET', 'path' => '/v1/ssl', 'perm' => 'read', 'handler' => 'api_v1_ssl',
 		      'summary' => 'The certificates of an account\'s sites: issuer, expiry, the names covered and missing, and whether it may get free ones (free_ssl) (server tokens: ?account=; ?check=1 adds where each name points)',
 		      'mcp' => array('name' => 'ssl_status', 'args' => array('account?' => 'string: The hosting account (server tokens only)', 'check?' => 'boolean: Also look up where each name points in DNS'),
@@ -619,10 +638,21 @@ function api_routes() {
 		      'mcp' => array('name' => 'wordpress_list', 'args' => array('account?' => 'string: Only this account\'s sites'),
 		                     'description' => 'The WordPress sites on the server (WP Toolkit\'s list): account, domain, URL and the WordPress version the last check saw. wordpress_show reads the live version.')),
 		array('method' => 'GET', 'path' => '/v1/wordpress/install', 'perm' => 'read', 'feature' => 'wptoolkit', 'handler' => 'api_v1_wordpress_install_options',
-		      'summary' => 'What a new WordPress can be: the account\'s sites (and why one cannot take it), languages, the default administrator email (?account=<user>)'),
+		      'summary' => 'What a new WordPress can be: the account\'s sites (and why one cannot take it), languages, the default administrator email (?account=<user>)',
+		      'mcp' => array('name' => 'wordpress_install_options', 'args' => array('account?' => 'string: The hosting account (server tokens only)'),
+		                     'description' => 'Where a new WordPress can be installed: the account\'s sites with their folders and why one cannot take it (already has WordPress, files in the folder...), the languages offered and the default administrator email. Read it before wordpress_install.')),
 		array('method' => 'POST', 'path' => '/v1/wordpress', 'perm' => 'write', 'feature' => 'wptoolkit', 'handler' => 'api_v1_wordpress_install',
 		      'summary' => 'Install WordPress in a site or a folder of it, with a new database (the folder must be empty but for the placeholder page)',
-		      'body' => 'domain, path (folder, optional), title, admin_user, admin_password (empty = made up, given back once), admin_email, locale, account (with a server token)'),
+		      'body' => 'domain, path (folder, optional), title, admin_user, admin_password (empty = made up, given back once), admin_email, locale, account (with a server token)',
+		      'mcp' => array('name' => 'wordpress_install', 'args' => array(
+		          'domain' => 'string: The site, from wordpress_install_options',
+		          'path?' => 'string: A folder of the site for it (blog = example.com/blog); empty = the site itself',
+		          'title' => 'string: The site\'s title',
+		          'admin_user' => 'string: User name of its first administrator (not admin, administrator, wordpress, test...)',
+		          'admin_email?' => 'string: The administrator\'s email (default: the account\'s contact address)',
+		          'locale?' => 'string: Language code from wordpress_install_options (default en_US)',
+		          'account?' => 'string: The hosting account (server tokens only)'),
+		          'description' => 'Install WordPress with a new database in a site or a folder of it. The folder must be empty but for the placeholder page. The administrator gets a strong password made up for it, given back once. Takes up to a minute.')),
 		array('method' => 'POST', 'path' => '/v1/wordpress/scan', 'perm' => 'write', 'feature' => 'wptoolkit', 'handler' => 'api_v1_wordpress_scan',
 		      'summary' => 'Look for an account\'s WordPress sites in all its sites\' folders and update the list', 'body' => 'account (with a server token)',
 		      'mcp' => array('name' => 'wordpress_scan', 'args' => array('account' => 'string: The hosting account'),
@@ -880,7 +910,7 @@ function api_v1_account_create(array $ctx) {
 		'disk_quota' => (int)api_str($b, 'quota'),
 		'dns' => (bool)api_bool($b, 'dns'), 'letsencrypt' => (bool)api_bool($b, 'letsencrypt'),
 		'email' => (bool)api_bool($b, 'email'), 'www' => (bool)api_bool($b, 'www'),
-		'shell' => $shell, 'php' => api_str($b, 'php'), 'package' => api_str($b, 'package'),
+		'shell' => $shell, 'php' => api_str($b, 'php'), 'package' => api_str($b, 'package'), 'owner' => api_str($b, 'owner'),
 	));
 	return api_created(api_with_password($r, $pw, $gen));
 }
@@ -900,9 +930,10 @@ function api_v1_account_edit(array $ctx) {
 	}
 	if (isset($b['php']))
 		$o['php'] = api_str($b, 'php', 20);
-	/* mail on/off and the shell type are the server admin's: an account token
-	   could otherwise give itself the full shell its package does not have */
-	foreach (array('email', 'shell') as $k)
+	/* mail on/off, the shell type and the contact address are the server admin's:
+	   an account token could otherwise give itself the full shell its package
+	   does not have, or a contact address without confirming it */
+	foreach (array('email', 'shell', 'contact', 'quota') as $k)
 		if (array_key_exists($k, $b) && $ctx['scope'] !== null)
 			return api_error(403, "Only a token for the whole server can change $k.");
 	if (array_key_exists('email', $b)) {
@@ -915,8 +946,18 @@ function api_v1_account_edit(array $ctx) {
 		if (!in_array($o['shell'], array('full', 'jailed', 'none'), true))
 			return api_error(400, 'shell must be full, jailed or none.');
 	}
+	if (array_key_exists('contact', $b)) {
+		if (!is_string($b['contact']))
+			return api_error(400, 'contact must be an email address or "".');
+		$o['contact'] = trim($b['contact']);
+	}
+	if (array_key_exists('quota', $b)) {
+		if (!is_int($b['quota']) || $b['quota'] < 0)
+			return api_error(400, 'quota must be a number of MB, 0 for none.');
+		$o['disk_quota'] = $b['quota'];
+	}
 	if (count($o) === 1)
-		return api_error(400, 'Nothing to change: send password, php, email or shell.');
+		return api_error(400, 'Nothing to change: send password, php, email, shell, contact or quota.');
 	return account_edit($db, $o);
 }
 
@@ -1151,8 +1192,17 @@ function api_v1_mailbox_edit(array $ctx) {
 			return api_error(400, 'size must be a size like 500M or 2G, or "default".');
 		$o['size'] = (string)$b['size'];
 	}
+	if (array_key_exists('refuse_incoming', $b)) {
+		$v = api_bool($b, 'refuse_incoming');
+		if ($v === null) return api_error(400, 'refuse_incoming must be true or false.');
+		$o['refuse_incoming'] = $v;
+	}
+	if (array_key_exists('refuse_message', $b)) {
+		if (!is_scalar($b['refuse_message'])) return api_error(400, 'refuse_message must be a string.');
+		$o['refuse_message'] = (string)$b['refuse_message'];
+	}
 	if (count($o) === 1)
-		return api_error(400, 'Nothing to change: send password, enabled or size.');
+		return api_error(400, 'Nothing to change: send password, enabled, size, refuse_incoming or refuse_message.');
 	return email_edit($o);
 }
 
@@ -1549,7 +1599,8 @@ function api_v1_domain_delete(array $ctx) {
 	$a = addon_domain_get($GLOBALS['ini'], $domain);
 	if (!$a)
 		return api_error(404, "$domain is not an addon domain.");
-	return domain_addon_delete($a['user'], $domain, (bool)(api_bool($ctx['body'], 'files') ?? api_bool($ctx['query'], 'files')));
+	$flag = function ($k) use ($ctx) { return (bool)(api_bool($ctx['body'], $k) ?? api_bool($ctx['query'], $k)); };
+	return domain_addon_delete($a['user'], $domain, $flag('files'), $flag('mailboxes'), $flag('mail_files'));
 }
 
 function api_v1_domain_mail(array $ctx) {
@@ -1907,7 +1958,9 @@ function api_v1_mail_dns(array $ctx) {
 	if ($e) return $e;
 	if ($domains === null)
 		return api_error(400, 'Say which domain: ?domain=<domain>.');
-	return result_ok('', array_values(mail_dns_check_many($domains)));
+	$checks = mail_dns_check_many($domains);
+	mail_dns_health_refresh($checks);
+	return result_ok('', array_values($checks));
 }
 
 function api_v1_mail_dns_fix(array $ctx) {

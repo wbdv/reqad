@@ -343,7 +343,7 @@
 <? /*
                       <li><a class="dropdown-item" href="">Anti-Spam Settings</a>
 */ ?>
-                      <li><a class="dropdown-item" href="/webmail/" target="_blank">Webmail</a>
+                      <li><a class="dropdown-item" href="<?=h(webmail_url() ?: '/webmail/');?>" target="_blank">Webmail</a>
 <? /*
                       <li><a class="dropdown-item <?php if($route=='check-email-settings') echo 'active'; ?>" href="/check-email-settings/">Check Email Settings</a>
                       <li><a class="dropdown-item <?php if($route=='email-stats') echo 'active'; ?>" href="/email-stats/" style="padding-left:53px;">SMTP Statistics</a>

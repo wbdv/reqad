@@ -40,7 +40,8 @@ if($domain=='' || !isset($domain) || $user=='' || !isset($user)) {
     	error_log("tmpfname $tmpfname\n", 3, __DIR__.'/../../log/debug_log');
         file_put_contents($tmpfname, $file_contents);
 	    #shell_exec("sudo cat $tmpfname > $file");
-	    shell_exec("sudo cp $tmpfname $file");
+	    shell_exec('sudo install -m 0644 -o root -g root '.escapeshellarg($tmpfname).' '.escapeshellarg($file));
+	    unlink($tmpfname);
     	error_log("apache conf file $file was written\n", 3, __DIR__.'/../../log/debug_log');
         #echo $file."\n";
 		#echo '<pre>'; echo htmlspecialchars(file_het_contents($file)); exit;

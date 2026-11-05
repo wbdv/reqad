@@ -6,6 +6,7 @@
 	}
 
     include('defines.php');
+    $db->busyTimeout(5000);   // wait for another writer (a transfer, cron) instead of failing at once
     include('modules/functions.php');
     // Account / database / email operations, shared with bin/reqad (and the API).
     foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
@@ -62,18 +63,18 @@
 
 	$allowed_actions = array(
 		'accounts'			=> array('create-account', 'edit-account', 'delete-account'),
-		'addon-domains'		=> array('add-addon-domain', 'edit-addon-domain', 'delete-addon-domain', 'addon-domain-mail'),
+		'addon-domains'		=> array('add-addon-domain', 'edit-addon-domain', 'delete-addon-domain', 'addon-domain-mail', 'addon-domain-redirect'),
 		'account'			=> array('alias-add', 'alias-delete', 'reissue-ssl', 'config-save', 'config-restore', 'account-limits', 'pool-pm', 'account-db-limit'),
 		'databases' 		=> array('create-database', 'delete-database', 'change-db-password', 'assign-database'),
 		'email-accounts' 	=> array('create-email', 'edit-email', 'delete-email'),
 		'email'				=> array('clamav-exim'),
-		'email-config'		=> array('save-mail-settings', 'save-mail-rbl', 'save-mail-skiprbl', 'reset-mail-limit'),
+		'email-config'		=> array('save-mail-settings', 'save-mail-rbl', 'save-mail-dbl', 'save-mail-skiprbl', 'reset-mail-limit'),
 		'forwarders'		=> array('create-forwarder', 'edit-forwarder', 'delete-forwarder'),
 		'autoresponders'	=> array('create-autoresponder', 'edit-autoresponder', 'delete-autoresponder'),
 		'email-filters'		=> array('create-email-filter', 'edit-email-filter', 'delete-email-filter', 'save-email-filter-raw'),
 		'spam-filters'		=> array('create-spam-rule', 'delete-spam-rule', 'save-spam-rules'),
 		'ssl'				=> array('update-ssl'),
-		'settings'			=> array('settings', 'settings-smtp', 'auto-update-cron'),
+		'settings'			=> array('settings', 'settings-smtp', 'auto-update-cron', 'settings-limits'),
 		'security'			=> array('security-password', 'security-2fa-start', 'security-2fa-enable',
 							       'security-2fa-disable', 'security-2fa-codes', 'security-session-revoke',
 							       'security-sessions-revoke-all', 'security-unban', 'security-fw', 'security-device-forget', 'security-email', 'security-passkey', 'security-shell-default', 'security-shell-log'),
@@ -86,7 +87,7 @@
 		'dns-keys'			=> array('dns-keys-toggle', 'dns-key-create', 'dns-key-revoke', 'dns-key-zones-add',
 							       'dns-key-zone-release', 'dns-key-zones-move', 'dns-key-limit'),
 		'php-settings'		=> array('php-settings'),
-		'wp-toolkit'		=> array('wp-install', 'wp-clone', 'wp-scan', 'wp-auto-login'),
+		'wp-toolkit'		=> array('wp-install', 'wp-clone', 'wp-auto-login'),
 		'reboot'			=> array('reboot-server'),
 		'backup'			=> array('generate-backup', 'delete-backup', 'download-backup', 'restore-backup',
 							       'remote-backup-settings', 'remote-backup-cron', 'remote-backup-restore',

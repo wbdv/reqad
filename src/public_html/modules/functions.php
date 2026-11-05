@@ -1524,13 +1524,14 @@ function ajax_required_feature($action) {
 		'ajax-webmail-ticket'     => 'email',
 		'ajax-mobileconfig'       => 'email',
 		'ajax-wp-install'         => 'wptoolkit',
-		'ajax-wp-scan'            => 'wptoolkit',
 		'ajax-transfer-start'     => 'transfer',
 		'ajax-transfer-status'    => 'transfer',
 		'ajax-transfer-stop'      => 'transfer',
 		'ajax-transfer-accounts'  => 'transfer',
 		'ajax-transfer-php'       => 'transfer',
 		'ajax-transfer-precheck'  => 'transfer',
+		'ajax-transfer-zones'     => 'transfer',
+		'ajax-transfer-zones-start' => 'transfer',
 		'ajax-fm-list'            => 'filemanager',
 		'ajax-fm-read'            => 'filemanager',
 		'ajax-fm-save'            => 'filemanager',
@@ -1629,9 +1630,10 @@ function plugin_for_action($action) {
  * 'limit.allows'); a plugin that throws keeps the value unchanged.
  *
  * Events fired by core (data keys in brackets):
- *   account.created  [user, domain, uid, package ('' = not asked for)]
+ *   account.created  [user, domain, uid, package ('' = not asked for), owner ('' = the admin)]
  *   account.edited   [user, domain, changed]
- *   account.deleted  [user, domain]
+ *   account.deleted  [user, domain, owned (accounts it owned as a reseller, now the admin's)]
+ *   account.owner_changed [user, owner, old]  ('' = the server admin; account_owner_set(), db 1056)
  *   database.created [account, database, user] database.deleted [database, users_dropped]
  *   database_user.created [account, user]     database_user.deleted [user, hosts]
  *   database.access  [user, database, access (all|none)]
@@ -1652,7 +1654,7 @@ function plugin_for_action($action) {
  *   dns_record.changed [account, zone, name, type, value, old: {name, type, value}]  dns_record.deleted [account, zone, name, type, value]
  *     (app/functions/dns.php: the API, the account panel's DNS zone, 2087 DNS Zones)
  *   dns_zone.created [zone, ip, key?]  dns_zone.deleted [zone, account (its owner, '' = none), key]  dns_zone.imported [account, zone, sets]
- *     (app/functions/dns_tools.php: 2087 DNS Zones; filter dns.nameservers = the name servers zones should name;
+ *     (app/functions/dns_tools.php: 2087 DNS Zones; filter dns.nameservers = the name servers zones should name, + zone ('' = the server's own; a reseller's zones: its private ones);
  *      key = the DNS API key that made / held the zone, app/functions/dns_keys.php)
  *   mail_provider.changed [account, domain, provider (local|google|microsoft|zoho|other), remote (its mail is left to that provider)]
  *     (app/functions/email_tools.php: the API, the account panel's DNS zone)
@@ -1664,6 +1666,7 @@ function plugin_for_action($action) {
  *   account.contact_changed [account, email, old]  account.notify_changed [account, kinds]
  *   account.notified [account, kind, to, subject]  (app/functions/notify.php: the account panel's Profile page)
  *   ssl.issued       [account, domain, names]   (a Let's Encrypt certificate, domains.php)
+ *   ssl.renewed      [account, domain, was]     (a free certificate from elsewhere replaced by Let's Encrypt: was = its issuer; ssl_renew.php)
  *   wordpress.scanned [account, added, removed] (installs found / gone, app/functions/wordpress.php)
  *   wordpress.updated [account, domain, what, items]
  *   wordpress.installed [account, domain, path, database]
@@ -1693,9 +1696,14 @@ function plugin_for_action($action) {
  * Create account / Manage account dialogs; Manage hands fields named
  * plugin[<name>] to account.edit.apply as $o['plugin'][<name>]),
  * accounts.user.badge (HTML after the user name in the accounts list, + user),
+ * accounts.user.name (the user name in the accounts list as HTML, escaped
+ * by core; e.g. bold for a reseller, + user),
  * accounts.columns (extra columns of the accounts list, after User:
  * array(array('title' => ..., 'cell' => fn($row) => HTML), ...); with
  * 'after' => 'domain' after Domain instead),
+ * accounts.columns.hide (core columns of the accounts list to leave out so
+ * the plugin's own fit without scrolling: array of 'email', 'shell' (the
+ * jailed / SFTP only badge); both are still in Accounts > Manage),
  * email.create.check / email.edit.check ('' or why email_create() /
  * email_edit() must refuse their $o, + $o, account; e.g. a mailbox size over
  * the package's), email.create.apply / email.edit.apply (array(changes,
@@ -1726,15 +1734,41 @@ function plugin_for_action($action) {
  * these three,
  * stats.needed (false, or true when an add-on needs the sites' logs counted
  * while visitor stats are switched off: Hosting Pro's bandwidth limits;
- * app/functions/stats.php).
+ * app/functions/stats.php),
+ * wptoolkit.site_buttons (HTML of extra buttons on a WP Toolkit row, after
+ * Login, + the wordpress table row: e.g. the malware scanner's Scan),
+ * account.owner.check ('' or why reseller $owner may not own account $user,
+ * + owner, user (an account about to be made too); the default refuses, so
+ * without the reseller add-on only the admin owns accounts),
+ * reseller.active (false, or true when $name is a reseller now, + name: the
+ * reseller scope of scope_check() asks it first),
+ * transfer.can (array(): what an add-on takes over from cPanel in the
+ * transfer tool - 'packages' => true (Hosting Pro), 'resellers' => true),
+ * transfer.reseller and transfer.account (array() of log lines, "!" in
+ * front = a warning, + user, what cPanel says: plan, package (its KEY=VALUE
+ * settings or null), package_owner (the reseller whose "<name>_" it has),
+ * owner ('' = root), server, reseller (null, or acls, limits, limits_api,
+ * ns, mainip, ips, packages (name => KEY=VALUE), owns, email)) - the last
+ * step of a transferred account (scripts/transfer_cpanel.php): the first
+ * only for a cPanel reseller, before the second.
  * Plugins may add their own fields to a mailbox's /etc/dovecot/users line;
  * core keeps them when it rewrites the line (mailbox_extra_fields()). For
  * state every site of an account must carry, core writes named marker blocks
  * into the account's vhosts: account_vhost_marker() (app/functions/accounts.php).
  *
+ * Events fired by the reseller add-on (plugins/reseller): reseller.created
+ * [user, limits], reseller.changed [user, limits], reseller.deleted [user,
+ * accounts (given back to the admin)].
+ *
  * Events fired by Hosting Pro: account.suspended [user, reason, source]
  * account.unsuspended [user], account.ips [user, ipv4, ipv6], package.*
- * (see plugins/hosting). Core binds an account's vhosts to extra addresses
+ * (see plugins/hosting). Filters Hosting Pro asks other add-ons: ip.use (''
+ * or why account $user may not use extra address $ip, + address row, user,
+ * the accounts using it; the default refuses an address another account
+ * uses - the reseller add-on keeps a reseller's addresses for its accounts
+ * and lets them share its shared one), ip.holder (null or array(label,
+ * shared): who an address was given to, for the IP addresses page and
+ * Manage account). Core binds an account's vhosts to extra addresses
  * with account_vhost_listen() (app/functions/accounts.php).
  */
 /* Core's own listeners, run before the plugins': event => functions. */
@@ -4019,6 +4053,16 @@ function sieve_quote($s) {
 	return '"' . str_replace(array('\\', '"'), array('\\\\', '\\"'), (string)$s) . '"';
 }
 
+/* The headers the field 'any header' (cPanel's "Any Header", Exim's
+   $message_headers) tests. Sieve cannot test every header, so it is this list:
+   the senders, the recipients (Delivered-To also holds a Bcc'd address),
+   Received, Subject and List-Id. Changing it breaks the round trip of scripts
+   already written: the parser only knows this exact set. */
+function sieve_any_headers() {
+	return array('From', 'Sender', 'Reply-To', 'Return-Path', 'To', 'Cc', 'Bcc', 'Delivered-To',
+	             'X-Original-To', 'Envelope-To', 'Resent-From', 'Resent-To', 'Received', 'Subject', 'List-Id');
+}
+
 /* Map a rule condition onto a Sieve test.
    $c = array('field' => ..., 'op' => ..., 'value' => ...) */
 function sieve_render_test($c, &$requires) {
@@ -4057,6 +4101,9 @@ function sieve_render_test($c, &$requires) {
 		/* cPanel's "Any Recipient". Sieve takes a header list, which is one test
 		   rather than an anyof of two, so it round-trips as a single condition. */
 		$test = 'header ' . $match . ' ["To", "Cc"] ' . sieve_quote($value);
+	} else if ($field === 'any header') {
+		$test = 'header ' . $match . ' [' . implode(', ', array_map('sieve_quote', sieve_any_headers())) . '] '
+		      . sieve_quote($value);
 	} else if ($field === 'to' || $field === 'from') {
 		/* envelope is more reliable than the header for these, but the header is
 		   what users mean when they read a message, so keep the header test. */
@@ -4877,17 +4924,23 @@ function sieve_parse_test($t) {
 		if ($match === null || count($strs) < 2)
 			return false;
 		/* Last string is the value; anything before it is a header name. More than
-		   one name is only modelled for To+Cc ("Any Recipient") — any other list
-		   is left to the raw editor rather than silently flattened. */
+		   one name is only modelled for To+Cc ("Any Recipient") and the exact
+		   list of sieve_any_headers() — any other list is left to the raw editor
+		   rather than silently flattened. */
 		$value = array_pop($strs);
 		if (count($strs) === 1) {
 			$field = $strs[0];
 		} else {
 			$names = array_map('strtolower', $strs);
 			sort($names);
-			if ($names !== array('cc', 'to'))
+			$any = array_map('strtolower', sieve_any_headers());
+			sort($any);
+			if ($names === array('cc', 'to'))
+				$field = 'to,cc';
+			else if ($names === $any)
+				$field = 'any header';
+			else
 				return false;
-			$field = 'to,cc';
 		}
 		$op    = substr($match, 1);     /* is | contains | matches | regex */
 
@@ -5185,12 +5238,16 @@ function ef_pipe_programs() {
  * admin to read, never guessed at.
  *
  * Returns array('rules' => array(<rule rows>), 'skipped' => array(
- *     array('raw' => <the block>, 'why' => <one line>), ...)).
+ *     array('raw' => <the block>, 'why' => <one line>), ...),
+ *     'refuse' => <text> or null: an unconditional top-level `fail`, cPanel's
+ *     "suspend incoming mail", which is the mailbox's refuse-incoming setting
+ *     here (email_edit() refuse_incoming), not a filter rule).
  */
 function exim_filter_parse($src, $ctx = array()) {
 	$lines = preg_split('/\r\n|\r|\n/', (string)$src);
 	$rules = array();
 	$skip  = array();
+	$refuse = null;
 	$n     = count($lines);
 	$i     = 0;
 	$name  = null;
@@ -5214,14 +5271,19 @@ function exim_filter_parse($src, $ctx = array()) {
 		   decoding directive, not a rule, and Sieve does the equivalent itself. */
 		if (preg_match('/^headers\s+charset\b/i', $l)) { $i++; continue; }
 
-		/* An unconditional top-level `fail` / `save "/dev/null"` is not a filter
-		   at all: it is how cPanel marks a mailbox whose incoming mail has been
-		   suspended. Say so, rather than reporting it as an unreadable rule. */
-		if (preg_match('/^fail\b/i', $l) || preg_match('/^save\s+"?\/dev\/null"?/i', $l)) {
-			$skip[] = array('raw' => $l, 'why' => 'this is "suspend incoming mail" flag for the '
-			              . 'mailbox, not a filter — every message is refused unconditionally. Reqad has no '
-			              . 'equivalent, so nothing is imported; delete or disable the mailbox if you want '
-			              . 'that to continue');
+		/* An unconditional top-level `fail` is not a filter at all: it is how
+		   cPanel marks a mailbox whose incoming mail has been suspended. It comes
+		   back as 'refuse' (its text), the mailbox's refuse-incoming setting. */
+		if (preg_match('/^fail(?:\s+text)?\s*(.*)$/i', $l, $fm)) {
+			$refuse = exim_filter_unquote(rtrim(trim($fm[1]), ';'));
+			$i++;
+			continue;
+		}
+		/* `save "/dev/null"` on its own throws every message away. */
+		if (preg_match('/^save\s+"?\/dev\/null"?/i', $l)) {
+			$skip[] = array('raw' => $l, 'why' => 'throws every message away unconditionally, which is '
+			              . 'not imported as a filter; turn on "Refuse incoming mail" for the mailbox if '
+			              . 'nothing should arrive (senders are told, no bounce is sent)');
 			$i++;
 			continue;
 		}
@@ -5327,7 +5389,7 @@ function exim_filter_parse($src, $ctx = array()) {
 		);
 	}
 
-	return array('rules' => $rules, 'skipped' => $skip);
+	return array('rules' => $rules, 'skipped' => $skip, 'refuse' => $refuse);
 }
 
 /* Blank out the parts of Exim filter text that keywords must not be matched in:
@@ -5529,7 +5591,9 @@ function exim_filter_test($t, &$why, $ctx = array()) {
 	/* Header names are case-insensitive in Sieve, but keep the spelling from the
 	   source so a rule reads as "X-Spam-Flag", not "x-spam-flag". */
 	$field = null;
-	if ($var === '$message_body')        $field = 'body';
+	/* cPanel's "Any Header" */
+	if ($var === '$message_headers' || $var === '$message_headers_raw') $field = 'any header';
+	else if ($var === '$message_body')   $field = 'body';
 	else if ($var === '$reply_address')  $field = 'reply-to';
 	else if (strpos($var, '$header_') === 0) $field = substr($raw_var, 8);
 	else if (strpos($var, '$h_') === 0)      $field = substr($raw_var, 3);
@@ -5606,12 +5670,14 @@ function exim_filter_action($a, &$why, $ctx = array()) {
 	if (preg_match('/^deliver\s+(.*)$/i', $a, $m)) {
 		$to = exim_expand_vars(exim_filter_unquote($m[1]), $ctx, $why);
 		if ($to === false) return false;
-		$to = exim_redirect_address($to, $why);
-		if ($to === false) return false;
+		/* the mailbox's own +folder address first: the folder name may have
+		   spaces ("claudia+Rentrop si etc"@...), which no redirect allows */
 		$fold = ef_detail_folder($to, $ctx);
 		if ($fold !== null)
 			return $fold === '' ? array('type' => 'keep',     'value' => '')
 			                    : array('type' => 'fileinto', 'value' => $fold);
+		$to = exim_redirect_address($to, $why);
+		if ($to === false) return false;
 		return array('type' => 'redirect', 'value' => $to);
 	}
 	if (preg_match('/^fail\s+(.*)$/i', $a, $m)) {
@@ -5699,15 +5765,20 @@ function ef_detail_folder($addr, $ctx) {
 
 	$lp  = strtolower($ctx['localpart']);
 	$dom = strtolower($ctx['domain']);
+	$addr = trim($addr);
+	/* a quoted local part: "dt+My folder"@domain */
+	if (preg_match('/^"((?:[^"\\\\]|\\\\.)*)"(@.*)$/', $addr, $q))
+		$addr = stripslashes($q[1]) . $q[2];
 	$at  = strrpos($addr, '@');
 	if ($at === false) return null;
-	if (substr($addr, $at + 1) !== $dom) return null;
+	if (strtolower(substr($addr, $at + 1)) !== $dom) return null;
 
 	$alp = substr($addr, 0, $at);
-	if ($alp === $lp) return '';                       /* itself, no detail */
-	if (strpos($alp, $lp . '+') !== 0) return null;    /* a different mailbox */
+	if (strtolower($alp) === $lp) return '';                   /* itself, no detail */
+	if (strpos(strtolower($alp), $lp . '+') !== 0) return null; /* a different mailbox */
 
-	$detail = substr($alp, strlen($lp) + 1);
+	/* the folder keeps its case: folder names are case-sensitive */
+	$detail = trim(substr($alp, strlen($lp) + 1));
 	if ($detail === '') return '';
 	return str_replace('.', '/', $detail);
 }
@@ -5753,7 +5824,8 @@ function exim_maildir_to_folder($path) {
 }
 
 function ef_valid_field($f) {
-	if ($f === 'body' || $f === 'size' || $f === 'to,cc')
+	/* 'to,cc' and 'any header' cannot be header names (no comma or space in one) */
+	if ($f === 'body' || $f === 'size' || $f === 'to,cc' || $f === 'any header')
 		return true;
 	return preg_match('/^[A-Za-z0-9][A-Za-z0-9\-]{0,63}$/', (string)$f) === 1;
 }
@@ -7220,6 +7292,56 @@ function mail_vsz_set($vsz) {
 	return array('error' => '', 'success' => 'IMAP/POP3 memory limit set to '.h($vsz).' and dovecot restarted.');
 }
 
+/* ---- Dovecot connected mail apps at most ----------------------------------
+   service imap-login / pop3-login { process_limit }: one login process per
+   connection, kept for the whole TLS session, so this caps how many mail apps
+   (and webmail requests) can be connected at once. Dovecot's default is 100;
+   when it is full new connections are dropped and webmail says "Connection to
+   storage server failed". Own file and script, like the memory limit above. */
+
+if (!defined('LOGIN_LIMIT_HELPER'))
+	define('LOGIN_LIMIT_HELPER', _PATH.'/scripts/update/setup_dovecot_login_limits.sh');
+
+/* What dovecot enforces (`doveconf -n`) plus how many imap-login processes run
+   now. Cached for the request. */
+function mail_login_limit_status($refresh = false) {
+	static $cache = null;
+	if ($cache !== null && !$refresh) return $cache;
+	$out = array(); $rc = 0;
+	exec('sudo -n /usr/bin/bash '.escapeshellarg(LOGIN_LIMIT_HELPER).' --status 2>&1', $out, $rc);
+	$st = array('limit' => '', 'default' => true, 'used' => 0, 'ok' => ($rc === 0));
+	foreach ($out as $line) {
+		$line = trim($line);
+		if (strpos($line, 'login=') === 0)   $st['limit']   = substr($line, 6);
+		if (strpos($line, 'default=') === 0) $st['default'] = (substr($line, 8) === 'yes');
+		if (strpos($line, 'used=') === 0)    $st['used']    = (int)substr($line, 5);
+	}
+	$cache = $st;
+	return $st;
+}
+
+/* "In use now" under the field, so the admin sees how close it is. */
+function mail_login_limit_note() {
+	$st = mail_login_limit_status();
+	if (!$st['ok'] || $st['limit'] === '') return '';
+	$full = ($st['used'] >= (int)$st['limit'] * 0.9);
+	return '<br><span class="'.($full ? 'text-danger' : 'text-muted').'">In use now: '.(int)$st['used'].' of '.h($st['limit']).
+	       ($st['default'] ? ' (dovecot default)' : '').'.</span>';
+}
+
+/* A reload is enough here (tested: the master rebuilds the services with the
+   new limit and open connections stay). */
+function mail_login_limit_set($limit) {
+	if (!preg_match('/^\d{2,5}$/', $limit) || (int)$limit < 16 || (int)$limit > 20000)
+		return array('error' => 'Invalid connection limit.', 'success' => '');
+	$out = array(); $rc = 0;
+	exec('sudo -n /usr/bin/bash '.escapeshellarg(LOGIN_LIMIT_HELPER).' --limit '.escapeshellarg($limit).' 2>&1', $out, $rc);
+	mail_login_limit_status(true);
+	if ($rc !== 0)
+		return array('error' => 'Could not set the connection limit: '.h(implode(' ', array_slice($out, -3))), 'success' => '');
+	return array('error' => '', 'success' => 'Mail apps connected at most: '.h($limit).' (dovecot reloaded, open connections kept).');
+}
+
 function mail_setting_defs($which) {
 	if ($which === 'exim') return array(
 		'identity' => array('title' => 'Identity &amp; logging', 'keys' => array(
@@ -7343,6 +7465,9 @@ function mail_setting_defs($which) {
 			'imap_idle_notify_interval' => array('label' => 'IMAP IDLE notify interval', 'type' => 'text', 'pattern' => '#^\d{1,6}\s*(secs?|mins?|hours?|s|m|h)?$#',
 				'help' => 'How often dovecot pings an idle client, e.g. <code>2 mins</code>.'),
 			'imap_max_line_length' => array('label' => 'IMAP max line length', 'type' => 'text', 'pattern' => '#^\d{1,12}\s*[kKmM]?$#'),
+			'mail_login_limit' => array('label' => 'Connected mail apps at most', 'type' => 'select', 'special' => 'login',
+				'choices' => array('100' => '100 (dovecot default)', '256' => '256', '512' => '512', '1024' => '1024 (recommended)', '2048' => '2048', '4096' => '4096'),
+				'help' => 'How many IMAP and POP3 connections can be open at once (the <code>process_limit</code> of <code>imap-login</code> and <code>pop3-login</code>). Every phone and desktop mail app stays connected all day and holds one, and webmail takes one for each page it loads. When they are all in use, dovecot <strong>drops new connections</strong>: mail apps report the server as down, webmail says <em>Connection to storage server failed</em>, and the mail log shows <code>service(imap-login): process_limit (100) reached, client connections are being dropped</code>. Each one is a small process (a few MB). Saving this reloads dovecot; open connections stay.'.mail_login_limit_note()),
 			'mail_vsz_limit' => array('label' => 'Memory limit per mail process', 'type' => 'select', 'special' => 'vsz',
 				'choices' => array('256M' => '256 MB (dovecot default)', '512M' => '512 MB', '1024M' => '1 GB', '2048M' => '2 GB', '4096M' => '4 GB'),
 				'help' => 'Address space a single <code>imap</code>, <code>pop3</code> or <code>indexer-worker</code> process may use. A process that hits the ceiling is <strong>killed mid-session</strong> — the user sees the connection drop while opening a large message or running a search, and the mail log shows <code>child NNN returned error 83 (Out of memory (service imap { vsz_limit=256 MB }))</code>. Raise it if you see that. The full-text indexer is often the process that dies first, and it surfaces on the imap side as <code>Mailbox INBOX: indexer failed to index mailbox</code>, so all three are set together — raising one alone just moves the error somewhere else. This is address space, not RAM: a higher limit does not reserve memory, it stops dovecot refusing the mapping. Large mailboxes, full-text searches and reading compressed mail all push against it. Saving this <strong>restarts dovecot</strong>, because the limit is read by the master process at startup.'),
@@ -7531,6 +7656,8 @@ function mail_settings_current($which) {
 		if (!empty($d['special']) && $d['special'] === 'compress') { $out[$k] = mail_compress_enabled() ? 'yes' : 'no'; continue; }
 		/* limits.conf, via doveconf -- what dovecot is actually enforcing */
 		if (!empty($d['special']) && $d['special'] === 'vsz')      { $st = mail_vsz_status(); $out[$k] = $st['vsz']; continue; }
+		/* login-limits.conf, via doveconf */
+		if (!empty($d['special']) && $d['special'] === 'login')    { $st = mail_login_limit_status(); $out[$k] = $st['limit']; continue; }
 		$v = mail_setting_read($content, mail_setting_line_key($k, $d), $which);
 		/* A key the config file still spells by its deprecated name (SpamAssassin's
 		   `required_hits` for `required_score`) is the value in force -- show it,
@@ -7626,6 +7753,10 @@ function mail_setting_validate($key, $def, $value) {
 	   mail_settings_apply() turns it into a line removal, same as a cleared
 	   text field. Without this, merely opening the page and saving would write
 	   the first choice into the file as though the admin had picked it. */
+	/* the connection limit may have been set to another number by hand (shown
+	   as "(current)"); mail_login_limit_set() checks the range */
+	if (!empty($def['special']) && $def['special'] === 'login' && preg_match('/^\d{2,5}$/', $value))
+		return '';
 	if ($type === 'select')
 		return ($value === '' || isset($def['choices'][$value])) ? '' : $label.': not one of the offered values.';
 
@@ -7718,6 +7849,16 @@ function mail_settings_apply($which, $posted) {
 		   restarts. */
 		if (!empty($def['special']) && $def['special'] === 'compress') { $want_compress = ($value === 'yes'); continue; }
 		if (!empty($def['special']) && $def['special'] === 'vsz')      { $want_vsz = $value; continue; }
+		/* a reload, no restart: done at once */
+		if (!empty($def['special']) && $def['special'] === 'login') {
+			if ($value === '') continue;
+			$st = mail_login_limit_status();
+			if ($value === $st['limit']) continue;
+			$r = mail_login_limit_set($value);
+			if ($r['error'] !== '') return $r;
+			$special_msgs[] = $r['success'];
+			continue;
+		}
 
 		/* not a local.conf key: it owns a generated credential and a passdb
 		   block, so it has its own enable/disable path */
@@ -7903,22 +8044,74 @@ function exim_limits_reset($kind, $domain) {
 /* ---- Exim DNS blocklists (RBLs) -----------------------------------------
    The two uncommented `dnslists =` lines in exim.conf are, in order, the one in
    the authenticated-sender ACL and the one in the RCPT ACL. They are edited by
-   position rather than by name because exim ACL conditions have no identifiers. */
+   position rather than by name because exim ACL conditions have no identifiers.
+   The sender domain check (Spamhaus DBL) is a block of its own, written only by
+   scripts/update/setup_exim_dbl.sh, and is not one of these lists.
+
+   An item may carry an answer filter (`zen.spamhaus.org=127.0.0.2,...`: only
+   these answers count). The panel shows and takes the bare name; on save a
+   name keeps the filter it had, and a Spamhaus IP list gets the standard one
+   (exim_dnslist_filter()), because exim counts ANY answer as a listing and
+   Spamhaus answers an error code (127.255.255.x) to public resolvers. */
+
+function exim_dbl_marker() {
+	return '### --- Reqad managed (sender-domain-dbl) --- ###';
+}
 
 function exim_dnslists_read() {
 	$content = (string)mail_config_read('exim');
 	$out = array();
+	$in_dbl = false;
 	foreach (explode("\n", $content) as $n => $line) {
+		if (strpos($line, 'Reqad managed (sender-domain-dbl)') !== false) {   // begin / end marker
+			$in_dbl = (strpos($line, '--- end Reqad') === false);
+			continue;
+		}
+		if ($in_dbl) continue;
 		if (!preg_match('/^(\s*)dnslists(\s*)=(\s*)(.*)$/', $line, $m)) continue;
 		if (preg_match('/^\s*#/', $line)) continue;                   // commented-out example
 		$hosts = array();
+		$names = array();
 		foreach (explode(':', $m[4]) as $h) {
 			$h = trim($h);
-			if ($h !== '') $hosts[] = $h;
+			if ($h === '') continue;
+			$hosts[] = $h;
+			$names[] = exim_dnslist_name($h);
 		}
-		$out[] = array('line' => $n, 'indent' => $m[1], 'hosts' => $hosts);
+		$out[] = array('line' => $n, 'indent' => $m[1], 'hosts' => $hosts, 'names' => $names);
 	}
 	return $out;
+}
+
+/* the list's name without an answer filter or key: zen.spamhaus.org=127.0.0.2 -> zen.spamhaus.org */
+function exim_dnslist_name($item) {
+	return (string)preg_replace('/[=!&\/].*$/s', '', trim((string)$item));
+}
+
+/* The answers that are real listings, for the lists that answer errors too.
+   Same codes as setup_exim_dbl.sh. '' = no filter. */
+function exim_dnslist_filter($name) {
+	if (preg_match('/^(?:[a-z0-9-]+\.)?(?:zen|sbl|xbl|pbl)\.(?:spamhaus\.org|dq\.spamhaus\.net)$/i', $name))
+		return '127.0.0.2,127.0.0.3,127.0.0.4,127.0.0.5,127.0.0.6,127.0.0.7,127.0.0.9,127.0.0.10,127.0.0.11';
+	return '';
+}
+
+/* The sender domain check: on when its block is in exim.conf. */
+function exim_dbl_status($content = null) {
+	if ($content === null) $content = (string)mail_config_read('exim');
+	return strpos($content, exim_dbl_marker()) !== false;
+}
+
+/* Switch it on or off: the script saves the setting `exim-dbl` (so updates keep
+   the choice), rewrites exim.conf after `exim -bV -C` and reloads exim. */
+function exim_dbl_apply($on) {
+	$cmd = 'sudo -n /bin/bash '.escapeshellarg(_PATH.'/scripts/update/setup_exim_dbl.sh').' '.($on ? '--on' : '--off').' 2>&1';
+	exec($cmd, $o, $rc);
+	if ($rc !== 0)
+		return array('error' => 'Could not change the sender domain check: '.h(trim(implode("\n", $o))), 'success' => '');
+	return array('error' => '', 'success' => $on
+		? 'Sender domain check is on: mail from domains on the Spamhaus Domain Block List is refused.'
+		: 'Sender domain check is off.');
 }
 
 /* Blocklists that stopped answering years ago. A dead RBL does not fail open
@@ -7939,13 +8132,28 @@ function exim_dnslists_apply($idx, $hosts) {
 	if (!isset($lists[$idx]))
 		return array('error' => 'That blocklist no longer exists in the configuration.', 'success' => '');
 
+	/* the filters the list has now, by name, so a save keeps them */
+	$had = array();
+	foreach ($lists[$idx]['hosts'] as $item)
+		$had[strtolower(exim_dnslist_name($item))] = $item;
+
 	$clean = array();
+	$seen  = array();
 	foreach ((array)$hosts as $h) {
-		$h = trim((string)$h);
+		$h = exim_dnslist_name($h);
 		if ($h === '') continue;
 		if (!exim_dnslist_valid_host($h))
 			return array('error' => 'Not a valid blocklist hostname: '.h($h), 'success' => '');
-		if (!in_array($h, $clean, true)) $clean[] = $h;
+		/* DBL lists domains: asked about an IP address it answers 127.0.1.255
+		   for every message, which refuses all mail */
+		if (preg_match('/(^|\.)dbl\.(spamhaus\.org|dq\.spamhaus\.net)$/i', $h))
+			return array('error' => h($h).' lists domains, not IP addresses: use the Sender domain check switch below instead.', 'success' => '');
+		$k = strtolower($h);
+		if (isset($seen[$k])) continue;
+		$seen[$k] = true;
+		if (isset($had[$k]) && $had[$k] !== $h)  $clean[] = $had[$k];   // its own filter
+		elseif (exim_dnslist_filter($h) !== '')  $clean[] = $h.'='.exim_dnslist_filter($h);
+		else                                     $clean[] = $h;
 	}
 
 	$content = str_replace("\r\n", "\n", (string)mail_config_read('exim'));
@@ -8961,9 +9169,18 @@ function dns_zone_for($name, $zones) {
 /* A TXT record's text from its zone-file form ("abc" "def" -> abcdef). */
 function dns_txt_decode($content) {
 	$content = trim((string)$content);
-	if (preg_match_all('/"((?:[^"\\\\]|\\\\.)*)"/', $content, $m) && $m[1])
-		return implode('', array_map(function ($s) { return str_replace(array('\\"', '\\\\'), array('"', '\\'), $s); }, $m[1]));
+	if (preg_match_all('/"((?:[^"\\\\]|\\\\.)*)"/s', $content, $m) && $m[1])
+		return implode('', array_map('dns_txt_unescape', $m[1]));
 	return $content;
+}
+
+/* Zone-file escapes inside one quoted string: \DDD = that byte, \X = X.
+   cPanel's zone files write "v=DKIM1\; k=rsa\; ...": the \; must become ;
+   (keeping it once saved DMARC/DKIM records receivers cannot read). */
+function dns_txt_unescape($s) {
+	return preg_replace_callback('/\\\\(\d{3}|.)/s', function ($x) {
+		return strlen($x[1]) === 3 ? chr(min(255, (int)$x[1])) : $x[1];
+	}, (string)$s);
 }
 
 /* Text -> 255-byte chunks, unquoted. */
@@ -9488,6 +9705,37 @@ function transfer_php_exts(array $lines) {
 	return $out;
 }
 
+/* Dovecot's pop3_uidl_format as the pop3 service sees it (a protocol pop3 { }
+   block may set it). The shell part also runs on the cPanel server: Dovecot
+   2.4 filters with protocol=, 2.3 with service=. */
+function transfer_uidl_cmd() {
+	return '{ doveconf -f protocol=pop3 -h pop3_uidl_format || doveconf -f service=pop3 -h pop3_uidl_format || doveconf -h pop3_uidl_format; } 2>/dev/null | head -1';
+}
+
+/* A pop3_uidl_format in Dovecot 2.4's syntax, so equal formats compare equal:
+   2.3's %08Xu%08Xv becomes %{uid | hex(8)}%{uidvalidity | hex(8)} (2.4's
+   default, which keeps 2.3's ids: X was lowercase hex), U / L become upper /
+   lower. Spaces inside %{ } are made one form. */
+function transfer_uidl_norm($f) {
+	$f = trim((string)$f);
+	if (strpos($f, '%{') === false) {
+		$vars = array('u' => 'uid', 'v' => 'uidvalidity', 'm' => 'md5', 'f' => 'filename', 'g' => 'guid');
+		$f = preg_replace_callback('/%(0?)(\d*)([LUX]*)([uvmfg])/', function ($m) use ($vars) {
+			$s = '%{'.$vars[$m[4]];
+			if (strpos($m[3], 'X') !== false)
+				$s .= ' | hex'.($m[1] === '0' && $m[2] !== '' ? '('.(int)$m[2].')' : '');
+			if (strpos($m[3], 'U') !== false)
+				$s .= ' | upper';
+			if (strpos($m[3], 'L') !== false)
+				$s .= ' | lower';
+			return $s.'}';
+		}, $f);
+	}
+	return preg_replace_callback('/%\{([^}]*)\}/', function ($m) {
+		return '%{'.implode(' | ', array_map('trim', explode('|', $m[1]))).'}';
+	}, $f);
+}
+
 /* The check of the cPanel server itself. $pkgs: the PHP packages its sites
    use (ea-php82, alt-php74). array(items, ctx) - ctx goes back with each
    account's check: the server's addresses and name servers, free space here,
@@ -9501,6 +9749,8 @@ echo "@@RQ ips"; hostname -I 2>/dev/null | tr ' ' '\n'; awk -F: '{print $1}' /et
 echo "@@RQ cpconf"; grep -E '^(maxemailsperhour|emailsperdaynotify|email_outbound_spam_detect_enable|email_outbound_spam_detect_action|email_outbound_spam_detect_threshold|nobodyspam|smtpmailgidonly)=' /var/cpanel/cpanel.config 2>/dev/null
 echo "@@RQ localopts"; grep -E '^(smarthost_routelist|per_domain_mailips|acl_[a-z0-9_]*rbl[a-z0-9_]*|acl_ratelimit[a-z0-9_]*|acl_deny_spam_score_over_int|acl_default_spam_scan[a-z0-9_]*|require_secure_auth|max_spam_scan_size|senderverify|callouts|acl_requirehelo[a-z0-9_]*)=' /etc/exim.conf.localopts 2>/dev/null
 echo "@@RQ mailipsall"; awk -F': *' '$1=="*"{print FILENAME": "$2}' /etc/mailips /etc/mailhelo 2>/dev/null
+echo "@@RQ dovecot"; dovecot --version 2>/dev/null | head -1
+echo "@@RQ pop3uidl"; @@UIDL@@
 while read -r p; do
   case "$p" in
     ea-php[0-9]*) b=/opt/cpanel/$p/root/usr/bin/php ;;
@@ -9510,6 +9760,7 @@ while read -r p; do
   echo "@@RQ phpm $p"; [ -x "$b" ] && "$b" -m 2>/dev/null
 done
 SH;
+	$script = str_replace('@@UIDL@@', transfer_uidl_cmd(), $script);
 	$pk = array();
 	foreach ($pkgs as $p)
 		if (preg_match('/^(ea|alt)-php\d{2,3}$/', (string)$p))
@@ -9518,7 +9769,8 @@ SH;
 	if (trim($out) === '')
 		return array(array(transfer_item('Server', 'block', 'The cPanel server did not answer the check.')), array());
 
-	$sec = array('mysql' => array(), 'ns' => array(), 'ips' => array(), 'cpconf' => array(), 'localopts' => array(), 'mailipsall' => array(), 'hostname' => array());
+	$sec = array('mysql' => array(), 'ns' => array(), 'ips' => array(), 'cpconf' => array(), 'localopts' => array(), 'mailipsall' => array(), 'hostname' => array(),
+	             'dovecot' => array(), 'pop3uidl' => array());
 	$phpm = array();
 	foreach (transfer_sections($out) as $s) {
 		if ($s[0] === 'phpm')
@@ -9594,6 +9846,25 @@ SH;
 		$items[] = transfer_item('Mail', 'info', 'The cPanel server watches for accounts sending spam ('.($kv['email_outbound_spam_detect_action'] ?? 'noaction').' above '.($kv['email_outbound_spam_detect_threshold'] ?? '?').' messages)');
 	if (($kv['per_domain_mailips'] ?? '') === '1' || $sec['mailipsall'])
 		$items[] = transfer_item('Mail', 'info', 'The cPanel server chooses the address mail is sent from', 'Per domain (/etc/mailips, /etc/mailhelo). Domains with their own address are shown in their account\'s check; Hosting Pro does the same with Settings > IP addresses > Outgoing mail.', $sec['mailipsall']);
+
+	// POP3 message ids (UIDL): the transfer keeps each message's UID and the
+	// mailbox's UIDVALIDITY, but the id a POP3 program remembers is built from
+	// them by pop3_uidl_format - a different format (even only upper/lower case
+	// hex) makes every message look new to programs that leave mail on the server
+	$ru = transfer_uidl_norm($sec['pop3uidl'][0] ?? '');
+	$lu = transfer_uidl_norm(shell_exec(transfer_uidl_cmd()));
+	$rdv = ($sec['dovecot'][0] ?? '') !== '' ? ' (Dovecot '.strtok($sec['dovecot'][0], ' ').')' : '';
+	if ($ru === '' || $lu === '')
+		$items[] = transfer_item('Mail', 'warn', 'Could not compare the POP3 message ids (pop3_uidl_format) of the two servers',
+			'Read on the '.($ru === '' ? 'cPanel server' : 'this server').' failed (doveconf). If they differ, POP3 programs that leave mail on the server download every message again after the move.');
+	elseif ($ru === $lu)
+		$items[] = transfer_item('Mail', 'ok', 'POP3 message ids: same format on both servers', 'pop3_uidl_format = '.$lu);
+	else
+		$items[] = transfer_item('Mail', 'warn', 'POP3 message ids are made differently here: POP3 programs would download every message again',
+			'The cPanel server'.$rdv.' uses pop3_uidl_format = '.$sec['pop3uidl'][0].', this server '.$lu.'. Programs that leave mail on the server (Outlook, Thunderbird, phones using POP3) '
+			.'see all moved messages as new. To keep the cPanel ids, add the line below to /etc/dovecot/local.conf and reload Dovecot before the transfer - '
+			.'but mailboxes already on this server then get new ids, so their POP3 programs download everything once.',
+			array('pop3_uidl_format = '.$ru), true);
 
 	// space here
 	$free = (float)@disk_free_space('/home');
@@ -9844,14 +10115,22 @@ function transfer_precheck_account($ssh, $user, array $sites, array $ctx) {
 		$items[] = transfer_item('DNS', $mworst, 'Where mail goes now', '', $mlist);
 
 	/* ---- cPanel features missing here ---- */
-	$caldav = array();
+	/* a mailbox's contacts go into its webmail address book (tr_webmail());
+	   calendars, and the contacts of the cPanel user itself, stay behind */
+	$caldav = $carddav = array();
 	foreach ($sec['caldav'] ?? array() as $l) {
 		$p = preg_split('/\s+/', trim($l));
-		if (count($p) === 3)
+		if (count($p) !== 3)
+			continue;
+		if ($p[1] === 'vcf' && strpos($p[0], '@') !== false)
+			$carddav[] = $p[0].': '.$p[2].' contacts';
+		else
 			$caldav[] = $p[0].': '.$p[2].' '.($p[1] === 'ics' ? 'calendar entries' : 'contacts');
 	}
+	if ($carddav)
+		$items[] = transfer_item('Features', 'info', 'Contacts on cPanel\'s contacts service (CardDAV)', 'They are copied into the webmail address book of each mailbox. Phones and mail programs that synced them from cPanel stop syncing after the switch: their copies stay on the device.', $carddav);
 	if ($caldav)
-		$items[] = transfer_item('Features', 'warn', 'Calendars and contacts are used', 'This server has no calendar or contacts service. Ask the users to export them (from webmail or their phone) before the switch; they are not transferred.', $caldav);
+		$items[] = transfer_item('Features', 'warn', 'Calendars and contacts that are not transferred', 'This server has no calendar service, and the address book of the cPanel user itself has no mailbox to go to. Ask the users to export them (from their phone or mail program) before the switch.', $caldav);
 	if (!empty($sec['webdisk']))
 		$items[] = transfer_item('Features', 'warn', 'Web Disk accounts: '.count($sec['webdisk']), 'Web Disk is not available here. FTP accounts or the file manager can replace it.', $sec['webdisk']);
 	if (!empty($sec['boxtrapper']))
@@ -9975,7 +10254,7 @@ function transfer_precheck_account($ssh, $user, array $sites, array $ctx) {
 		$cp = array_values(array_unique($cp));
 		if ($cp)
 			$items[] = transfer_item('PHP', 'warn', $s['domain'].': settings that point at cPanel folders',
-				'These folders do not exist here, so for example PHP sessions (logins) fail. Remove the lines after the transfer.', $cp);
+				'These folders do not exist here, so for example PHP sessions (logins) fail. The transfer comments these lines out after copying the files (the file as it was is kept as .user.ini.from-cpanel / .htaccess.from-cpanel).', $cp);
 		if ($by['htaccess']) {
 			if ($mode === 'fpm' && $apache)
 				$items[] = transfer_item('PHP', 'block', $s['domain'].': php_value lines in .htaccess',
@@ -10367,6 +10646,23 @@ function ssl_custom_install($domain, $cert, $key, $reload = true) {
    job-<id>.state.json (how far it is, written by the job) and
    job-<id>.<account>.log (what it did). No passwords or keys in any of them. */
 
+/* cPanel settings of account $user that do not work here: PHP settings naming
+   cPanel's folders (session.save_path = /var/cpanel/php/sessions/ea-php74
+   written by its MultiPHP INI Editor...) in every .user.ini and the php_*
+   lines of every .htaccess, and .htaccess Options Apache refuses here
+   (FollowSymLinks -> SymLinksIfOwnerMatch...), read AS the account (fm-helper
+   verb cpini). $fix changes those lines, the
+   file as it was kept beside it as <name>.from-cpanel. data: files = list of
+   {path, lines, fixed, error}, complete = false when the home was too big to
+   look at whole. Used by the transfer after the files and by
+   `reqad transfer cpanel-files`. */
+function transfer_cpanel_paths($user, $fix = false) {
+	$r = files_run($user, array('verb' => 'cpini', 'roots' => array(''), 'fix' => (bool)$fix), null, null, 600);
+	if (empty($r['ok']))
+		return result_error('Its PHP settings could not be checked: '.str_replace('{reason}', (string)($r['args']['reason'] ?? ''), (string)($r['error'] ?? 'no answer')));
+	return result_ok('', array('files' => (array)($r['files'] ?? array()), 'complete' => !empty($r['complete'])));
+}
+
 function transfer_job_dir() {
 	return _PATH.'/transfers';
 }
@@ -10381,8 +10677,19 @@ function transfer_job_valid_id($id) {
 
 /* What the transfer can bring, all on unless the page says otherwise */
 function transfer_job_parts() {
-	return array('files' => 'Files', 'databases' => 'Databases', 'mail' => 'Email (mailboxes, mail, forwarders, filters, autoresponders, spam lists, DKIM)',
-	             'cron' => 'Cron jobs', 'ssl' => 'Certificates');
+	$parts = array('files' => 'Files', 'databases' => 'Databases', 'mail' => 'Email (mailboxes, mail, forwarders, filters, autoresponders, spam lists, DKIM)',
+	               'cron' => 'Cron jobs', 'ssl' => 'Certificates');
+	$caps = transfer_caps();
+	if (!empty($caps['packages']) || !empty($caps['resellers']))
+		$parts['packages'] = !empty($caps['resellers']) ? 'Hosting packages and resellers (its privileges and packages, who owns which account)' : 'Hosting packages';
+	return $parts;
+}
+
+/* What the add-ons take over from cPanel (filter transfer.can): packages
+   (Hosting Pro), resellers (Reqad Reseller). */
+function transfer_caps() {
+	$c = plugin_filter('transfer.can', array());
+	return is_array($c) ? $c : array();
 }
 
 function transfer_job_get($id) {
@@ -10419,9 +10726,6 @@ function transfer_job_start(array $conn, array $accounts, array $parts, array $p
 	$ssh = transfer_ssh((string)($conn['server'] ?? ''), (int)($conn['port'] ?? 22), (string)($conn['ruser'] ?? ''), $err);
 	if ($err !== '')
 		return result_error($err);
-	$latest = transfer_job_latest();
-	if ($latest && transfer_job_active($latest['id']))
-		return result_error('A transfer is already running. Wait for it to end, or stop it.');
 	$list = array();
 	foreach ($accounts as $a) {
 		$u = (string)($a['user'] ?? '');
@@ -10429,6 +10733,14 @@ function transfer_job_start(array $conn, array $accounts, array $parts, array $p
 			return result_error("$u cannot be an account name here (2-16 lowercase letters and digits, starting with a letter).");
 		$list[$u] = array('user' => $u, 'domain' => strtolower((string)($a['domain'] ?? '')),
 		                  'diskused' => preg_match('/^[0-9.]+[KMGT]?$/i', (string)($a['diskused'] ?? '')) ? (string)$a['diskused'] : '');
+		/* a reseller on cPanel, and the address its sign-in codes go to here */
+		if (!empty($a['reseller'])) {
+			$e = strtolower(trim((string)($a['reseller_email'] ?? '')));
+			if ($e !== '' && (!valid_email_address($e) || strlen($e) > 254))
+				return result_error("Sign-in codes of reseller $u: $e is not an email address.");
+			$list[$u]['reseller'] = true;
+			$list[$u]['reseller_email'] = $e;
+		}
 	}
 	if (!$list)
 		return result_error('Choose at least one account.');
@@ -10437,30 +10749,137 @@ function transfer_job_start(array $conn, array $accounts, array $parts, array $p
 		$take[$k] = in_array($k, $parts, true);
 	if (!array_filter($take))
 		return result_error('Choose at least one thing to transfer.');
+	return transfer_job_launch($conn, array_values($list), $take, transfer_php_map($php_map));
+}
 
+/* Write a job and start its runner (accounts and / or DNS zones). */
+function transfer_job_launch(array $conn, array $accounts, array $take, array $php_map = array(), array $zones = array()) {
+	$latest = transfer_job_latest();
+	if ($latest && transfer_job_active($latest['id']))
+		return result_error('A transfer is already running. Wait for it to end, or stop it.');
 	$id = bin2hex(random_bytes(8));
 	$dir = transfer_job_dir();
 	if (!is_dir($dir))
 		@mkdir($dir, 0750, true);
 	$job = array('id' => $id, 'server' => (string)$conn['server'], 'port' => (int)$conn['port'], 'ruser' => (string)$conn['ruser'],
-	             'accounts' => array_values($list), 'parts' => $take, 'php_map' => transfer_php_map($php_map), 'created' => time(), 'by' => function_exists('auth_user') ? (string)auth_user() : '');
+	             'accounts' => $accounts, 'parts' => $take, 'php_map' => $php_map, 'created' => time(), 'by' => function_exists('auth_user') ? (string)auth_user() : '');
+	if ($zones)
+		$job['zones'] = $zones;
 	if (@file_put_contents(transfer_job_file($id), json_encode($job, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) === false)
 		return result_error("Could not write the job file in $dir.");
 	@chmod(transfer_job_file($id), 0640);
+	$users = array_column($accounts, 'user');
+	$what = $accounts ? 'transfer of '.count($accounts).' cPanel account(s)' : 'copy of '.count($zones).' DNS zone(s)';
 	$cmd = server_sudo().'systemd-run --quiet --collect --unit='.escapeshellarg('reqad-transfer-'.$id)
-	     .' --description='.escapeshellarg('Reqad transfer of '.count($list).' cPanel account(s) from '.$job['server'])
+	     .' --description='.escapeshellarg('Reqad '.$what.' from '.$job['server'])
 	     .' -p Nice=5 -p IOSchedulingClass=best-effort -p IOSchedulingPriority=6'
 	     .' -- /opt/reqad/php-current/usr/bin/php -c /etc/reqad/php-fpm/php.ini '._PATH.'/scripts/transfer_cpanel.php --job='.$id.' 2>&1';
-	transfer_job_log($id, 'Transfer from '.$job['server'].' asked by '.transfer_actor().': '.implode(', ', array_keys($list))
-	                    .'. Parts: '.implode(', ', array_keys(array_filter($take))).($job['php_map'] ? '. PHP versions replaced: '
-	                    .implode(', ', array_map(function ($f, $t) { return "$f -> $t"; }, array_keys($job['php_map']), $job['php_map'])) : '').'.');
+	if ($accounts)
+		transfer_job_log($id, 'Transfer from '.$job['server'].' asked by '.transfer_actor().': '.implode(', ', $users)
+		                    .'. Parts: '.implode(', ', array_keys(array_filter($take))).($php_map ? '. PHP versions replaced: '
+		                    .implode(', ', array_map(function ($f, $t) { return "$f -> $t"; }, array_keys($php_map), $php_map)) : '').'.');
+	if ($zones)
+		transfer_job_log($id, 'DNS zones from '.$job['server'].' asked by '.transfer_actor().' ('.count($zones).'): '.implode(', ', array_column($zones, 'zone')).'.');
 	exec($cmd, $out, $rc);
 	if ($rc !== 0) {
 		transfer_job_log($id, 'Could not start: '.trim(implode(' ', $out)));
 		return result_error('Could not start the transfer: '.trim(implode(' ', $out)));
 	}
-	route_log('transfer from '.$job['server'].': '.implode(', ', array_keys($list)));
+	route_log('transfer from '.$job['server'].': '.($accounts ? implode(', ', $users) : '').($zones ? ($accounts ? '; ' : '').count($zones).' DNS zone(s)' : ''));
 	return result_ok('Transfer started.', array('id' => $id));
+}
+
+/* ---- Transfer tool: DNS zones -------------------------------------------------
+   Every zone on the cPanel server (whmapi1 listzones): its accounts' zones and
+   those no account owns (added in WHM, or a DNS cluster's). The job copies the
+   chosen ones as new zones here with their records unchanged (tr_zones() in
+   scripts/transfer_cpanel.php); a zone that is here already is left alone. */
+
+/* The zones on the cPanel server. data: zones [{zone, file (in /var/named,
+   '' = not found), account (its cPanel account, '' = none), size (bytes),
+   here (this server's DNS provider has it)}], managed (this server has a DNS
+   provider), provider, nameservers (this server's), error (the provider did
+   not answer). */
+function transfer_zones($ssh) {
+	global $db;
+	$script = <<<'SH'
+echo '@@RQ listzones'
+whmapi1 --output=json listzones 2>/dev/null
+echo
+echo '@@RQ userdomains'
+cat /etc/userdomains 2>/dev/null
+echo '@@RQ sizes'
+cd /var/named 2>/dev/null && find . -maxdepth 1 -type f -printf '%s %f\n' 2>/dev/null
+SH;
+	$sec = array();
+	foreach (transfer_sections(transfer_remote($ssh, $script, '', 120)) as $s)
+		$sec[$s[0]] = $s[2];
+	$j = json_decode(trim(implode("\n", $sec['listzones'] ?? array())), true);
+	if (!is_array($j) || empty($j['metadata']['result']))
+		return result_error('Connected, but whmapi1 listzones did not answer. Is this a cPanel server, and is the SSH user root?');
+	$owner = array();
+	foreach ($sec['userdomains'] ?? array() as $l)
+		if (preg_match('/^([^:\s]+):\s*(\S+)/', $l, $m) && $m[1] !== '*' && $m[2] !== 'nobody')
+			$owner[strtolower($m[1])] = $m[2];
+	$size = array();
+	foreach ($sec['sizes'] ?? array() as $l)
+		if (preg_match('/^(\d+) (\S+)$/', trim($l), $m))
+			$size[$m[2]] = (int)$m[1];
+	$have = array();
+	$perr = '';
+	$managed = dns_managed();
+	if ($managed) {
+		dns_provider_load($db);
+		$all = get_zones();
+		if (is_array($all))
+			foreach (array_keys($all) as $z)
+				$have[strtolower((string)$z)] = true;
+		else
+			$perr = 'The DNS provider is not answering: '.preg_replace('/^Error:\s*/', '', (string)$all);
+	}
+	$zones = array();
+	foreach ((array)($j['data']['zone'] ?? array()) as $z) {
+		$name = dns_zone_name($z['domain'] ?? '');
+		if (!valid_domain($name) || strpos($name, '.') === false)
+			continue;
+		$file = (string)($z['zonefile'] ?? '');
+		if (!preg_match('/^[A-Za-z0-9_][A-Za-z0-9._-]*$/', $file) || !isset($size[$file]))
+			$file = isset($size[$name.'.db']) ? $name.'.db' : '';
+		$zones[$name] = array('zone' => $name, 'file' => $file, 'account' => (string)($owner[$name] ?? ''),
+		                      'size' => $file !== '' ? $size[$file] : 0, 'here' => isset($have[$name]));
+	}
+	ksort($zones);
+	return result_ok('', array('zones' => array_values($zones), 'managed' => $managed, 'provider' => (string)setting_get('dns-provider'),
+	                           'nameservers' => $managed ? dns_expected_nameservers() : array(), 'error' => $perr));
+}
+
+/* Copy the zones $names (from transfer_zones()) in a transfer job. data: id. */
+function transfer_zones_start(array $conn, array $names) {
+	$ssh = transfer_ssh((string)($conn['server'] ?? ''), (int)($conn['port'] ?? 22), (string)($conn['ruser'] ?? ''), $err);
+	if ($err !== '')
+		return result_error($err);
+	if (!dns_managed())
+		return result_error('This server has no DNS provider: choose one under Settings > DNS Settings first.');
+	$r = transfer_zones($ssh);
+	if (!$r['ok'])
+		return $r;
+	if ($r['data']['error'] !== '')
+		return result_error($r['data']['error']);
+	$by = array_column($r['data']['zones'], null, 'zone');
+	$list = array();
+	foreach ($names as $n) {
+		$n = dns_zone_name($n);
+		if (!isset($by[$n]))
+			return result_error("$n is not a zone on {$conn['server']}.");
+		if ($by[$n]['here'])
+			continue;
+		if ($by[$n]['file'] === '')
+			return result_error("The zone file of $n was not found in /var/named on {$conn['server']}.");
+		$list[$n] = array('zone' => $n, 'file' => $by[$n]['file'], 'account' => $by[$n]['account']);
+	}
+	if (!$list)
+		return result_error('Choose at least one zone that is not on this server yet.');
+	return transfer_job_launch($conn, array(), array('dns' => true), array(), array_values($list));
 }
 
 /* The job, its progress and what each account's log got since $offsets
@@ -10489,13 +10908,29 @@ function transfer_job_status($id, array $offsets = array()) {
 		                    'started' => (int)($st['started'] ?? 0), 'finished' => (int)($st['finished'] ?? 0),
 		                    'log' => $log, 'offset' => $off + strlen($log));
 	}
+	/* the DNS zones: one row, '_dns' (never an account name) */
+	if (!empty($job['zones'])) {
+		$st = (array)($state['accounts']['_dns'] ?? array());
+		$off = max(0, (int)($offsets['_dns'] ?? 0));
+		$f = transfer_job_file($id, '_dns.log');
+		$size = is_file($f) ? (int)filesize($f) : 0;
+		$log = $size > $off ? (string)@file_get_contents($f, false, null, $off, min(262144, $size - $off)) : '';
+		$status = (string)($st['status'] ?? 'queued');
+		if (!$active && in_array($status, array('queued', 'running'), true))
+			$status = 'stopped';
+		$n = count($job['zones']);
+		$accounts[] = array('user' => '_dns', 'domain' => $n.' DNS zone'.($n === 1 ? '' : 's'), 'status' => $status, 'step' => (string)($st['step'] ?? ''),
+		                    'detail' => (string)($st['detail'] ?? ''), 'warnings' => (int)($st['warnings'] ?? 0),
+		                    'started' => (int)($st['started'] ?? 0), 'finished' => (int)($st['finished'] ?? 0),
+		                    'log' => $log, 'offset' => $off + strlen($log));
+	}
 	$status = (string)($state['status'] ?? 'queued');
 	if (!$active && in_array($status, array('queued', 'running'), true))
 		$status = 'stopped';
 	return result_ok('', array('id' => $id, 'server' => $job['server'], 'parts' => $job['parts'], 'created' => $job['created'],
 	                           'by' => (string)($job['by'] ?? ''), 'ips' => is_file(transfer_job_file($id, 'ips')),
 	                           'joblog' => (string)@file_get_contents(transfer_job_file($id, 'log'), false, null, 0, 65536),
-	                           'status' => $status, 'active' => $active, 'accounts' => $accounts));
+	                           'status' => $status, 'active' => $active, 'accounts' => $accounts, 'zones' => count($job['zones'] ?? array())));
 }
 
 function transfer_job_stop($id) {
@@ -10574,7 +11009,7 @@ function transfer_job_list() {
 		               'finished' => (int)($st['finished'] ?? 0), 'by' => (string)($job['by'] ?? ''), 'status' => $status, 'active' => $active,
 		               'accounts' => count($job['accounts']), 'users' => array_column($job['accounts'], 'user'),
 		               'done' => $n['done'], 'warn' => $n['warn'], 'failed' => $n['failed'], 'warnings' => $n['warnings'],
-		               'ips' => is_file(transfer_job_file($m[1], 'ips')));
+		               'ips' => is_file(transfer_job_file($m[1], 'ips')), 'zones' => count($job['zones'] ?? array()));
 	}
 	usort($out, function ($a, $b) { return $b['created'] - $a['created']; });
 	return $out;
@@ -10587,19 +11022,23 @@ function transfer_job_log_text($id, $user = '') {
 	if (!$job)
 		return result_error('No such transfer.');
 	$users = array_column($job['accounts'], 'user');
+	if (!empty($job['zones']))
+		$users[] = '_dns';     /* the DNS zones' log */
 	if ($user !== '' && !in_array($user, $users, true))
 		return result_error("The transfer $id did not have the account $user.");
 	$text = '';
 	if ($user === '') {
 		$text = "Transfer $id from {$job['server']}, started ".date('Y-m-d H:i', (int)$job['created'])
-		      .($job['by'] !== '' ? " by {$job['by']}" : '')."\nAccounts: ".implode(', ', $users)."\n\n";
+		      .($job['by'] !== '' ? " by {$job['by']}" : '')."\n"
+		      .($job['accounts'] ? 'Accounts: '.implode(', ', array_column($job['accounts'], 'user'))."\n" : '')
+		      .(!empty($job['zones']) ? 'DNS zones: '.implode(', ', array_column($job['zones'], 'zone'))."\n" : '')."\n";
 		$own = (string)@file_get_contents(transfer_job_file($id, 'log'));
 		if ($own !== '')
 			$text .= $own."\n";
 	}
 	foreach ($user === '' ? $users : array($user) as $u) {
 		$l = (string)@file_get_contents(transfer_job_file($id, $u.'.log'));
-		$text .= ($user === '' ? "==================== $u ====================\n" : '').($l !== '' ? $l : "(nothing logged)\n").($user === '' ? "\n" : '');
+		$text .= ($user === '' ? '==================== '.($u === '_dns' ? 'DNS zones' : $u)." ====================\n" : '').($l !== '' ? $l : "(nothing logged)\n").($user === '' ? "\n" : '');
 	}
 	return result_ok('', array('name' => 'transfer-'.date('Ymd-Hi', (int)$job['created']).($user !== '' ? '-'.$user : '').'.log', 'text' => $text));
 }

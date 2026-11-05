@@ -33,6 +33,8 @@
 
 require_once '/usr/local/reqad/public_html/defines.php';
 require_once '/usr/local/reqad/public_html/modules/functions.php';
+foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
+    require_once $app_functions_file;
 
 $opt    = getopt('', array('scope:', 'target::', 'file:', 'apply', 'replace', 'help'));
 $usage  = "usage: import_cpanel_filters.php --scope=global|domain|account "
@@ -95,8 +97,46 @@ if ($res['skipped']) {
     }
 }
 
-if (!$res['rules'])
-    exit("\nNothing to import.\n");
+/* cPanel's "suspend incoming mail" (a bare `fail`) is the mailbox's
+   "Refuse incoming mail" here: senders get the text at RCPT time, no bounce. */
+$refuse = null;
+if ($res['refuse'] !== null) {
+    if ($scope !== 'account') {
+        print "\n  NOT IMPORTED:\n";
+        printf("    · refuses every message (fail %s), which is not imported for a whole %s; turn on \"Refuse incoming mail\" for the mailboxes that should get nothing\n",
+               $res['refuse'], $scope);
+    } else {
+        $refuse = $res['refuse'];
+        if ($refuse === '' || email_refuse_text_error($refuse) !== '') {
+            if ($refuse !== '')
+                printf("\n  (the text \"%s\" cannot be an SMTP answer, the default is used)", $refuse);
+            $refuse = EMAIL_REFUSE_DEFAULT;
+        }
+        printf("\n  REFUSE INCOMING MAIL (\"suspend incoming mail\" was on): senders get \"550 %s\"\n", $refuse);
+    }
+}
+
+/* Turn the mailbox's refusal on; the exit code. */
+function import_refuse($target, $text) {
+    $r = email_edit(array('email' => $target, 'refuse_incoming' => true, 'refuse_message' => $text));
+    if (empty($r['ok'])) {
+        printf("ERROR: %s still accepts incoming mail: %s\n", $target, $r['error']);
+        return 1;
+    }
+    foreach ($r['warnings'] as $w)
+        printf("WARNING: %s\n", $w);
+    printf("%s now refuses incoming mail (it can still log in and send).\n", $target);
+    return 0;
+}
+
+if (!$res['rules']) {
+    if ($refuse === null)
+        exit("\nNothing to import.\n");
+    if (!$apply)
+        exit("\nDry run — nothing written. Re-run with --apply to import.\n");
+    print "\n";
+    exit(import_refuse($target, $refuse));
+}
 
 /* Show exactly what would run, dry run or not. */
 $sieve_preview = rtrim(sieve_render_rules($res['rules'], $scope !== 'account'));
@@ -136,7 +176,7 @@ if ($scope === 'account') {
         exit("\nERROR: the imported rules did not compile, nothing was written.\n$err\n");
     printf("\nImported %d rule(s) into %s (%d were already there).\n",
            count($res['rules']), $target, count($existing));
-    exit(0);
+    exit($refuse !== null ? import_refuse($target, $refuse) : 0);
 }
 
 /* Admin tiers are DB-truth. INSERT OR IGNORE on (scope,target,name), so a

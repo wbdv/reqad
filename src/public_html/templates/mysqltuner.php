@@ -70,25 +70,30 @@
           </div>
 <? } ?>
 <?
-		if(is_file(_PATH.'/reports/mysqltuner.html')) {
+		$report = _PATH.'/reports/mysqltuner.txt';
+		if(is_file($report)) {
+			/* plain text, the marks coloured: [OK] green, [!!] red, [--] grey; section lines bold */
+			$text = htmlspecialchars(rtrim((string)@file_get_contents($report)), ENT_QUOTES);
+			$text = preg_replace('/^\[OK\]/m', '[<span class="mt-ok">OK</span>]', $text);
+			$text = preg_replace('/^\[!!\]/m', '[<span class="mt-bad">!!</span>]', $text);
+			$text = preg_replace('/^\[--\]/m', '[<span class="mt-info">--</span>]', $text);
+			$text = preg_replace('/^(-{8} .*)$/m', '<span class="mt-head">$1</span>', $text);
 ?>
 		<div class="alert alert-success" role="alert" style="background:#EFE;">
 			<div class="text">
-				<b>Note:</b> MySQLTuner report was generated on: <?=date("F d, Y \a\\t H:i", filemtime(_PATH.'/reports/mysqltuner.html'));?>.
+				<b>Note:</b> MySQLTuner report was generated on: <?=date("F d, Y \a\\t H:i", filemtime($report));?>.
 			</div>
 		</div><br/>
 		<div class="col-12">
-            <div class="card" id="mysqltuner"><div class="term-container"><?
-			echo trim(@file_get_contents(_PATH.'/reports/mysqltuner-style.html'));
-			echo trim(@file_get_contents(_PATH.'/reports/mysqltuner.html'));
-			?></div></div>
-<? 		
+			<div class="card" id="mysqltuner"><div class="term-container"><?=$text;?></div></div>
+		</div>
+<?
 		} else {
-?>			
+?>
 			<div class="alert alert-info" role="alert" style="background:#EEF0FF;">
-				<div class="text"><b>Note:</b> MySQLTuner report file does not exists, please <a href="#" data-bs-toggle="modal" data-bs-target="#modal-report">geneate a new report</a> first.</div>
+				<div class="text"><b>Note:</b> there is no MySQLTuner report yet, please <a href="#" data-bs-toggle="modal" data-bs-target="#modal-report">generate a new report</a> first.</div>
 			</div>
-<?			
+<?
 		}
 	} 
 ?>
@@ -97,58 +102,72 @@
       </div>
     </div>
 
-	<form method="post" action="/" id="report" class="needs-validation" novalidate>
-    <input type="hidden" name="action" value="mysqltuner-report">
-    <div class="modal modal-blur fade" id="modal-report" tabindex="-1" role="dialog" aria-hidden="true">
-      <div class="modal-dialog modal-lg" role="document">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Generate a new MySQLTuner report</h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-          </div>
-          <div class="modal-body">
-            <p>Please wait until report is generated.</p>
-			<div class="progress">
-  				<div class="progress-bar progress-bar-indeterminate"></div>
-			</div>
-          </div>
-          <div class="modal-footer">
-            <a href="#" class="btn btn-link link-primary" data-bs-dismiss="modal">
-              Close
-            </a>
-          </div>
-        </div>
+<div class="modal modal-blur fade" id="modal-report" tabindex="-1" role="dialog" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-xl modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Generate a new MySQLTuner report</h5>
+      </div>
+      <div class="modal-body">
+        <div class="subheader mb-1">Output</div>
+        <div id="report-output" class="term-container" style="min-height:80px;max-height:460px;overflow-y:auto;"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="report-close" class="btn btn-primary" type="button" disabled>Close</button>
       </div>
     </div>
-</form>
+  </div>
+</div>
 
 <?php
-    include('templates/footer.php'); 
+    include('templates/footer.php');
 ?>
+<style>
+	#mysqltuner .mt-ok   { color:#5fd35f; }
+	#mysqltuner .mt-bad  { color:#ff6b6b; }
+	#mysqltuner .mt-info { color:#8aa4c8; }
+	#mysqltuner .mt-head { color:#fff; font-weight:bold; }
+</style>
 <script>
 jQuery(document).ready(function () {
 	'use strict';
-	var report_running = false;
-    $('#report').on('show.bs.modal', function (event) {
-        //console.log(event);
-        // Button that triggered the modal
-        var button = event.relatedTarget;
-        // $('#report .modal-title').html('');
-		if(!report_running) {
-			report_running = true;
-			jQuery.ajax({
-				method: "POST",
-				url: "./ajax-mysqltuner/",
-				data: { action: 'ajax-mysqltuner' }
-			}).done(function( msg ) {
-				console.log(msg);
-				if(msg == 'OK') {
-					window.location.reload();
+	var running = false;
+
+	function out(text) {
+		var el = document.getElementById('report-output');
+		$(el).append(document.createTextNode(text));
+		el.scrollTop = el.scrollHeight;
+	}
+
+	function poll(job_id, offset) {
+		$.post('/?ajax=1', { action: 'ajax-php-modules-status', job_id: job_id, offset: offset })
+			.done(function (r) {
+				if (r.output) out(r.output);
+				if (r.done) {
+					out(r.success ? '\n✓ Done. Exit code: 0\n' : '\n✗ Completed with errors. Exit code: 1\n');
+					$('#report-close').prop('disabled', false);
 				} else {
+					setTimeout(function () { poll(job_id, r.offset); }, 1000);
 				}
-			});
-		}
-    });
+			})
+			.fail(function () { setTimeout(function () { poll(job_id, offset); }, 2000); });
+	}
+
+	$('#modal-report').on('show.bs.modal', function () {
+		if (running) return;
+		running = true;
+		$('#report-output').text('');
+		$('#report-close').prop('disabled', true);
+		$.post('/?ajax=1', { action: 'ajax-mysqltuner' }, null, 'json')
+			.done(function (r) {
+				if (r.error) { out('Error: ' + r.error + '\n'); $('#report-close').prop('disabled', false); return; }
+				if (r.running) out('A report is being generated already, showing its output.\n');
+				poll(r.job_id, 0);
+			})
+			.fail(function () { out('Request failed.\n'); $('#report-close').prop('disabled', false); });
+	});
+
+	$('#report-close').on('click', function () { window.location.reload(); });
 });
 </script>
 </body>

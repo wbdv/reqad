@@ -277,7 +277,8 @@ if(!is_file('/etc/ssl/certs/'.$domain.'.crt') || !is_file('/etc/ssl/certs/'.$dom
 if(!is_file($nginx_file)) {
 	$tmpfname = tempnam("/tmp", "reqad");
     file_put_contents($tmpfname, $nginx_content);
-	shell_exec("sudo mv $tmpfname $nginx_file");
+	shell_exec('sudo install -m 0644 -o root -g root '.escapeshellarg($tmpfname).' '.escapeshellarg($nginx_file));
+	unlink($tmpfname);
 	error_log("nginx conf file $nginx_file was written\n", 3, __DIR__.'/../../log/debug_log');
 } else {
     $errmsg = 'Error: file '.$nginx_file.' already exists.'."\n";
@@ -316,7 +317,8 @@ php_value[soap.wsdl_cache_dir]  = /var/lib/php/wsdlcache
 if(!is_file($phpfpm_file)) {
 	$tmpfname = tempnam("/tmp", "reqad");
     file_put_contents($tmpfname, $phpfpm_content);
-	shell_exec("sudo mv $tmpfname $phpfpm_file");
+	shell_exec('sudo install -m 0644 -o root -g root '.escapeshellarg($tmpfname).' '.escapeshellarg($phpfpm_file));
+	unlink($tmpfname);
 	error_log("php-fpm conf file $phpfpm_file was written\n", 3, __DIR__.'/../../log/debug_log');
 } else {
     $errmsg = 'Error: file '.$phpfpm_file.' already exists.'."\n";

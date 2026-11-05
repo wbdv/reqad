@@ -786,6 +786,113 @@ function v_wpdbname(array $q) {
 	out(array('ok' => true, 'dbs' => $dbs));
 }
 
+/* PHP settings that name cPanel's own folders (its MultiPHP INI Editor
+   writes session.save_path = /var/cpanel/php/sessions/ea-php74; include_path
+   /opt/cpanel/...; CloudLinux /opt/alt/...): they do not exist here, and PHP
+   still uses them, so sessions (logins) fail. Looks at every .user.ini
+   (PHP-FPM) and the php_* lines of every .htaccess (mod_php) under "roots"
+   (folders, '' = the home folder). Also Options lines of .htaccess that
+   Apache refuses here (AllowOverride Options=Indexes,MultiViews,
+   SymLinksIfOwnerMatch,IncludesNOEXEC: FollowSymLinks, ExecCGI, Includes,
+   All give every page error 500). "fix": those lines are changed; the
+   file as it was is kept once beside it as <name>.from-cpanel (0600, so no
+   web server shows it). Lines already commented are not counted again. */
+function v_cpini(array $q) {
+	$fix = !empty($q['fix']);
+	$skip = array('mail', 'logs', 'tmp', 'etc', '.cache', '.trash', '.cpanel', '.cagefs', 'node_modules', 'vendor', '.git',
+	              'softaculous_backups', 'backup-restores', 'wp-backups', 'cache');
+	$cp = '#/(var|opt|usr/local)/cpanel/|/opt/alt/#';
+	$files = array();
+	$dirs = 0;
+	$visited = array();
+	foreach (array_slice((array)($q['roots'] ?? array('')), 0, 200) as $root) {
+		if (!is_string($root) || ($real = real_in($root)) === false || !is_dir($real))
+			continue;
+		$queue = array(array($real, 0));
+		while ($queue && $dirs < 30000) {
+			list($dir, $depth) = array_shift($queue);
+			if (isset($visited[$dir]))
+				continue;
+			$visited[$dir] = true;
+			$dirs++;
+			foreach (array('.user.ini' => ';', '.htaccess' => '#') as $name => $c) {
+				$f = $dir.'/'.$name;
+				if (is_link($f) || !is_file($f) || filesize($f) > 1048576 || fileowner($f) !== MY_UID)
+					continue;
+				$text = (string)@file_get_contents($f);
+				$lines = preg_split('/(?<=\n)/', $text);
+				$hits = array();
+				foreach ($lines as $i => $l) {
+					$t = rtrim($l, "\r\n");
+					$ok = $name === '.user.ini'
+						? preg_match('/^\s*[A-Za-z0-9_.]+\s*=\s*(.*)$/', $t, $m)
+						: preg_match('/^\s*php_(?:admin_)?(?:value|flag)\s+\S+\s+(.*)$/i', $t, $m);
+					if ($ok && preg_match($cp, $m[1])) {
+						$hits[] = trim($t);
+						$lines[$i] = $c.' reqad: cPanel folder, not on this server: '.ltrim($l);
+						continue;
+					}
+					/* Options Apache does not let .htaccess set here (every page
+					   of the folder: error 500): FollowSymLinks -> SymLinksIfOwnerMatch
+					   (the same for the account's own links), -ExecCGI / -Includes
+					   dropped (off already), +ExecCGI / Includes / All dropped (no
+					   CGI here); a line left with nothing is commented out */
+					if ($name === '.htaccess' && preg_match('/^(\s*Options\s+)(.*?)(\s*)$/i', $t, $o)) {
+						$keep = array(); $gone = array(); $changed = false;
+						foreach (preg_split('/\s+/', trim($o[2])) as $tok) {
+							if (preg_match('/^([+-]?)FollowSymLinks$/i', $tok, $x)) {
+								$keep[] = $x[1].'SymLinksIfOwnerMatch';
+								$changed = true;
+							} elseif (preg_match('/^[+-]?(ExecCGI|Includes|All)$/i', $tok)) {
+								if ($tok[0] !== '-')
+									$gone[] = $tok;
+								$changed = true;
+							} else
+								$keep[] = $tok;
+						}
+						if (!$changed)
+							continue;
+						$hits[] = trim($t).($gone ? '  (not possible here: '.implode(' ', $gone).')' : '');
+						$eol = substr($l, strlen(rtrim($l, "\r\n")));
+						$lines[$i] = $keep ? $o[1].implode(' ', $keep).$eol : '# reqad: not allowed on this server: '.ltrim($l);
+					}
+				}
+				if (!$hits)
+					continue;
+				$e = array('path' => rel_from_abs($f), 'lines' => $hits, 'fixed' => false, 'error' => '');
+				if ($fix) {
+					$bak = $f.'.from-cpanel';
+					if (!file_exists($bak) && !is_link($bak)) {
+						if (!@copy($f, $bak))
+							$e['error'] = 'its copy could not be made';
+						else
+							@chmod($bak, 0600);
+					}
+					if ($e['error'] === '') {
+						/* written in place: the file keeps its owner and mode */
+						if (@file_put_contents($f, implode('', $lines)) === false)
+							$e['error'] = 'it could not be written';
+						else
+							$e['fixed'] = true;
+					}
+				}
+				$files[] = $e;
+			}
+			if ($depth >= 10)
+				continue;
+			foreach (@scandir($dir) ?: array() as $n) {
+				if ($n === '.' || $n === '..' || ($depth === 0 && $dir === HOME && in_array($n, $skip, true))
+				    || ($depth > 0 && in_array($n, array('node_modules', 'vendor', '.git', 'cache'), true)) || !preg_match('//u', $n))
+					continue;
+				$abs = $dir.'/'.$n;
+				if (!is_link($abs) && is_dir($abs))
+					$queue[] = array($abs, $depth + 1);
+			}
+		}
+	}
+	out(array('ok' => true, 'files' => $files, 'complete' => $dirs < 30000));
+}
+
 /* A one-time sign-in file for the install at "path" (its folder): bytes on
    stdin ("size"), written as wp-content/mu-plugins/<name> (name
    reqad-login-<hex>.php). Earlier ones older than 10 minutes go first (each
@@ -1892,6 +1999,7 @@ $verbs = array('list' => 'v_list', 'stat' => 'v_stat', 'read' => 'v_read', 'save
                'wpprep' => 'v_wpprep', 'wpplace' => 'v_wpplace', 'wpperms' => 'v_wpperms', 'wpclone' => 'v_wpclone',
                'wppushdiff' => 'v_wppushdiff', 'wppush' => 'v_wppush', 'wppushundo' => 'v_wppushundo',
                'bkrestore' => 'v_bkrestore', 'sshkeys' => 'v_sshkeys', 'sshkeysput' => 'v_sshkeysput', 'appfacts' => 'v_appfacts',
+               'cpini' => 'v_cpini',
                'kill' => 'v_kill');
 if (!isset($verbs[$req['verb']]))
 	fail('Unknown request.');

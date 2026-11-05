@@ -298,7 +298,8 @@
 <? if( $_accounts_on ) { ?>
 <? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
                         <div class="ca-item"><a class="ca-icon" href="email-accounts/"><img src="images/email-accounts.png" alt=""></a><a href="email-accounts/">Email Accounts</a></div>
-                        <div class="ca-item"><a class="ca-icon" href="webmail/"><img src="images/rouncube.png" width="48" height="48" alt=""></a><a href="webmail/">Webmail</a></div>
+<?php $_wm = h(webmail_url() ?: '/webmail/'); ?>
+                        <div class="ca-item"><a class="ca-icon" href="<?=$_wm?>" target="_blank"><img src="images/rouncube.png" width="48" height="48" alt=""></a><a href="<?=$_wm?>" target="_blank">Webmail</a></div>
 <? } ?>
                         <div class="ca-item"><a class="ca-icon" href="databases/"><img src="images/databases.png" alt=""></a><a href="databases/">Manage Databases</a></div>
                         <div class="ca-item"><a class="ca-icon" href="phpmyadmin/" target="_blank"><img src="images/phpmyadmin.png" alt=""></a><a href="phpmyadmin/" target="_blank">PhpMyAdmin</a></div>

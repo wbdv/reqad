@@ -66,6 +66,24 @@ function wordpress_cli(array $row, $args, $timeout = 900, $stdin = null) {
 	return array('out' => rtrim($out), 'rc' => $rc);
 }
 
+/*
+ * The site's title. wp-cli prints PHP's warnings (a site's old code, its
+ * wp-config.php defining WP_DEBUG twice) on the same output as the answer,
+ * so the title comes after a marker; '' when WordPress does not start.
+ */
+function wordpress_site_title(array $row) {
+	$code = 'echo "\n##REQAD##", json_encode((string)get_option("blogname"));';
+	$r = wordpress_cli($row, 'eval '.escapeshellarg($code).' --skip-plugins --skip-themes --path='.escapeshellarg(wordpress_docroot($row)), 60);
+	$pos = strrpos($r['out'], '##REQAD##');
+	$t = $pos !== false ? json_decode(substr($r['out'], $pos + 9), true) : null;
+	return is_string($t) ? trim(preg_replace('/\s+/u', ' ', html_entity_decode($t, ENT_QUOTES, 'UTF-8'))) : '';
+}
+
+/* a title saved with PHP's messages in it (before wordpress_site_title()) */
+function wordpress_title_garbled($title) {
+	return (bool)preg_match('/\b(PHP )?(Warning|Notice|Deprecated|Fatal error|Parse error): .* on line \d+/', $title);
+}
+
 function wordpress_docroot(array $row) {
 	return wp_site_docroot($row['user'], $row['path'] ?? '', $row['domain']);
 }
@@ -77,7 +95,8 @@ function wordpress_public(array $row) {
 	             'version' => $row['wp_version'], 'core_status' => wordpress_core_status((string)$row['wp_version']),
 	             'php' => ($php = wp_site_php_version($GLOBALS['ini'], $row['domain'])),
 	             'php_ended' => isset(health_php_eol()[$php]) && strtotime(health_php_eol()[$php]) < time(),
-	             'title' => $row['title'], 'status' => $row['status'],
+	             /* a title saved with PHP's warnings in it shows as none until the next scan reads it again */
+	             'title' => wordpress_title_garbled((string)$row['title']) ? '' : $row['title'], 'status' => $row['status'],
 	             /* a copy made in Clone or staging: kind (staging|clone), source (the live site's id) */
 	             'copy' => wordpress_copy_map()[(int)$row['id']] ?? null);
 }
@@ -741,11 +760,18 @@ function wordpress_scan($account) {
 				$u->bindValue(':id', (int)$have[$key]['id'], SQLITE3_INTEGER);
 				$u->execute();
 			}
+			/* titles saved before wordpress_site_title() could hold PHP warnings: read them again */
+			if (wordpress_title_garbled((string)$have[$key]['title'])) {
+				$title = wordpress_site_title($have[$key]);
+				$u = $db->prepare('UPDATE wordpress SET title = :t WHERE id = :id');
+				$u->bindValue(':t', mb_substr($title !== '' ? $title : $domain, 0, 255), SQLITE3_TEXT);
+				$u->bindValue(':id', (int)$have[$key]['id'], SQLITE3_INTEGER);
+				$u->execute();
+			}
 			continue;
 		}
 		$row = array('id' => 0, 'user' => $user, 'domain' => $domain, 'path' => $path);
-		$t = wordpress_cli($row, 'option get blogname --skip-plugins --skip-themes --path='.escapeshellarg(wordpress_docroot($row)), 60);
-		$title = $t['rc'] === 0 ? html_entity_decode(trim($t['out']), ENT_QUOTES, 'UTF-8') : '';
+		$title = wordpress_site_title($row);
 		$ins = $db->prepare('INSERT INTO wordpress (user, domain, title, wp_version, path, comments, status, created_at)
 		                     VALUES (:u, :d, :t, :v, :p, "", :s, datetime("now"))');
 		$ins->bindValue(':u', $user, SQLITE3_TEXT);
@@ -966,6 +992,17 @@ EOT;
 
 /* ---- a new WordPress ------------------------------------------------------- */
 
+/* The newest WordPress .zip for a language from wordpress.org ('' = none found). */
+function wordpress_download_zip($locale) {
+	$d = json_decode((string)shell_exec('curl -fsS --max-time 8 '
+		.escapeshellarg('https://api.wordpress.org/core/version-check/1.7/?locale='.rawurlencode($locale)).' 2>/dev/null'), true);
+	foreach ((is_array($d) && isset($d['offers']) && is_array($d['offers'])) ? $d['offers'] : array() as $o)
+		if (($o['locale'] ?? '') === $locale
+		    && preg_match('~^https://downloads\.(wordpress\.org|w\.org)/release/([a-zA-Z_]+/)?wordpress-[0-9.]+\.zip$~', (string)($o['download'] ?? '')))
+			return (string)$o['download'];
+	return '';
+}
+
 /* WordPress's languages, code => name (English first): wordpress.org's list,
    kept a week in wptoolkit/translations.json (English alone until it can be had). */
 function wordpress_locales() {
@@ -1170,7 +1207,14 @@ function wordpress_install($account, array $o) {
 			database_delete($database);
 	};
 
-	$r = wordpress_cli($row, 'core download --locale='.escapeshellarg($c['locale']).$p, 150);
+	/* the .zip, not wp-cli's default .tar.gz: WP-CLI up to 2.12 unpacks the tarball with
+	   PharData, which cuts paths over 100 characters (WordPress 6.7+ wp-includes/php-ai-client/
+	   loses files, the site breaks later) - wp-cli/core-command#336. The tarball stays the
+	   fallback when the address cannot be had or the site's PHP has no zip extension. */
+	$zip = wordpress_download_zip($c['locale']);
+	$r = $zip !== '' ? wordpress_cli($row, 'core download '.escapeshellarg($zip).$p, 150) : array('rc' => 1);
+	if ($r['rc'] !== 0)
+		$r = wordpress_cli($row, 'core download --force --locale='.escapeshellarg($c['locale']).$p, 150);
 	if ($r['rc'] !== 0) {
 		$undo();
 		return result_error('WordPress could not be downloaded: '.wp_cli_error($r));

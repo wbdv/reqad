@@ -7,6 +7,8 @@ $r = email_edit(array(
 	'password' => trim($_POST['password'] ?? ''),
 	'enabled'  => isset($_POST['login_enabled']) && $_POST['login_enabled'] == '1',
 	'size'     => trim($_POST['size'] ?? ''),      // mailbox size (Hosting Pro's field)
+	'refuse_incoming' => isset($_POST['refuse_incoming']) && $_POST['refuse_incoming'] == '1',
+	'refuse_message'  => isset($_POST['refuse_incoming']) ? trim($_POST['refuse_message'] ?? '') : null,
 ));
 
 $msg_base = $_SERVER['REQUEST_SCHEME'].'://'.$_SERVER['HTTP_HOST'].'/email-accounts/';

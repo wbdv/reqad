@@ -3,17 +3,21 @@
 /**
  * Reqad - import_cpanel_spam.php
  *
- * Import a cPanel account's SpamAssassin whitelist / blocklist.
+ * Import a cPanel account's SpamAssassin whitelist / blocklist and its spam
+ * score (the threshold).
  *
  *   cPanel path                              what it holds
- *   /home/<acct>/.spamassassin/user_prefs    whitelist_from / blacklist_from
+ *   /home/<acct>/.spamassassin/user_prefs    whitelist_from / blacklist_from,
+ *                                            required_score
  *
  * cPanel keeps these in exactly the file SpamAssassin reads, and so does Reqad,
  * so this is a merge rather than a conversion: the remote file is parsed, its
  * two lists are added to whatever the local account already has, and every other
  * preference in the LOCAL file (a score threshold, a hand-added rule) is left
- * alone. Preferences other than the two lists are NOT taken from the remote
- * file - they are the old server's tuning and often reference its rule set.
+ * alone. The spam score (required_score) is taken too when it differs from
+ * this server's default, through spam_settings_set() like the panel. Other
+ * preferences are NOT taken from the remote file - they are the old server's
+ * tuning and often reference its rule set.
  *
  * DRY RUN BY DEFAULT. Nothing is written without --apply, because a bad import
  * silently changes which mail is treated as spam.
@@ -30,6 +34,8 @@
 
 require_once '/usr/local/reqad/public_html/defines.php';
 require_once '/usr/local/reqad/public_html/modules/functions.php';
+foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
+    require_once $app_functions_file;
 
 $opt   = getopt('', array('user:', 'file:', 'apply', 'replace', 'help'));
 $usage = "usage: import_cpanel_spam.php --user=<local account> "
@@ -82,19 +88,44 @@ if ($skipped) {
         printf("    · %s\n", $s);
 }
 
-/* The other preferences in the remote file are shown but never taken: scores and
-   custom rules belong to the server they were tuned on. */
+/* The spam score: taken when it is a usable threshold (1-20, as the panel
+   allows) other than this server's default. Equal to the default it is left
+   out, so the account keeps following the server's setting. */
+$score = null;
+$score_note = '';
+foreach ($remote['other'] as $l)
+    if (preg_match('/^\s*(required_score|required_hits)\s+(\S+)/i', $l, $m)) {
+        $v = $m[2];
+        $def = spam_default_score();
+        if (!is_numeric($v) || (float)$v < 1 || (float)$v > 20) {
+            $score = null;
+            $score_note = "spam score $v is not usable here (1 to 20), left on this server's default ($def)";
+        } elseif (abs((float)$v - $def) < 0.001) {
+            $score = null;
+            $score_note = "spam score $v is this server's default too, nothing to set";
+        } else {
+            $score = round((float)$v, 1);
+            $score_note = '';
+        }
+    }
+
+/* The other preferences in the remote file are shown but never taken: rule
+   scores and custom rules belong to the server they were tuned on. */
 $carried = array();
 foreach ($remote['other'] as $l)
-    if (trim($l) !== '' && trim($l)[0] !== '#')
+    if (trim($l) !== '' && trim($l)[0] !== '#' && !preg_match('/^\s*(required_score|required_hits)\s/i', $l))
         $carried[] = trim($l);
+if ($score !== null)
+    printf("\n  SPAM SCORE %s (this server's default is %s)\n", $score, spam_default_score());
+elseif ($score_note !== '')
+    printf("\n  %s\n", ucfirst($score_note));
 if ($carried) {
     print "\n  NOT IMPORTED - other preferences in the remote file, shown for reference:\n";
     foreach ($carried as $l)
         printf("    · %s\n", $l);
 }
 
-if (!$remote['white'] && !$remote['black'])
+if (!$remote['white'] && !$remote['black'] && $score === null)
     exit("\nNothing to import.\n");
 
 $local = sa_lists_get($user);
@@ -123,9 +154,17 @@ if ($dupes)
 if (!$apply)
     exit("\nDry run - nothing written. Re-run with --apply to import.\n");
 
-$err = sa_lists_put($user, $white, $black);
-if ($err !== '')
-    exit("\nERROR: nothing was written. $err\n");
+if ($remote['white'] || $remote['black'] || $replace) {
+    $err = sa_lists_put($user, $white, $black);
+    if ($err !== '')
+        exit("\nERROR: nothing was written. $err\n");
+    printf("\nImported into %s: %d whitelisted and %d blocklisted sender(s) are now in place.\n",
+           $user, count($white), count($black));
+}
 
-printf("\nImported into %s: %d whitelisted and %d blocklisted sender(s) are now in place.\n",
-       $user, count($white), count($black));
+if ($score !== null) {
+    $r = spam_settings_set($user, array('score' => $score));
+    if (empty($r['ok']))
+        exit("\nERROR: the spam score was not set: ".($r['error'] ?? 'unknown error')."\n");
+    printf("Spam score of %s set to %s.\n", $user, $score);
+}

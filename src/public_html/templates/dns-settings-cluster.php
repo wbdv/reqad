@@ -23,7 +23,7 @@
 		return '<span class="dc-ic" style="background:'.$x[0].'"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="'.$x[1].'" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="'.$x[2].'"/></svg></span>';
 	};
 	$dc_state = array('o' => array('bg-green-lt', 'in step'), 'b' => array('bg-yellow-lt', 'behind'), 'd' => array('bg-red-lt', 'not answering'), '' => array('bg-secondary-lt', 'not checked yet'));
-	$dc_seg   = array('o' => '#2fb344', 'b' => '#e09b18', 'd' => '#d63939', '' => '#dfe2e6');
+	$dc_seg   = array('o' => '#7bde59', 'b' => '#e4ff66', 'd' => '#d63939', '' => '#dfe2e6');
 ?>
 <style>
 	#dns-cluster .dc-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
@@ -203,10 +203,10 @@
 				<span class="text-muted">in step <?=h(rtrim(rtrim(number_format($s['pct'], 1), '0'), '.'))?>% of the checks this week</span>
 <?php endif; ?>
 				<span class="ms-auto d-flex flex-wrap text-muted" style="gap:12px">
-					<span class="dc-key"><span class="dns-dot" style="background:#2fb344"></span>in step</span>
-					<span class="dc-key"><span class="dns-dot" style="background:#e09b18"></span>behind</span>
-					<span class="dc-key"><span class="dns-dot" style="background:#d63939"></span>not answering</span>
-					<span class="dc-key"><span class="dns-dot" style="background:#dfe2e6"></span>no check</span>
+					<span class="dc-key"><span class="dns-dot" style="background:#7bde59;border:1px solid #70c254"></span>in step</span>
+					<span class="dc-key"><span class="dns-dot" style="background:#e4ff66;border:1px solid #c3da57"></span>behind</span>
+					<span class="dc-key"><span class="dns-dot" style="background:#ff2746;border:1px solid #e0223d"></span>not answering</span>
+					<span class="dc-key"><span class="dns-dot" style="background:#dfe2e6;border:1px solid #bbb"></span>no check</span>
 				</span>
 			</div>
 			<div class="dc-bar" role="img" aria-label="The checks of the last 24 hours, half an hour each">

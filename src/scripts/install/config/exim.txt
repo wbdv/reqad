@@ -202,27 +202,10 @@ tls_advertise_hosts = *
 # tls_certificate = /etc/pki/tls/certs/exim.pem
 # tls_privatekey = /etc/pki/tls/private/exim.pem
 
-tls_certificate = ${if and \
-    { \
-        {gt{$tls_in_sni}{}} \
-        {!match{$tls_in_sni}{/}} \
-	{exists{/etc/letsencrypt/live/$tls_in_sni/fullchain.pem}} \
-	{exists{/etc/letsencrypt/live/$tls_in_sni/privkey.pem}} \
-    } \
-    {/etc/letsencrypt/live/$tls_in_sni/fullchain.pem} \
-    {/etc/pki/tls/certs/exim.pem} \
-}
-
-tls_privatekey = ${if and \
-    { \
-        {gt{$tls_in_sni}{}} \
-        {!match{$tls_in_sni}{/}} \
-	{exists{/etc/letsencrypt/live/$tls_in_sni/fullchain.pem}} \
-	{exists{/etc/letsencrypt/live/$tls_in_sni/privkey.pem}} \
-    } \
-    {/etc/letsencrypt/live/$tls_in_sni/privkey.pem} \
-    {/etc/pki/tls/private/exim.pem} \
-}
+# Certificate per SNI name: /etc/exim/sni_certs.db + sni_keys.db, written by
+# scripts/update_email_sni (wildcard keys like *.example.com match subdomains)
+tls_certificate = ${lookup{$tls_in_sni}wildlsearch{/etc/exim/sni_certs.db}{$value}{/etc/pki/tls/certs/exim.pem}}
+tls_privatekey  = ${lookup{$tls_in_sni}wildlsearch{/etc/exim/sni_keys.db}{$value}{/etc/pki/tls/private/exim.pem}}
 
 # For OpenSSL, prefer EC- over RSA-authenticated ciphers
 .ifdef _HAVE_OPENSSL
@@ -736,10 +719,21 @@ acl_check_prdr:
 # extension (WITH_CONTENT_SCAN=yes in Local/Makefile).
 
 acl_check_data:
+  ### --- Reqad managed (sender-domain-dbl) --- ###
+  # Sender domain on the Spamhaus Domain Block List: spam, phishing, malware,
+  # botnet. Hacked real sites (127.0.1.1xx) and error answers do not count.
+  # Switch: Email > Exim > Blocklists, or scripts/update/setup_exim_dbl.sh --off
+  deny    message    = rejected because the sender domain $sender_address_domain is listed at $dnslist_domain see $dnslist_text
+          log_message = sender domain $sender_address_domain listed at $dnslist_domain ($dnslist_value)
+          !authenticated = *
+          !hosts = +relay_from_hosts
+          condition = ${if def:sender_address_domain}
+          dnslists = dbl.spamhaus.org=127.0.1.2,127.0.1.4,127.0.1.5,127.0.1.6/$sender_address_domain
+  ### --- end Reqad managed (sender-domain-dbl) --- ###
 
   deny    message    = rejected because $sender_host_address is in a blacklist at $dnslist_domain see $dnslist_text
           !authenticated = *
-          dnslists  =  bl.abuseat.org : b.barracudacentral.org : zen.spamhaus.org : bl.spamcop.net  : dnsbl.dronebl.org : combined.abuse.ch
+          dnslists = bl.abuseat.org : b.barracudacentral.org : zen.spamhaus.org=127.0.0.2,127.0.0.3,127.0.0.4,127.0.0.5,127.0.0.6,127.0.0.7,127.0.0.9,127.0.0.10,127.0.0.11 : bl.spamcop.net : dnsbl.dronebl.org : combined.abuse.ch
 
   deny    message   = Content Policy Restriction: Multiple from addresses are not accepted.
           condition = ${if match{$header_from:}{@.+@.+@}}
@@ -749,8 +743,8 @@ acl_check_data:
   # Deny if the message contains an overlong line.  Per the standards
   # we should never receive one such via SMTP.
   #
-  deny    condition  = ${if > {$max_received_linelength}{998}}
-          message    = maximum allowed line length is 998 octets, \
+  deny    condition  = ${if > {$max_received_linelength}{10000}}
+          message    = maximum allowed line length is 10000 octets, \
                        got $max_received_linelength
 
   # Deny if the headers contain badly-formed addresses.
@@ -1237,6 +1231,7 @@ begin transports
 
 dkim_remote_smtp:
 	driver = smtp
+	message_linelength_limit = 10000
 	#dkim_domain = $sender_address_domain
 	dkim_domain = DKIM_DOMAIN
 	dkim_selector = default
@@ -1273,13 +1268,13 @@ dkim_remote_forwarded_smtp:
 	tls_try_verify_hosts = ""
     # Disable chunking with empty list:
     hosts_try_chunking = :
-    message_linelength_limit = 2048
+    message_linelength_limit = 10000
 	max_rcpt = 1
 	return_path = ${srs_encode {SRS_SECRET} {$return_path} {$original_domain}}
 
 remote_smtp:
   driver = smtp
-  message_size_limit = ${if > {$max_received_linelength}{998} {1}{0}}
+  message_linelength_limit = 10000
 .ifdef _HAVE_DANE
   dnssec_request_domains = *
   hosts_try_dane = *
@@ -1301,6 +1296,7 @@ remote_smtp:
 
 mandrill_smtp:
   driver = smtp
+  message_linelength_limit = 10000
   port = 587
   hosts_require_auth = $host_address
   hosts_require_tls = $host_address
@@ -1310,6 +1306,7 @@ mandrill_smtp:
 
 remote_msa:
   driver = smtp
+  message_linelength_limit = 10000
   port = 587
   hosts_require_auth = *
 
@@ -1334,7 +1331,7 @@ procmail:
 
 smarthost_smtp:
   driver = smtp
-  message_size_limit = ${if > {$max_received_linelength}{998} {1}{0}}
+  message_linelength_limit = 10000
   multi_domain
   #
 .ifdef _HAVE_TLS

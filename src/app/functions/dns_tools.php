@@ -361,6 +361,9 @@ function dns_zone_check($zone, array $sets, $account = '', $net = true) {
 				if (strlen($v) > 1 && $v[0] === '"' && substr($v, -1) === '"')
 					$add('warn', 'txt_quotes', $n, "The text of {$show($n)} has quotes inside it (it was pasted with them), so services read them as part of it.", $ref,
 					     array('label' => 'Take the quotes off', 'ops' => array(array('op' => 'edit', 'old' => $rec($n, $t, $v, $tl), 'new' => $rec($n, $t, dns_txt_decode($v), $tl)))));
+				elseif (preg_match('/\\\\(?:[;@ "\\\\]|\d{3})/', $v))
+					$add('warn', 'txt_escaped', $n, "The text of {$show($n)} has backslashes left from a zone file (such as \\; for ;), so services cannot read it (a DMARC or DKIM record then fails).", $ref,
+					     array('label' => 'Take the backslashes off', 'ops' => array(array('op' => 'edit', 'old' => $rec($n, $t, $v, $tl), 'new' => $rec($n, $t, dns_txt_unescape($v), $tl)))));
 				if (strpos($lv, 'v=spf1') === 0) {
 					if (preg_match('/(^|\s)\+?all$/i', trim($v)) && !preg_match('/[-~?]all$/i', trim($v)))
 						$add('warn', 'spf_all', $n, "The SPF record of {$show($n)} ends with +all: every server on the internet may send mail as it.", $ref,
@@ -452,11 +455,12 @@ function dns_zone_check($zone, array $sets, $account = '', $net = true) {
 			     array('label' => 'Allow Let\'s Encrypt', 'ops' => array(array('op' => 'add', 'rec' => $rec($zone, 'CAA', '0 issue "letsencrypt.org"', $ttl[$zone.'|CAA'] ?? 14400)))));
 	}
 	/* the name servers the zone names, against those it should have */
-	$want = dns_expected_nameservers();
+	$want = dns_expected_nameservers($zone);
 	if ($want && $ns) {
 		$miss = array_values(array_diff($want, $ns));
 		$extra = array_values(array_diff($ns, $want));
-		if ($miss) {
+		/* other names for the same servers (private name servers) are fine */
+		if ($miss && !dns_ns_aliases($ns, $want, $net)) {
 			$tl = $ttl[$zone.'|NS'] ?? 86400;
 			$ops = array();
 			foreach ($miss as $m)
@@ -491,14 +495,75 @@ function dns_zone_check($zone, array $sets, $account = '', $net = true) {
 	return $items;
 }
 
-/* The name servers this server's zones should name ([] = no rule known). */
-function dns_expected_nameservers() {
+/* The name servers this server's zones should name ([] = no rule known).
+   $zone: the ones that zone should name - the filter 'dns.nameservers' (+
+   zone, '' = the server's own) may give another set for it, e.g. a
+   reseller's private name servers for the zones of its accounts. */
+function dns_expected_nameservers($zone = '') {
 	$ns = array();
 	if (setting_get('dns-provider') === 'powerdns')
 		foreach (array('powerdns-ns1', 'powerdns-ns2') as $k)
 			if (($v = dns_host_canon(setting_get($k))) !== '')
 				$ns[] = $v;
-	return (array)plugin_filter('dns.nameservers', array_values(array_unique($ns)));
+	return array_values(array_map('dns_host_canon', (array)plugin_filter('dns.nameservers', array_values(array_unique($ns)), dns_host_canon($zone))));
+}
+
+/* The addresses (A and AAAA) of host $name: from the DNS provider's zones
+   when one holds them (no waiting for caches), else - with $net - from the
+   internet. Kept for the request. */
+function dns_ns_addrs($name, $net = true) {
+	static $memo = array();
+	$name = dns_host_canon($name);
+	$k = $name.'|'.(int)$net;
+	if (isset($memo[$k]))
+		return $memo[$k];
+	$out = null;
+	if (!function_exists('dns_rrset_get') && function_exists('dns_provider_load') && function_exists('dns_managed') && dns_managed()) {
+		global $db;
+		dns_provider_load($db);
+	}
+	if (function_exists('dns_rrset_get')) {
+		$a = dns_rrset_get($name, 'A');
+		if ($a !== null)
+			$out = array_merge((array)$a, (array)dns_rrset_get($name, 'AAAA'));
+	}
+	if (!$out) {      /* no zone here holds it, or it has no address in it */
+		$out = array();
+		if ($net)
+			foreach (array(DNS_A, DNS_AAAA) as $t)
+				foreach ((array)@dns_get_record($name.'.', $t) as $r)
+					if (!empty($r['ip']) || !empty($r['ipv6']))
+						$out[] = $r['ip'] ?? $r['ipv6'];
+	}
+	$out = array_values(array_unique(array_filter(array_map(function ($a) {
+		$b = @inet_pton(trim((string)$a));
+		return $b === false ? '' : inet_ntop($b);
+	}, $out))));
+	return $memo[$k] = $out;
+}
+
+/* Are the name servers $have other names for $want: as many, and each with
+   addresses, all of them addresses of $want's (a reseller's private name
+   servers, ns1.example.com -> the server's ns1)? Then the zone is served by
+   the same machines and nothing is wrong. */
+function dns_ns_aliases(array $have, array $want, $net = true) {
+	$have = array_values(array_unique(array_map('dns_host_canon', $have)));
+	$want = array_values(array_unique(array_map('dns_host_canon', $want)));
+	if (!$have || count($have) !== count($want))
+		return false;
+	/* the server's own name servers: a public lookup even without $net
+	   (two names, kept for the request) - their own zone may be elsewhere */
+	$w = array();
+	foreach ($want as $n)
+		$w = array_merge($w, dns_ns_addrs($n, true));
+	if (!$w)
+		return false;
+	foreach ($have as $n) {
+		$a = dns_ns_addrs($n, $net);
+		if (!$a || array_diff($a, $w))
+			return false;
+	}
+	return true;
 }
 
 /* Record counts and problems of several zones (the zone list): zone =>
@@ -748,14 +813,15 @@ function dns_record_preview($account, $zone, array $r, array $old = null) {
 	$sets = dns_zone_sets($zone);
 	if (!is_array($sets))
 		return result_error($sets);
-	$hints = dns_record_hints($zone, $sets, $r, $old);
 	$o = null;
 	if ($old) {
 		list($ofq, $otype, $ov, $e) = dns_record_find($account, $zone, $sets, $old);
 		if ($e !== '')
-			return result_error($e, array('hints' => $hints));
+			return result_error($e, array('hints' => dns_record_hints($zone, $sets, $r, $old)));
+		$r = dns_record_same_name($r, $old, $ofq);
 		$o = array('fqdn' => $ofq, 'type' => $otype);
 	}
+	$hints = dns_record_hints($zone, $sets, $r, $old);
 	list($fq, $type, $ttl, $v, $e) = dns_record_input($account, $zone, $sets, $r, $o);
 	if ($e !== '')
 		return result_error($e, array('hints' => $hints));

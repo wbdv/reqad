@@ -75,7 +75,9 @@
 		}
 	}
 
-	#echo '<pre>'; print_r($user_databases); print_r($dbs); exit;
+	$items = 20;    // databases per page
+	$nb_dbs = 0;
+	foreach($user_databases as $tmp_databases) $nb_dbs += count($tmp_databases);
 ?>
           <!-- Page title -->
           <div class="page-header d-print-none">
@@ -192,6 +194,18 @@
                         <th style="background-color:#DEF;width:20%;max-width:250px;">Operation</th>
                         <th class="w-1" style="background-color:#DEF;"></th>
                       </tr>
+					<? if($nb_dbs > 1) { ?>
+                      <tr style="background-color:#FFF;">
+                        <td style="padding:4px 8px;">&nbsp;</td>
+                        <td style="padding:4px 8px;">
+                          <div style="position:relative;">
+                            <input type="text" id="db-search" class="form-control" placeholder="Filter databases, users..." style="padding:6px;padding-right:26px;line-height:8pt;font-size:10pt;border:none;" autocomplete="off">
+                            <button id="db-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
+                          </div>
+                        </td>
+                        <td colspan="6" style="padding:4px 8px;"></td>
+                      </tr>
+					<? } ?>
                     </thead>
                     <tbody>
                     <?
@@ -199,8 +213,9 @@
                     foreach($user_databases as $user => $dbs) {
 						foreach($dbs as $dbname) {
 							$i++;
+							$db_search = strtolower($dbname.' '.($mysql_users[$dbname] ?? '').' '.($user === '<i>unassigned</i>' ? 'unassigned' : $user));
                     ?>
-                      <tr>
+                      <tr class="db-row" data-idx="<?=$i;?>" data-search="<?=h($db_search);?>" style="<?=$i>$items?'display:none':'';?>">
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
@@ -292,29 +307,9 @@
                     </tbody>
                   </table>
                 </div>
-                <? /* pagination
-				        <div class="card-footer d-flex align-items-center">
-                  <p class="m-0 text-muted"><span class="d-none d-xl-inline">Showing </span><span>1</span> to <span>2</span> of <span>2</span></p>
-                  <!--
-                  <ul class="pagination m-0 ms-auto">
-                    <li class="page-item disabled">
-                      <a class="page-link" href="#" tabindex="-1" aria-disabled="true">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><polyline points="15 6 9 12 15 18"></polyline></svg>
-                        prev
-                      </a>
-                    </li>
-                    <li class="page-item active"><a class="page-link" href="#">1</a></li>
-                    <li class="page-item"><a class="page-link" href="#">2</a></li>
-                    <li class="page-item"><a class="page-link" href="#">3</a></li>
-                    <li class="page-item">
-                      <a class="page-link" href="/email-accounts/?page=2">
-                        next <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><polyline points="9 6 15 12 9 18"></polyline></svg>
-                      </a>
-                    </li>
-                  </ul>
-                  -->
+                <div id="db-footer" class="card-footer d-flex align-items-center">
+                  <p class="m-0 text-muted">Total: <?=$nb_dbs;?> database<?=$nb_dbs!=1?'s':'';?>.</p>
                 </div>
-                */ ?>
               </div>
             </div>
 			<?  } ?>
@@ -621,6 +616,64 @@
 <script>
 jQuery(document).ready(function () {
 	'use strict';
+
+	// Search / pagination (search results are paged too)
+	var dbItems = <?=(int)$items;?>;
+	var dbStart = 1;
+	var svgPrev = '<svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><polyline points="15 6 9 12 15 18"></polyline></svg>';
+	var svgNext = '<svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><polyline points="9 6 15 12 9 18"></polyline></svg>';
+
+	function dbMatches() {
+		var q = String($('#db-search').val() || '').toLowerCase().trim();
+		return $('.db-row').filter(function() {
+			return q === '' || String($(this).data('search')).indexOf(q) !== -1;
+		});
+	}
+
+	function showDbPage(start) {
+		var q = String($('#db-search').val() || '').trim();
+		var rows = dbMatches();
+		var total = rows.length;
+		if (start < 1 || start > total) start = 1;
+		dbStart = start;
+		$('.db-row').hide();
+		rows.slice(start - 1, start - 1 + dbItems).show();
+
+		var label = q === '' ? ' databases' : ' results for &ldquo;' + $('<span>').text(q).html() + '&rdquo;';
+		var html = '';
+		if (total > dbItems) {
+			var pages = Math.ceil(total / dbItems);
+			var curPage = Math.floor((start - 1) / dbItems) + 1;
+			html += '<p class="m-0 text-muted"><span class="d-none d-xl-inline">Showing </span>' + start + ' to ' + Math.min(start + dbItems - 1, total) + ' of ' + total + label + '</p>';
+			html += '<ul class="pagination m-0 ms-auto">';
+			html += '<li class="page-item' + (start === 1 ? ' disabled' : '') + '"><a class="page-link" href="#" data-start="' + Math.max(1, start - dbItems) + '">' + svgPrev + ' prev</a></li>';
+			for (var p = 1; p <= pages; p++) {
+				html += '<li class="page-item' + (p === curPage ? ' active' : '') + '"><a class="page-link" href="#" data-start="' + ((p - 1) * dbItems + 1) + '">' + p + '</a></li>';
+			}
+			html += '<li class="page-item' + ((start + dbItems) > total ? ' disabled' : '') + '"><a class="page-link" href="#" data-start="' + (start + dbItems) + '">next ' + svgNext + '</a></li>';
+			html += '</ul>';
+		} else if (q === '') {
+			html = '<p class="m-0 text-muted">Total: ' + total + ' database' + (total !== 1 ? 's' : '') + '.</p>';
+		} else {
+			html = '<p class="m-0 text-muted">' + total + ' result' + (total !== 1 ? 's' : '') + ' for &ldquo;' + $('<span>').text(q).html() + '&rdquo;</p>';
+		}
+		$('#db-footer').html(html);
+	}
+
+	$('#db-footer').on('click', '.page-link', function(e) {
+		e.preventDefault();
+		if ($(this).closest('.page-item').hasClass('disabled')) return;
+		showDbPage(parseInt($(this).data('start')));
+	});
+	$('#db-search').on('input', function() {
+		$('#db-search-clear').toggle($(this).val() !== '');
+		showDbPage(1);
+	});
+	$('#db-search-clear').on('click', function() {
+		$('#db-search').val('').trigger('input').focus();
+	});
+	if ($('.db-row').length) showDbPage(1);
+
 	$("#user").on("change", function(value){
 		var user = $(this).val();
 		if(user=='') {

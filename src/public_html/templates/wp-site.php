@@ -74,7 +74,7 @@
                   <a href="/wp-toolkit/" class="text-muted">Wordpress Toolkit</a> / <?=h($domain);?><?=$sub !== '' ? '/'.h($sub) : '';?>
                 </div>
                 <h2 class="page-title">
-                  <span id="wp-title"><?=h($site['title']);?></span>
+                  <span id="wp-title"><?=h(wordpress_title_garbled((string)$site['title']) ? $domain : $site['title']);?></span>
                 </h2>
                 <div class="text-muted" id="wp-tagline"></div>
               </div>

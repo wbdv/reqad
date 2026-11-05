@@ -10,6 +10,8 @@
  *                                      dismissed ones left out unless $all.
  *                                      $account null = all, '' = server only.
  *   health_dismiss($db, $id, $days)    hide an item for $days (0 = for good)
+ *   health_item_refresh($db, $id, $it) after a fix: update or drop one stored
+ *                                      item now (else it waits for the run)
  *
  * An item (health_item()): id check:account:subject (stable across runs, so a
  * dismissal keeps applying), account ('' = the server), subject (domain,
@@ -61,7 +63,9 @@ function health_checks() {
 		'services'   => array('label' => 'Services',                       'scope' => 'server',  'run' => 'health_check_services'),
 		'backup'     => array('label' => 'Nightly backup',                 'scope' => 'server',  'run' => 'health_check_backup'),
 		'rbl'        => array('label' => 'Server IP on mail blocklists',   'scope' => 'server',  'run' => 'health_check_rbl'),
+		'spamhaus'   => array('label' => 'Spamhaus checks on incoming mail get answers', 'scope' => 'server', 'run' => 'health_check_spamhaus'),
 		'mail_queue' => array('label' => 'Mail queue',                     'scope' => 'server',  'run' => 'health_check_mail_queue'),
+		'webmail'    => array('label' => 'Webmail on its own port (2096)', 'scope' => 'server',  'run' => 'health_check_webmail'),
 		'root_mail'  => array('label' => 'Mail for root',                  'scope' => 'server',  'run' => 'health_check_root_mail'),
 		'reboot'     => array('label' => 'Reboot after a kernel update',   'scope' => 'server',  'run' => 'health_check_reboot'),
 		'stats'      => array('label' => 'Visitor stats counting',         'scope' => 'server',  'run' => 'health_check_stats'),
@@ -72,6 +76,7 @@ function health_checks() {
 		'shell_log'  => array('label' => 'Commands of hosting accounts that look like abuse', 'scope' => 'server', 'run' => 'health_check_shell_log'),
 		'dns_cluster' => array('label' => 'DNS cluster: secondaries in step with this server', 'scope' => 'server', 'run' => 'health_check_dns_cluster'),
 		'dns_keys'   => array('label' => 'DNS API keys that expire or hold zones while revoked', 'scope' => 'server', 'run' => 'health_check_dns_keys'),
+		'php_legacy' => array('label' => 'PHP 5.4 / 5.6: newest security fixes installed and loaded', 'scope' => 'server', 'run' => 'health_check_php_legacy'),
 		'apps'       => array('label' => 'Webmail and phpMyAdmin versions','scope' => 'server',  'run' => 'health_check_apps'),
 		'reqad'      => array('label' => 'Reqad updates',                  'scope' => 'server',  'run' => 'health_check_reqad_update'),
 		'premium_repo' => array('label' => 'Premium repository: updates of the add-ons', 'scope' => 'server', 'run' => 'health_check_premium_repo'),
@@ -171,6 +176,22 @@ function health_items($db, $account = null, $all = false) {
 		   <=> array($sev[$b['severity']] ?? 9, $b['account'] !== '', $b['account'], $b['subject'], $b['check_id']);
 	});
 	return $rows;
+}
+
+/* Bring one stored item up to date after a fix or a fresh check, without
+   waiting for the next run: $item null = fixed (the stored one goes), else
+   its new wording. Only an item already stored is touched; new ones wait
+   for the run. */
+function health_item_refresh($db, $id, $item = null) {
+	if (!health_item_get($db, $id))
+		return;
+	if ($item !== null) {
+		health_store($db, $item, time());
+		return;
+	}
+	$stmt = $db->prepare('DELETE FROM health_items WHERE id = :id');
+	$stmt->bindValue(':id', (string)$id, SQLITE3_TEXT);
+	$stmt->execute();
 }
 
 function health_item_get($db, $id) {
@@ -317,11 +338,32 @@ function health_check_ssl() {
 			$items[] = health_item('ssl', $user, $domain, 'warning', "Self-signed certificate on $what",
 			                       "Browsers warn on https://$domain/. A Let's Encrypt certificate needs the domain to point at this server.",
 			                       '/ssl/', 'SSL');
-		} elseif ($days < 14) {
-			$items[] = health_item('ssl', $user, $domain, $days < 3 ? 'critical' : 'warning',
-			                       "Certificate of $what expires in $days day".($days == 1 ? '' : 's'),
-			                       "Let's Encrypt renews 30 days ahead, so the renewal is probably failing (certbot renew --dry-run shows why).",
-			                       '/ssl/', 'SSL');
+		} else {
+			/* how it renews (app/functions/ssl_renew.php) */
+			$issuer = (string)($c['issuer']['O'] ?? ($c['issuer']['CN'] ?? ''));
+			$kind = ssl_renew_kind(array('issuer' => $issuer, 'lets_encrypt' => strpos((string)$c['_file'], '/etc/letsencrypt/') === 0));
+			if ($kind === 'auto' && ($user === '' || ssl_free_error($user) !== ''))
+				$kind = 'manual';
+			$title = "Certificate of $what expires in $days day".($days == 1 ? '' : 's');
+			$sev = $days < 3 ? 'critical' : 'warning';
+			if ($kind === 'certbot' && $days < 14)
+				$items[] = health_item('ssl', $user, $domain, $sev, $title,
+				                       "Let's Encrypt renews 30 days ahead, so the renewal is probably failing (certbot renew --dry-run shows why).",
+				                       '/ssl/', 'SSL');
+			elseif ($kind === 'auto' && $days < ssl_renew_days()) {
+				/* reqad ssl renew (daily) replaces it; say so only when that did not work */
+				$st = ssl_renew_state()[$domain] ?? null;
+				if ($st || $days < 14)
+					$items[] = health_item('ssl', $user, $domain, $sev, $title,
+					                       "It is a free certificate from $issuer that came from elsewhere, so this server gets a Let's Encrypt one in its place"
+					                       .($st ? ', but the last try ('.date('j M', (int)$st['t']).') failed: '.$st['e']
+					                             : ", but it has not done so yet (reqad ssl renew --dry-run shows what is due)."),
+					                       '/ssl/', 'SSL');
+			} elseif ($kind === 'manual' && $days < ssl_renew_days())
+				$items[] = health_item('ssl', $user, $domain, $days < 7 ? 'critical' : 'warning', $title,
+				                       'It was issued by '.($issuer !== '' ? $issuer : 'another certificate authority')
+				                       .' and does not renew here: renew it there and install the new certificate, or use a free Let\'s Encrypt one instead.',
+				                       '/ssl/', 'SSL');
 		}
 	}
 	return $items;
@@ -348,21 +390,26 @@ function health_check_mail_dns() {
 		if (isset($byuser[$u]) && !isset($accts[$d]) && valid_domain($d))
 			$accts[$d] = $byuser[$u];
 	$items = array();
-	foreach (mail_dns_check_many(array_keys($accts)) as $d => $c) {
-		$a = $accts[$d];
-		$url = '/check-email-settings/?domain='.rawurlencode($d);
-		if (!$c['mx']) {
-			$items[] = health_item('mail_dns', $a['user'], $d, 'critical', "No MX record for $d",
-			                       "Mail to @$d cannot be delivered. Check and fix adds the record at the DNS provider.",
-			                       $url, 'Check & fix');
-			continue;
-		}
-		if ($c['missing'])
-			$items[] = health_item('mail_dns', $a['user'], $d, 'warning', 'Mail DNS for '.$d.': '.implode(', ', $c['missing']),
-			                       'Mail from @'.$d.' may land in spam or be rejected: Gmail and Yahoo require SPF, DKIM and DMARC.',
-			                       $url, 'Check & fix');
-	}
+	foreach (mail_dns_check_many(array_keys($accts)) as $d => $c)
+		if ($it = health_mail_dns_item($accts[$d]['user'], $d, $c))
+			$items[] = $it;
 	return $items;
+}
+
+/* The mail_dns item of one domain from its mail_dns_check() result, null =
+   nothing to report. Also used to refresh the stored item right after a
+   check or fix (mail_dns_health_refresh()). */
+function health_mail_dns_item($user, $d, array $c) {
+	$url = '/check-email-settings/?domain='.rawurlencode($d);
+	if (!$c['mx'] && !in_array('mx', $c['pending'] ?? array(), true))
+		return health_item('mail_dns', $user, $d, 'critical', "No MX record for $d",
+		                   "Mail to @$d cannot be delivered. Check and fix adds the record at the DNS provider.",
+		                   $url, 'Check & fix');
+	if ($c['missing'])
+		return health_item('mail_dns', $user, $d, 'warning', 'Mail DNS for '.$d.': '.implode(', ', $c['missing']),
+		                   'Mail from @'.$d.' may land in spam or be rejected: Gmail and Yahoo require SPF, DKIM and DMARC.',
+		                   $url, 'Check & fix');
+	return null;
 }
 
 /* Addon sites of an account with email that should have mail
@@ -747,6 +794,60 @@ function health_check_rbl() {
 	return $items;
 }
 
+/* exim asks Spamhaus (IP blocklist, sender domain check of setup_exim_dbl.sh)
+   but Spamhaus does not answer this server's resolver: it refuses public DNS
+   (8.8.8.8, 1.1.1.1...) with no answer or a 127.255.255.x error code, so those
+   checks quietly let everything through. Its test address 127.0.0.2 must be
+   listed. Runs as root, so exim.conf is readable. */
+function health_check_spamhaus() {
+	global $ini;
+	if (!feature_enabled($ini, 'email') || !is_file('/etc/exim/exim.conf'))
+		return array();
+	$conf = (string)@file_get_contents('/etc/exim/exim.conf');
+	if (!preg_match('/^[ \t]*dnslists[ \t]*=.*spamhaus\.org/mi', $conf))
+		return array();
+	$a = health_dig('A', '2.0.0.127.zen.spamhaus.org');
+	if (in_array('127.0.0.2', $a, true))
+		return array();
+	$ns = array();
+	foreach (@file('/etc/resolv.conf', FILE_IGNORE_NEW_LINES) ?: array() as $l)
+		if (preg_match('/^\s*nameserver\s+(\S+)/', $l, $m)) $ns[] = $m[1];
+	return array(health_item('spamhaus', '', 'resolver', 'warning', 'Spamhaus does not answer this server\'s DNS resolver',
+	                         'The Spamhaus checks on incoming mail (IP blocklist and sender domain check) let every message through, because Spamhaus '
+	                         .($a ? 'answers '.implode(', ', $a).' (refused)' : 'gives no answer').' through '.($ns ? implode(', ', $ns) : 'the resolver in /etc/resolv.conf')
+	                         .'. Spamhaus refuses public resolvers such as 8.8.8.8 and 1.1.1.1: use a resolver of your own (a local unbound or PowerDNS recursor) in /etc/resolv.conf.',
+	                         '/email-config/exim/?tab=blocklists', 'Blocklists'));
+}
+
+/* Webmail on port 2096 (scripts/update/setup_webmail_port.sh): still on the
+   panel's 2087 = warning (closing 2087 to others would take webmail away);
+   nothing listens on 2096 = critical; csf does not let 2096 in = warning
+   (csf.conf is root's: only the cron run, as root, sees that). */
+function health_check_webmail() {
+	global $ini;
+	if (!feature_enabled($ini, 'email') || !is_file(WEBMAIL_RC_DIR.'/public_html/index.php'))
+		return array();
+	$fix = 'Run as root: bash /usr/local/reqad/scripts/update/setup_webmail_port.sh';
+	if (!webmail_port_ready())
+		return array(health_item('webmail', '', 'port', 'warning', 'Webmail is still served on the panel\'s port 2087',
+		                         'Mailbox owners reach webmail through port 2087, so closing the panel to everyone but you (Settings > Security > IP restriction) would take webmail away from them. '.$fix.' - webmail then gets port '.WEBMAIL_PORT.' and 2087 only sends old links there.',
+		                         '/security/#firewall', 'Security'));
+	$ss = (string)shell_exec('ss -ltn 2>/dev/null');
+	if ($ss !== '' && !preg_match('/:'.WEBMAIL_PORT.'\s/', $ss))
+		return array(health_item('webmail', '', 'listen', 'critical', 'Webmail does not answer on port '.WEBMAIL_PORT,
+		                         'The panel\'s nginx has a server for webmail on port '.WEBMAIL_PORT.' but nothing listens there. Check: nginx -t -c /etc/reqad/nginx.conf, then systemctl restart reqad. '.$fix.' writes the server again.',
+		                         '/services/', 'Services'));
+	$csf = '/etc/csf/csf.conf';
+	if (is_readable($csf)) {
+		$conf = (string)@file_get_contents($csf);
+		if (preg_match('/^TCP_IN\s*=\s*"([^"]*)"/m', $conf, $m) && !in_array((string)WEBMAIL_PORT, array_map('trim', explode(',', $m[1])), true))
+			return array(health_item('webmail', '', 'firewall', 'warning', 'The firewall does not let webmail\'s port '.WEBMAIL_PORT.' in',
+			                         'Port '.WEBMAIL_PORT.' is not in TCP_IN in '.$csf.', so mailbox owners cannot reach webmail. '.$fix.' opens it (csf -r).',
+			                         '/security/', 'Security'));
+	}
+	return array();
+}
+
 function health_check_mail_queue() {
 	global $ini;
 	if (!feature_enabled($ini, 'email'))
@@ -1063,6 +1164,13 @@ function health_check_reqad_update() {
 	                         'Update from the dashboard or with: dnf update reqad', '/', 'Dashboard', false));
 }
 
+/* Major release of the OS from /etc/os-release ('8', '9'), '' unknown. */
+function health_el_version() {
+	if (preg_match('/^VERSION_ID="?(\d+)/m', (string)@file_get_contents('/etc/os-release'), $m))
+		return $m[1];
+	return '';
+}
+
 /* The premium repository answers only the IP addresses marked Premium on the
    owner's reqad.com account. When it refuses this server (subscription or trial
    ended, IP switched to Open Source) the add-ons keep running without updates,
@@ -1083,9 +1191,7 @@ function health_check_premium_repo() {
 	$conf = health_premium_repo_conf();
 	if ($conf === null || !$conf['enabled'])
 		return array();
-	$el = '';
-	if (preg_match('/^VERSION_ID="?(\d+)/m', (string)@file_get_contents('/etc/os-release'), $m))
-		$el = $m[1];
+	$el = health_el_version();
 	if ($el === '')
 		return array();
 	$url  = 'https://repo.reqad.net/premium/el'.$el.'/RPMS/x86_64/repodata/repomd.xml';
@@ -1104,3 +1210,166 @@ function health_check_premium_repo() {
 	                         'https://reqad.com/account', 'Open your reqad.com account'));
 }
 
+/* ---- PHP 5.4 / 5.6 ------------------------------------------------------- */
+
+/* rpm's version order (rpmvercmp) for one version or release string: runs of
+   digits or letters, a number beats letters, '~' sorts before everything, '^'
+   after the end but before more. -1, 0 or 1. */
+function health_rpm_vercmp($a, $b) {
+	$a = (string)$a;
+	$b = (string)$b;
+	if ($a === $b) return 0;
+	preg_match_all('/~|\^|[0-9]+|[A-Za-z]+/', $a, $x);
+	preg_match_all('/~|\^|[0-9]+|[A-Za-z]+/', $b, $y);
+	$x = $x[0];
+	$y = $y[0];
+	for ($i = 0; ; $i++) {
+		$p = $x[$i] ?? null;
+		$q = $y[$i] ?? null;
+		if ($p === '~' || $q === '~') {
+			if ($p !== $q) return $p === '~' ? -1 : 1;
+			continue;
+		}
+		if ($p === '^' || $q === '^') {
+			if ($p === $q) continue;
+			if ($p === null) return -1;
+			if ($q === null) return 1;
+			return $p === '^' ? -1 : 1;
+		}
+		if ($p === null || $q === null)
+			return $p === $q ? 0 : ($p === null ? -1 : 1);
+		$pn = ctype_digit($p);
+		$qn = ctype_digit($q);
+		if ($pn !== $qn) return $pn ? 1 : -1;
+		if ($pn) {
+			$p = ltrim($p, '0');
+			$q = ltrim($q, '0');
+			if (strlen($p) !== strlen($q)) return strlen($p) > strlen($q) ? 1 : -1;
+		}
+		$c = strcmp($p, $q);
+		if ($c !== 0) return $c > 0 ? 1 : -1;
+	}
+}
+
+/* Compare two "[epoch:]version-release" strings the way rpm/dnf do. */
+function health_rpm_evr_cmp($a, $b) {
+	$split = function ($s) {
+		$e = '0';
+		if (preg_match('/^(\d+):(.*)$/', (string)$s, $m)) {
+			$e = $m[1];
+			$s = $m[2];
+		}
+		$p = strrpos((string)$s, '-');
+		return $p === false ? array($e, (string)$s, '') : array($e, substr($s, 0, $p), substr($s, $p + 1));
+	};
+	$x = $split($a);
+	$y = $split($b);
+	for ($i = 0; $i < 3; $i++)
+		if (($c = health_rpm_vercmp($x[$i], $y[$i])) !== 0)
+			return $c;
+	return 0;
+}
+
+/* Newest build of package $pkg in the premium repository for EL $el, '' when
+   unknown. That repository answers only Premium servers, so this reads the
+   public package list of repo.reqad.net: versions.json, else the package's
+   row on the HTML page. Cached for a day (health_latest). */
+function health_premium_latest($el, $pkg) {
+	return health_latest('premium-el'.$el.'-'.$pkg, function () use ($el, $pkg) {
+		$base = 'https://repo.reqad.net/packages/premium-el'.$el.'/';
+		$j = json_decode(health_http($base.'versions.json'), true);
+		if (is_array($j) && isset($j['packages'][$pkg]) && is_string($j['packages'][$pkg]))
+			return $j['packages'][$pkg];
+		if (preg_match('#<code>'.preg_quote($pkg, '#').'</code>.*?<td class="pkg-ver[^"]*">([^<]+)</td>#s', health_http($base), $m))
+			return html_entity_decode(trim($m[1]), ENT_QUOTES);
+		return '';
+	});
+}
+
+/* The installed packages built from the PHP 5.4 / 5.6 source itself (remi
+   layout: php54-php-*, php56-php-*; pear and pecl extensions left out):
+   array('54' => array(name => version-release), ...). */
+function health_php_legacy_installed() {
+	$out = (string)shell_exec("rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{SOURCERPM}\\n' 'php54-php*' 'php56-php*' 2>/dev/null");
+	$found = array();
+	foreach (explode("\n", trim($out)) as $l) {
+		$f = explode("\t", $l);
+		if (count($f) === 3 && preg_match('/^php(54|56)-php-5\./', $f[2], $m) && strpos($f[0], 'php'.$m[1].'-') === 0)
+			$found[$m[1]][$f[0]] = $f[1];
+	}
+	ksort($found);
+	return $found;
+}
+
+/* Is Apache running a PHP 5.4 / 5.6 module ($short '54' | '56') that rpm has
+   replaced since it was loaded (an update without an Apache restart)? Then
+   the main process's /proc/<pid>/maps names the old file "(deleted)". Needs
+   root, as health_run() has; false when not loaded or unknown. $maps: for
+   testing. */
+function health_php_legacy_apache_stale($short, $maps = null) {
+	if ($maps === null) {
+		$svc = web_server('httpd')['service'];
+		$pid = (int)trim((string)shell_exec('systemctl show -p MainPID --value '.escapeshellarg($svc).' 2>/dev/null'));
+		if ($pid <= 1)
+			return false;
+		$maps = @file_get_contents('/proc/'.$pid.'/maps');
+		if ($maps === false)
+			return false;
+	}
+	/* modules/libphp56-php5.so, or the copy under /opt/remi/php56/root */
+	return (bool)preg_match('#(/libphp'.$short.'-php5\.so|/opt/remi/php'.$short.'/root/\S*/libphp5\.so) \(deleted\)$#m', (string)$maps);
+}
+
+/* PHP 5.4 and 5.6 get security fixes only in Reqad's own builds, and only the
+   newest build in the premium repository has all of them (other builds, e.g.
+   remi's 5.6 on EL8, lack the latest). Per installed branch: older than that
+   build = critical; and on mod_php, Apache still running the module from
+   before an update = critical too (the fix is installed but not loaded).
+   The newest build is part of the item's id, so a dismissal ends with the
+   next release. */
+function health_check_php_legacy() {
+	$installed = health_php_legacy_installed();
+	if (!$installed)
+		return array();
+	$el      = health_el_version();
+	$conf    = health_premium_repo_conf();
+	$premium = $conf !== null && $conf['enabled'];
+	$svc     = web_server('httpd')['service'];
+	$items   = array();
+	foreach ($installed as $short => $pkgs) {
+		$short  = (string)$short;   /* '56' is an int as an array key */
+		$branch = $short[0].'.'.substr($short, 1);
+		$prefix = 'php'.$short.'-php';
+		$oldest = '';
+		foreach ($pkgs as $v)
+			if ($oldest === '' || health_rpm_evr_cmp($v, $oldest) < 0)
+				$oldest = $v;
+		$latest = $el !== '' ? health_premium_latest($el, $prefix) : '';
+		$apache = isset($pkgs[$prefix]) && health_php_legacy_apache_stale($short);
+
+		if ($latest !== '' && health_rpm_evr_cmp($oldest, $latest) < 0) {
+			$old = array_keys(array_filter($pkgs, function ($v) use ($latest) { return health_rpm_evr_cmp($v, $latest) < 0; }));
+			$detail = "Installed: $oldest".(count($old) < count($pkgs) ? ' ('.implode(', ', $old).' not updated)' : '').'. The newest build in the Reqad premium repository is '.$latest
+			        . ", and only that one has all the security fixes for PHP $branch, which php.net no longer supports. ";
+			if ($premium)
+				$detail .= "Update it: dnf update '$prefix*'";
+			else
+				$detail .= 'It comes from the premium repository, which this server does not use: with Premium for this server the premium installer turns it on, '
+				         . "then update with: dnf update '$prefix*'. Or move the sites on PHP $branch to a newer PHP version.";
+			if (isset($pkgs[$prefix]))
+				$detail .= " Then restart Apache, so the sites on mod_php load the new module: systemctl restart $svc";
+			$items[] = health_item('php_legacy', '', $prefix.'-'.$latest, 'critical',
+			                       "PHP $branch is missing security fixes", $detail,
+			                       $premium ? '/php-settings/' : 'https://reqad.com/account',
+			                       $premium ? 'PHP settings' : 'Open your reqad.com account');
+		}
+		if ($apache) {
+			$items[] = health_item('php_legacy', '', $prefix.'-apache-'.$pkgs[$prefix], 'critical',
+			                       "Apache still runs the old PHP $branch module",
+			                       "PHP $branch was updated to {$pkgs[$prefix]} after Apache started, so the sites on mod_php still run the module from before the update, "
+			                       . "without its security fixes. Restart Apache to load the new one: systemctl restart $svc",
+			                       '/services/', 'Services');
+		}
+	}
+	return $items;
+}

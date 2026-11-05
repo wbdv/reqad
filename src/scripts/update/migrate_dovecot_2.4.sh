@@ -546,6 +546,19 @@ userdb passwd-file {
 !include_try /etc/dovecot/compress.conf
 EOF
 
+# pop3_uidl_format: keep the one the old local.conf had (new installs set
+# UID%{uid}-%{uidvalidity}). Rewriting local.conf without it would give every
+# message a new POP3 id, and POP3 programs would download all mail again.
+if [[ "$UPGRADE_PKG" -eq 1 ]]; then OLD_LOCAL="$BACKUP/local.conf"; else OLD_LOCAL="${REPAIR_BACKUP:-}/local.conf"; fi
+OLD_UIDL=$(grep -E '^[[:space:]]*pop3_uidl_format[[:space:]]*=' "$OLD_LOCAL" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
+if [[ "$OLD_UIDL" == *'%{'* ]]; then
+    printf '\n# POP3 message ids - kept from the previous local.conf.\n%s\n' "$OLD_UIDL" >> /etc/dovecot/local.conf
+    echo "  Kept $OLD_UIDL"
+elif [ -n "$OLD_UIDL" ]; then
+    echo "  WARNING: the old local.conf had '$OLD_UIDL' (2.3 syntax), not carried over -"
+    echo "           write it in 2.4 syntax (%{uid}, %{uidvalidity}) or POP3 ids change."
+fi
+
 cat > /etc/dovecot/conf.d/10-auth.conf <<'EOF'
 # Auth handled by local.conf
 EOF

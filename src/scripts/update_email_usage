@@ -21,6 +21,7 @@ if(isset($argv) && count($argv)>1) {
 
 #$db = new SQLite3(__DIR__.'/../db/reqad.db');
 $db = new SQLite3('/usr/local/reqad/db/reqad.db');
+$db->busyTimeout(15000);   /* the panel and transfers write too: wait, do not fail */
 
 $output = shell_exec('sudo cat /etc/dovecot/users | sort | awk -F\':\' {\'print $1 " " $6\'}');
 $emails = explode("\n", trim($output));
@@ -65,7 +66,9 @@ if($nb_accounts == 0) {
              echo "Error in fetch ".$db->lastErrorMsg();
 			exit;
         } else {
-		if($row = $results->fetchArray()) {
+		$row = $results->fetchArray();
+		$results->finalize();   /* not left open (a read lock) during the next du */
+		if($row) {
 			echo '│ '.substr(str_pad($row["id"].' ', 5, ' ', STR_PAD_LEFT), 0, 5);
 			echo '│ '.substr(str_pad($row["email"], 41), 0, 41);
 	

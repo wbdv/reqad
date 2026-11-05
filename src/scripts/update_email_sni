@@ -99,9 +99,22 @@ $hostname = trim(shell_exec('hostname'));
 if($ssl_cert!='') {
 	#echo $hostname."---------\n".$ssl_cert."\n".$ssl_cert_key."\n\n";
 
-	$sni .= $sni_block($hostname, $ssl_cert, $ssl_cert_key);
+	/* every name of the hostname certificate (an old server name added to it,
+	   s19v.webindex.ro on s8): Dovecot's default certificate is not this one */
+	$host_sans = $get_cert_sans($ssl_cert, $ssl_cert_key);
 
-	foreach($get_cert_sans($ssl_cert, $ssl_cert_key) as $san) {
+	/* Dovecot's default certificate (clients that send no name or one not
+	   listed below) is the hostname's too: local.conf includes sni.conf right
+	   after its self-signed default, so this line replaces it */
+	$sni .= "\n# default: ".$ssl_cert.' '.(int)@filemtime($ssl_cert)."\n".($is_dovecot24
+		? 'ssl_server_cert_file = '.$ssl_cert."\nssl_server_key_file = ".$ssl_cert_key."\n"
+		: 'ssl_cert = <'.$ssl_cert."\nssl_key = <".$ssl_cert_key."\n");
+
+	foreach(array_unique(array_merge(array($hostname), $host_sans)) as $n)
+		if(strpos($n, '*') === false && preg_match('/^[a-z0-9.-]+$/i', $n))
+			$sni .= $sni_block(strtolower($n), $ssl_cert, $ssl_cert_key);
+
+	foreach($host_sans as $san) {
 		$sni_certs[$san] = $ssl_cert;
 		$sni_keys[$san]  = $ssl_cert_key;
 	}

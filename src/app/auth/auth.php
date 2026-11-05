@@ -694,6 +694,9 @@ function auth_mail_code($email, $code, $purpose) {
     /* a hosting account confirming its contact address (app/functions/notify.php) */
     if ($purpose === 'contact' && function_exists('account_contact_mail_code'))
         return account_contact_mail_code($email, $code);
+    /* a reseller signing in to its panel on 2085 (Reqad Reseller add-on) */
+    if ($purpose === 'reseller-login' && function_exists('reseller_login_mail_code'))
+        return reseller_login_mail_code($email, $code);
     $host = php_uname('n');
     $big  = '<p style="margin:24px 0;font-size:32px;letter-spacing:6px;font-weight:bold;color:#2a6099;font-family:Arial,Helvetica,sans-serif;">'.$code.'</p>';
     $min  = auth_cfg('auth-code-minutes');

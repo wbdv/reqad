@@ -17,15 +17,28 @@
  *   2. its addon domains and subdomains (each with its PHP version) and
  *      aliases (parked domains);
  *   3. the home folder, copied AS the account (tar over ssh), without what is
- *      cPanel's own (mail, etc, logs, ssl, .cpanel...);
+ *      cPanel's own (mail, etc, logs, ssl, .cpanel...), and the sites'
+ *      AWStats history (~/tmp/awstats) into the visitor stats;
  *   4. databases with their users and passwords (the hashes), owners of
  *      views/triggers/routines pointed at the account's own users;
  *   5. mail: mailboxes with their passwords, the mail itself, forwarders,
- *      filters, autoresponders, spam lists, DKIM keys;
+ *      filters, autoresponders, spam lists, DKIM keys, and each mailbox's
+ *      webmail data (contacts, groups, collected addresses, identities,
+ *      settings) with its CardDAV contacts, into Roundcube here;
  *   6. cron jobs (cPanel's PHP binaries changed to this server's);
- *   7. certificates of the sites (a paid one keeps working; free ones are
- *      issued again here once DNS points here).
- * DNS is not touched: the sites go live when their DNS is switched.
+ *   7. certificates of the sites (a paid one keeps working until it
+ *      expires; a free one is replaced with Let's Encrypt here when fewer
+ *      than 30 days are left and DNS points here: reqad ssl renew, daily);
+ *   8. its hosting package and owner (part 'packages'): what cPanel says is
+ *      handed to the add-ons (filters transfer.reseller, then
+ *      transfer.account): Hosting Pro makes the package here and gives it,
+ *      the reseller add-on gives a cPanel reseller its privileges and
+ *      packages, and its accounts to it. Resellers are transferred first.
+ * DNS is not touched by an account's transfer: the sites go live when their
+ * DNS is switched. A job can also copy DNS zones (job 'zones', from the
+ * transfer tool's DNS zones list: its accounts' zones and those no account
+ * owns): each becomes a new zone here with its records as they are, keeping
+ * this server's SOA and name servers (tr_zones(); row '_dns' of the state).
  *
  * An account that is already here is continued only when a transfer made it
  * (/var/lib/reqad/transfer/accounts/<user>.json), so a stopped or failed
@@ -42,6 +55,7 @@ require_once '/usr/local/reqad/public_html/modules/functions.php';
 foreach (glob(_PATH.'/app/functions/*.php') as $app_functions_file)
     require_once $app_functions_file;
 require_once _PATH.'/app/auth/auth.php';     /* the account's contact address */
+$db->busyTimeout(10000);   /* the panel and other jobs write too: wait, do not fail */
 plugins_load();
 
 $opt = getopt('', array('job:'));
@@ -67,11 +81,19 @@ $STATE = transfer_job_state($JOB['id']);
 $STATE['status']  = 'running';
 $STATE['started'] = $STATE['started'] ?? time();
 $STATE['pid']     = getmypid();
+/* resellers first: their accounts are given to them as they come */
+usort($JOB['accounts'], function ($x, $y) { return (int)!empty($y['reseller']) - (int)!empty($x['reseller']); });
 foreach ($JOB['accounts'] as $a)
     if (!isset($STATE['accounts'][$a['user']]) || in_array($STATE['accounts'][$a['user']]['status'] ?? '', array('running', 'stopped'), true))
         $STATE['accounts'][$a['user']] = array('status' => 'queued', 'step' => '', 'detail' => '', 'warnings' => 0);
+/* the DNS zones: one row '_dns' (an account name never starts with _) */
+$ZONES = (array)($JOB['zones'] ?? array());
+if ($ZONES && (!isset($STATE['accounts']['_dns']) || in_array($STATE['accounts']['_dns']['status'] ?? '', array('running', 'stopped'), true)))
+    $STATE['accounts']['_dns'] = array('status' => 'queued', 'step' => '', 'detail' => '', 'warnings' => 0);
 tr_state_save(true);
-transfer_job_log($JOB['id'], 'Running: '.count($JOB['accounts']).' account'.(count($JOB['accounts']) === 1 ? '' : 's').' (pid '.getmypid().').');
+transfer_job_log($JOB['id'], 'Running: '.implode(' and ', array_filter(array(
+    $JOB['accounts'] ? count($JOB['accounts']).' account'.(count($JOB['accounts']) === 1 ? '' : 's') : '',
+    $ZONES ? count($ZONES).' DNS zone'.(count($ZONES) === 1 ? '' : 's') : ''))).' (pid '.getmypid().').');
 
 @mkdir(TR_VAR.'/accounts', 0700, true);
 @chmod(TR_VAR, 0700);
@@ -102,8 +124,25 @@ foreach ($JOB['accounts'] as $a) {
     tr_state_save(true);
     exec('rm -rf '.escapeshellarg(TR_VAR.'/'.$JOB['id'].'/'.$u));
 }
+if ($ZONES && !in_array($STATE['accounts']['_dns']['status'] ?? '', array('done', 'warn'), true)) {
+    $STATE['accounts']['_dns'] = array('status' => 'running', 'step' => 'Starting', 'detail' => '', 'warnings' => 0, 'started' => time());
+    tr_state_save(true);
+    tr_log('_dns', '=== '.count($ZONES).' DNS zone'.(count($ZONES) === 1 ? '' : 's').' from '.$JOB['server'].' ===');
+    $ok = false;
+    try {
+        $ok = tr_zones($ZONES);
+    } catch (Throwable $e) {
+        tr_log('_dns', 'ERROR: '.$e->getMessage().' ('.basename($e->getFile()).':'.$e->getLine().')');
+    }
+    $w = (int)$STATE['accounts']['_dns']['warnings'];
+    $STATE['accounts']['_dns']['status'] = $ok ? ($w ? 'warn' : 'done') : 'failed';
+    $STATE['accounts']['_dns']['finished'] = time();
+    transfer_job_log($JOB['id'], 'DNS zones: '.($ok ? $STATE['accounts']['_dns']['step'] : 'failed').($w ? ", $w thing".($w === 1 ? '' : 's').' to check' : '').'.');
+    tr_state_save(true);
+}
 @rmdir(TR_VAR.'/'.$JOB['id']);
-shell_exec(_PATH.'/scripts/update_email_sni >/dev/null 2>&1 &');
+if ($JOB['accounts'])
+    shell_exec(_PATH.'/scripts/update_email_sni >/dev/null 2>&1 &');
 $STATE['status'] = 'done';
 $STATE['finished'] = time();
 tr_state_save(true);
@@ -116,6 +155,126 @@ exit(0);
 
 
 /* ======================================================================== */
+
+/*
+ * The DNS zones of the job: each zone file is read from the cPanel server
+ * (/var/named, 25 at a time over one ssh login) and made a new zone here
+ * holding exactly its records - dns_zone_import_new(), as DNS Zones > Import
+ * zone does. The zone keeps this server's SOA and name servers; nothing else
+ * is changed (addresses stay the cPanel server's). A zone that is here
+ * already is left as it is. true unless no zone could be made at all.
+ */
+function tr_zones(array $zones) {
+    global $db;
+    $u = '_dns';
+    dns_admin_mode(true);     /* the server's admin: NS below the apex, PTR, any name */
+    if (!dns_managed()) {
+        tr_log($u, 'ERROR: this server has no DNS provider (Settings > DNS Settings).');
+        return false;
+    }
+    dns_provider_load($db);
+    $all = get_zones();
+    if (!is_array($all)) {
+        tr_log($u, 'ERROR: the DNS provider is not answering: '.preg_replace('/^Error:\s*/', '', (string)$all));
+        return false;
+    }
+    $have = array();
+    foreach (array_keys($all) as $z)
+        $have[strtolower((string)$z)] = true;
+    $ns = dns_expected_nameservers();
+    tr_log($u, 'Each zone gets this server\'s SOA and name servers'.($ns ? ' ('.implode(', ', $ns).')' : '')
+             .'; its other records are copied as they are on the cPanel server.');
+    $n = count($zones);
+    $i = $made = $kept = $bad = 0;
+    tr_step($u, 'Copying DNS zones', "0 of $n");
+    foreach (array_chunk($zones, 25) as $chunk) {
+        $files = array();
+        foreach ($chunk as $z)
+            if (preg_match('/^[A-Za-z0-9_][A-Za-z0-9._-]*$/', (string)$z['file']))
+                $files[] = $z['file'];
+        $text = array();
+        if ($files) {
+            $out = tr_remote('cd /var/named || exit 1'."\n"
+                           .'for f in "$@"; do [ -f "$f" ] || continue; printf \'\n@@RQ zone %s\n\' "$f"; cat -- "$f"; done', $files, 300);
+            foreach (transfer_sections($out) as $s)
+                if ($s[0] === 'zone')
+                    $text[$s[1]] = implode("\n", $s[2]);
+        }
+        foreach ($chunk as $z) {
+            $i++;
+            $zone = (string)$z['zone'];
+            tr_detail($u, "$i of $n: $zone");
+            $label = $zone.((string)($z['account'] ?? '') !== '' ? " (cPanel account {$z['account']})" : ' (no cPanel account)');
+            if (isset($have[$zone])) {
+                tr_log($u, "$label: already on this server, left as it is.");
+                $kept++;
+                continue;
+            }
+            if (!isset($text[$z['file']])) {
+                tr_warn($u, "$label: its zone file /var/named/{$z['file']} could not be read on the cPanel server.");
+                $bad++;
+                continue;
+            }
+            $t = $text[$z['file']];
+            if (($origin = dns_zonefile_origin($t)) !== '' && $origin !== $zone) {
+                tr_warn($u, "$label: its zone file is for $origin, not copied.");
+                $bad++;
+                continue;
+            }
+            $p = dns_zonefile_parse($zone, $t);
+            $recs = $cpns = $notes = $left = array();
+            foreach ($p['records'] as $r) {
+                if ($r['status'] === 'new') {
+                    /* this server takes TTLs of 60 s to a week (cPanel allows 1 s): the
+                       record is kept with the nearest one rather than left out */
+                    $ttl = (int)$r['ttl'];
+                    if ($ttl > 0 && ($ttl < 60 || $ttl > 604800)) {
+                        $notes[] = "$zone: {$r['name']} {$r['type']}: TTL $ttl on cPanel, ".($ttl < 60 ? 60 : 604800).' here (the shortest / longest this server takes).';
+                        $ttl = $ttl < 60 ? 60 : 604800;
+                    }
+                    $recs[] = array('name' => $r['name'], 'type' => $r['type'], 'value' => $r['value'], 'ttl' => $ttl);
+                    if ($r['note'] !== '')
+                        $notes[] = "$zone: {$r['name']} {$r['type']}: {$r['note']}";
+                } elseif ($r['type'] === 'NS' && $r['name'] === $zone)
+                    $cpns[] = $r['value'];
+                elseif ($r['type'] !== 'SOA')
+                    $left[] = "$zone: left out ".mb_strimwidth(trim($r['name'].' '.$r['type'].' '.$r['value']), 0, 200, '...').' - '.$r['note'];
+            }
+            if (!$recs) {
+                tr_warn($u, "$label: its zone file has no records to copy.");
+                foreach ($left as $l)
+                    tr_warn($u, $l);
+                $bad++;
+                continue;
+            }
+            $r = dns_zone_import_new($zone, $recs);
+            if (!$r['ok']) {
+                tr_warn($u, "$label: not copied: ".$r['error']);
+                $bad++;
+                continue;
+            }
+            $have[$zone] = true;
+            $made++;
+            tr_log($u, "$label: ".$r['message'].($cpns ? ' (name servers on cPanel: '.implode(', ', $cpns).')' : ''));
+            if (!isset($r['data']['sets']))
+                tr_warn($u, "$zone: the zone was made, but without the records of its zone file.");
+            foreach ($notes as $l)
+                tr_log($u, '  '.$l);
+            foreach ($left as $l)
+                tr_warn($u, $l);
+            tr_warnings($u, $r, "$zone: ");
+            $errs = (array)($r['data']['errors'] ?? array());
+            if (count($errs) > 20)
+                tr_warn($u, "$zone: and ".(count($errs) - 20).' more records not saved.');
+        }
+    }
+    $sum = "$made of $n zone".($n === 1 ? '' : 's').' copied'.($kept ? ", $kept already here" : '').($bad ? ", $bad not copied" : '');
+    tr_log($u, $sum.'.');
+    if ($made)
+        tr_log($u, 'Nothing changes on the internet until each domain\'s name servers at its registrar are this server\'s.');
+    tr_step($u, ucfirst($sum));
+    return $made > 0 || $bad === 0;
+}
 
 function tr_state_save($now = false) {
     global $JOB, $STATE;
@@ -251,6 +410,19 @@ function tr_import($u, $script, array $args) {
             tr_log($u, '   '.rtrim($l));
     if ($rc !== 0)
         tr_warn($u, $script.' ended with an error (see above).');
+    return $out;
+}
+
+/* A filter import that left rules out (other than cPanel's bounce guard
+   `if not first_delivery and error_message`) makes the account "to check":
+   that mail would otherwise go somewhere else than it did on cPanel. */
+function tr_import_filters($u, $label, array $args) {
+    $n = 0;
+    foreach (tr_import($u, 'import_cpanel_filters.php', $args) as $l)
+        if (preg_match('/^\s*· /u', $l) && strpos($l, 'boilerplate') === false)
+            $n++;
+    if ($n)
+        tr_warn($u, "$label: $n filter rule(s) could not be converted (see above), set them up by hand.");
 }
 
 /* The account's lines of the IP map: each site's address on cPanel (its own
@@ -324,6 +496,13 @@ echo "@@RQ suspended"; [ -e "/var/cpanel/suspended/$u" ] && echo yes
 c=$(grep -m1 '^CONTACTEMAIL=' "/var/cpanel/users/$u" 2>/dev/null | cut -d= -f2-)
 [ -z "$c" ] && [ -f "$h/.contactemail" ] && [ ! -L "$h/.contactemail" ] && c=$(head -c 1000 "$h/.contactemail")
 echo "@@RQ contact"; printf '%s' "$c" | tr '\n' ' '; echo
+p=$(grep -m1 '^PLAN=' "/var/cpanel/users/$u" 2>/dev/null | cut -d= -f2-)
+echo "@@RQ plan"; printf '%s\n' "$p"
+case "$p" in ''|*/*|.*) ;; *) [ -s "/var/cpanel/packages/$p" ] && [ ! -L "/var/cpanel/packages/$p" ] && { echo "@@RQ pkg"; b64 "/var/cpanel/packages/$p"; } ;; esac
+echo "@@RQ owner"; grep -m1 '^OWNER=' "/var/cpanel/users/$u" 2>/dev/null | cut -d= -f2-
+echo "@@RQ limits"; grep -E '^(BWLIMIT|MAXPOP|MAXSQL|MAXADDON|MAXSUB|MAXPARK|MAXPASSENGERAPPS|MAX_EMAILACCT_QUOTA)=' "/var/cpanel/users/$u" 2>/dev/null | base64 -w0; echo
+echo "@@RQ disklimit"; whmapi1 --output=json accountsummary user="$u" 2>/dev/null | base64 -w0; echo
+r=$(grep -m1 "^$u:" /var/cpanel/resellers 2>/dev/null); [ -n "$r" ] && { echo "@@RQ reseller"; printf '%s\n' "${r#*:}"; }
 echo "@@RQ ipmain"; head -c 100 /var/cpanel/mainip 2>/dev/null; echo
 echo "@@RQ ipacct"; grep -m1 '^IP=' "/var/cpanel/users/$u" 2>/dev/null | cut -d= -f2
 echo "@@RQ ipown"; awk -F': *' '/^[0-9a-fA-F.:]+:/{print $1}' /etc/domainips 2>/dev/null
@@ -352,13 +531,14 @@ for s in "$@"; do
 done
 echo "@@RQ cron"; crontab -l -u "$u" 2>/dev/null | base64 -w0; echo
 [ -s "$h/.spamassassin/user_prefs" ] && { echo "@@RQ prefs"; b64 "$h/.spamassassin/user_prefs"; }
+[ -e "$h/.spamassassinboxenable" ] && { echo "@@RQ spambox"; echo yes; }
 if [ -d "$h/.autorespond" ] && [ ! -L "$h/.autorespond" ]; then
   for f in "$h/.autorespond"/*; do [ -f "$f" ] && [ ! -L "$f" ] || continue; echo "@@RQ ar ${f##*/}"; b64 "$f"; done
 fi
 echo "@@RQ dbs"; whmapi1 --output=json list_mysql_databases_and_users user="$u" 2>/dev/null | base64 -w0; echo
 SH;
-    $f = array('home' => '', 'shell' => '', 'hash' => '', 'suspended' => false, 'contact' => '', 'doms' => array(), 'cron' => '', 'prefs' => '',
-               'ar' => array(), 'dbs' => array(), 'ssl' => array(),
+    $f = array('home' => '', 'shell' => '', 'hash' => '', 'suspended' => false, 'contact' => '', 'doms' => array(), 'cron' => '', 'prefs' => '', 'spambox' => false,
+               'ar' => array(), 'dbs' => array(), 'ssl' => array(), 'plan' => '', 'pkg' => null, 'own' => array(), 'owner' => '', 'reseller' => null,
                'ip' => array('main' => '', 'acct' => '', 'own' => array(), 'nat' => array(), 'mail' => array(), 'mailall' => ''));
     $ipn = function ($x) { $b = @inet_pton(trim((string)$x)); return $b === false ? '' : (string)inet_ntop($b); };
     $out = tr_remote($script, $args, 600);
@@ -399,7 +579,26 @@ SH;
             case 'mdbox':     if (valid_domain($p[0]) && valid_email_user($p[1] ?? '')) $f['doms'][$dom($p[0])]['mdbox'][] = $p[1]; break;
             case 'ssl':       if (valid_domain($p[0])) $f['ssl'][$p[0]] = $b64; break;
             case 'cron':      $f['cron'] = $b64; break;
+            case 'plan':      $f['plan'] = mb_substr($first, 0, 100); break;
+            case 'pkg':       $f['pkg'] = tr_kv($b64); break;
+            case 'limits':    /* the account's own limits, in a package file's units (BWLIMIT here is bytes) */
+                foreach (tr_kv($b64) as $k => $v)
+                    $f['own'][$k] = $k === 'BWLIMIT' && ctype_digit($v) && (int)$v > 0 ? (string)(int)ceil((int)$v / 1048576) : $v;
+                break;
+            case 'disklimit': /* "2000M", "unlimited" (a quota, not in the users file) */
+                $x = strtolower(trim((string)(json_decode($b64, true)['data']['acct'][0]['disklimit'] ?? '')));
+                if ($x === 'unlimited' || $x === '0' || $x === '0m')
+                    $f['own']['QUOTA'] = 'unlimited';
+                elseif (preg_match('/^([0-9.]+)\s*([kmgt]?)b?$/', $x, $m))
+                    $f['own']['QUOTA'] = (string)max(1, (int)ceil((float)$m[1] * array('' => 1, 'k' => 1 / 1024, 'm' => 1, 'g' => 1024, 't' => 1048576)[$m[2]]));
+                break;
+            case 'owner':     $f['owner'] = preg_match('/^[a-z0-9][a-z0-9_.-]{0,31}$/', $first) ? $first : ''; break;
+            case 'reseller':  /* its ACLs: "add-pkg,create-acct,..." (or a named list) */
+                $f['reseller'] = array_values(array_filter(array_map('trim', preg_split('/[,\s]+/', strtolower($first))),
+                    function ($x) { return preg_match('/^[a-z0-9_.=-]{1,64}$/', $x); }));
+                break;
             case 'prefs':     $f['prefs'] = $b64; break;
+            case 'spambox':   $f['spambox'] = true; break;
             case 'ar':        if (preg_match('/^[A-Za-z0-9@._+=-]{1,200}$/', $arg) && $arg[0] !== '.') $f['ar'][$arg] = $b64; break;
             case 'dbs':       $f['dbs'] = (array)(json_decode($b64, true)['data'] ?? array()); break;
             case 'ipmain':    $f['ip']['main'] = $ipn($first); break;
@@ -704,6 +903,8 @@ SH;
         tr_log($u, 'Copied '.transfer_bytes($bytes).'.');
         if (!$ok)
             tr_warn($u, 'The copy of the home folder reported problems'.($e !== '' ? ":\n".$e : '.'));
+        tr_cpanel_paths($u);
+        tr_awstats($u, $home, $sites);
     }
 
     /* ---- 4. databases ---- */
@@ -760,7 +961,9 @@ SH;
             $e = ssl_custom_install($d, $chain, $key, false);
             if ($e === '') {
                 $reload = true;
-                tr_log($u, "$d: certificate from $issuer, valid until ".date('Y-m-d', (int)$x['validTo_time_t']).'.');
+                tr_log($u, "$d: certificate from $issuer, valid until ".date('Y-m-d', (int)$x['validTo_time_t'])
+                           .(ssl_free_issuer($issuer) ? '; replaced with Let\'s Encrypt from '.date('Y-m-d', (int)$x['validTo_time_t'] - ssl_renew_days() * 86400).' once it points here.'
+                                                      : '; it does not renew here: renew it where it was bought.'));
             } else
                 tr_warn($u, "$d: the certificate was not installed: $e");
         }
@@ -768,6 +971,12 @@ SH;
             $ws = web_server(web_front($ini));
             shell_exec('systemctl reload '.escapeshellarg($ws['service']).' 2>&1');
         }
+    }
+
+    /* ---- 8. package and owner (last: a package's disk quota must not stop the copy) ---- */
+    if (!empty($parts['packages'])) {
+        tr_step($u, 'Package and owner');
+        tr_package_owner($u, $f);
     }
 
     /* ---- after ---- */
@@ -779,6 +988,150 @@ SH;
             tr_log($u, 'WordPress sites found: '.$n.'.');
     }
     return true;
+}
+
+/* KEY=VALUE lines (cPanel's users and packages files) */
+function tr_kv($text) {
+    $kv = array();
+    foreach (explode("\n", (string)$text) as $l)
+        if (preg_match('/^([A-Za-z0-9_]{1,64})=(.*)$/', rtrim($l, "\r"), $m))
+            $kv[strtoupper($m[1])] = mb_substr(trim($m[2]), 0, 200);
+    return $kv;
+}
+
+/* What cPanel has of a reseller: limits (reseller-limits.yaml through
+   cPanel's own perl, and whmapi1 getresellerlimits), private name servers,
+   addresses, its packages (name => KEY=VALUE) and how many accounts it owns. */
+function tr_reseller_facts($u) {
+    $script = <<<'SH'
+u="$1"
+b64() { [ -f "$1" ] && [ ! -L "$1" ] && base64 -w0 < "$1" 2>/dev/null; echo; }
+P=/usr/local/cpanel/3rdparty/bin/perl
+echo "@@RQ limits"
+[ -x "$P" ] && [ -f /var/cpanel/reseller-limits.yaml ] && "$P" -MYAML::Syck -MJSON::XS -e 'my $d = YAML::Syck::LoadFile("/var/cpanel/reseller-limits.yaml"); my $r = (ref $d->{data} eq "HASH" ? $d->{data}{$ARGV[0]} : undef) // $d->{$ARGV[0]} // {}; print JSON::XS->new->canonical->encode($r)' "$u" 2>/dev/null | base64 -w0
+echo
+echo "@@RQ limitsapi"; whmapi1 --output=json getresellerlimits user="$u" 2>/dev/null | base64 -w0; echo
+echo "@@RQ ns"; grep -m1 "^$u:" /var/cpanel/resellers-nameservers 2>/dev/null | cut -d: -f2-
+echo "@@RQ mainip"; head -c 100 "/var/cpanel/mainips/$u" 2>/dev/null; echo
+echo "@@RQ dips"; head -n 100 "/var/cpanel/dips/$u" 2>/dev/null
+for p in /var/cpanel/packages/"$u"_*; do
+  [ -f "$p" ] && [ ! -L "$p" ] || continue
+  echo "@@RQ pkg $(printf '%s' "${p##*/}" | base64 -w0)"; b64 "$p"
+done
+echo "@@RQ owns"; grep -lx "OWNER=$u" /var/cpanel/users/* 2>/dev/null | grep -v "/$u\$" | wc -l
+SH;
+    $out = tr_remote($script, array($u), 120);
+    $r = array('limits' => array(), 'limits_api' => array(), 'ns' => array(), 'mainip' => '', 'ips' => array(), 'packages' => array(), 'owns' => 0);
+    $ipn = function ($x) { $b = @inet_pton(trim((string)$x)); return $b === false ? '' : (string)inet_ntop($b); };
+    foreach (transfer_sections($out) as $s) {
+        list($name, $arg, $lines) = $s;
+        $first = trim((string)($lines[0] ?? ''));
+        $b64 = $first === '' ? '' : (string)base64_decode($first, true);
+        switch ($name) {
+            case 'limits':    $r['limits'] = (array)json_decode($b64, true); break;
+            case 'limitsapi': $r['limits_api'] = (array)(json_decode($b64, true)['data'] ?? array()); break;
+            case 'ns':
+                foreach (preg_split('/[\s,;]+/', strtolower($first), -1, PREG_SPLIT_NO_EMPTY) as $n)
+                    if (valid_domain(rtrim($n, '.')))
+                        $r['ns'][] = rtrim($n, '.');
+                break;
+            case 'mainip':    $r['mainip'] = $ipn($first); break;
+            case 'dips':      foreach ($lines as $l) if (($x = $ipn($l)) !== '') $r['ips'][] = $x; break;
+            case 'pkg':
+                $n = (string)base64_decode($arg, true);
+                if ($n !== '' && strlen($n) <= 200 && !preg_match('/[\x00-\x1f\/]/', $n))
+                    $r['packages'][$n] = tr_kv($b64);
+                break;
+            case 'owns':      $r['owns'] = (int)$first; break;
+        }
+    }
+    $r['ns'] = array_values(array_unique($r['ns']));
+    return $r;
+}
+
+/* cPanel settings in its files that do not work here: PHP settings naming
+   cPanel's folders (its MultiPHP INI Editor writes session.save_path =
+   /var/cpanel/php/sessions/ea-phpXY into .user.ini) and .htaccess Options
+   Apache refuses here (FollowSymLinks...: error 500). Changed as the account,
+   the file as it was kept beside it. */
+function tr_cpanel_paths($u) {
+    $r = transfer_cpanel_paths($u, true);
+    if (empty($r['ok'])) {
+        tr_warn($u, $r['error']);
+        return;
+    }
+    foreach ($r['data']['files'] as $x) {
+        $what = '~/'.$x['path'].': '.implode('; ', array_map(function ($l) { return mb_strimwidth($l, 0, 160, '...'); }, $x['lines']));
+        if ($x['fixed'])
+            tr_log($u, 'cPanel setting that does not work here changed in '.$what.' (the file as it was: '.basename($x['path']).'.from-cpanel).');
+        else
+            tr_warn($u, 'cPanel setting that does not work here left in '.$what.': '.$x['error'].'.');
+        if ($x['fixed'] && strpos(implode(' ', $x['lines']), 'not possible here') !== false)
+            tr_warn($u, '~/'.$x['path'].': CGI scripts / server-side includes do not run on this server.');
+    }
+    if (!$r['data']['complete'])
+        tr_warn($u, 'The home folder has more than 30,000 folders: only the first were looked at for cPanel settings that do not work here.');
+}
+
+/* Step 8: the package the account had on cPanel and who owned it. Core only
+   reads; the add-ons decide (their lines go to the log, "!" = to check). */
+function tr_package_owner($u, array $f) {
+    global $JOB;
+    $caps = transfer_caps();
+    $owner = ($f['owner'] === 'root' || $f['owner'] === $u) ? '' : $f['owner'];
+    $plan = $f['plan'] === 'undefined' ? '' : $f['plan'];
+    /* cPanel names a reseller's packages "<reseller>_<name>" */
+    $pkg_owner = '';
+    foreach (array_filter(array($owner, $f['reseller'] !== null ? $u : '')) as $o)
+        if (strpos($plan, $o.'_') === 0)
+            $pkg_owner = $o;
+    /* cPanel copies a package's limits onto each account that gets it, so an
+       account keeps them when its package is gone (one moved from another
+       cPanel server has no file here): the package is then made from those */
+    $pkg = $f['pkg'];
+    $from = 'package';
+    $own_ok = isset($f['own']['QUOTA']) && count($f['own']) > 1;
+    if ($plan !== '' && $pkg === null && $own_ok) {
+        $pkg = $f['own'];
+        $from = 'account';
+    }
+    $cp = array('server' => $JOB['server'], 'plan' => $plan, 'package' => $pkg, 'package_from' => $from,
+                'limits' => $own_ok ? $f['own'] : null, 'package_owner' => $pkg_owner, 'owner' => $owner, 'reseller' => null);
+    $pnote = '';
+    if ($plan !== '' && $f['pkg'] === null)
+        $pnote = $from === 'account' ? " (not on this cPanel server: made from the account's own limits there)" : ' (no settings found)';
+    tr_log($u, 'On cPanel: package '.($plan !== '' ? $plan.$pnote : 'none')
+               .', owner '.($owner !== '' ? $owner : 'root').($f['reseller'] !== null ? ', a reseller' : '').'.');
+    if ($f['reseller'] !== null) {
+        $cp['reseller'] = tr_reseller_facts($u) + array('acls' => $f['reseller']);
+        $mail = '';
+        foreach ($JOB['accounts'] as $a)
+            if ($a['user'] === $u)
+                $mail = (string)($a['reseller_email'] ?? '');
+        $cp['reseller']['email'] = $mail !== '' ? $mail : $f['contact'];
+        if (empty($caps['resellers']))
+            tr_warn($u, 'It is a reseller on cPanel; this server has no resellers (Reqad Reseller), so it is an ordinary account here.');
+        else
+            tr_lines($u, plugin_filter('transfer.reseller', array(), $u, $cp));
+    }
+    if ($plan !== '' && empty($caps['packages']))
+        tr_log($u, 'This server has no hosting packages (Reqad Hosting Pro): the account has none.');
+    if ($owner !== '' && empty($caps['resellers']))
+        tr_warn($u, "It belongs to reseller $owner on cPanel; here it is the server admin's.");
+    tr_lines($u, plugin_filter('transfer.account', array(), $u, $cp));
+}
+
+/* lines from the add-ons: "! ..." = a warning */
+function tr_lines($u, $lines) {
+    foreach ((array)$lines as $l) {
+        $l = trim((string)$l);
+        if ($l === '')
+            continue;
+        if ($l[0] === '!')
+            tr_warn($u, ltrim(substr($l, 1)));
+        else
+            tr_log($u, $l);
+    }
 }
 
 function tr_databases($u, array $f, array &$marker) {
@@ -950,6 +1303,7 @@ function tr_mail($u, array $f, array $maildoms, $home) {
         mkdir($stage, 0700, true);
     $tar_doms = array();
     $skip = array();
+    $here = array();   /* domain/box of the mailboxes that are here */
     $made = 0;
     foreach (array_keys($maildoms) as $d) {
         $x = $f['doms'][$d];
@@ -978,6 +1332,7 @@ function tr_mail($u, array $f, array $maildoms, $home) {
             $e = mailbox_set_hash($email, $hash);
             if ($e !== '')
                 tr_warn($u, "$email: the cPanel password was not set ($e); it has a random one.");
+            $here[] = $d.'/'.$box;
         }
         if (tr_boxes($x['shadow']))
             $tar_doms[] = $d;
@@ -1046,14 +1401,14 @@ function tr_mail($u, array $f, array $maildoms, $home) {
         /* filters */
         if ($x['vfilter'] !== '') {
             file_put_contents($stage.'/vfilter-'.$d, $x['vfilter']);
-            tr_import($u, 'import_cpanel_filters.php', array('--scope=domain', '--target='.$d, '--file='.$stage.'/vfilter-'.$d, '--apply'));
+            tr_import_filters($u, $d, array('--scope=domain', '--target='.$d, '--file='.$stage.'/vfilter-'.$d, '--apply'));
         }
         foreach ($x['filters'] as $box => $text) {
             if (!in_array($box.'@'.$d, mailbox_list(true), true))
                 continue;
             file_put_contents($stage.'/filter-'.$box.'@'.$d, $text);
             /* --replace: a transfer started again must not add the rules twice */
-            tr_import($u, 'import_cpanel_filters.php', array('--scope=account', '--target='.$box.'@'.$d, '--file='.$stage.'/filter-'.$box.'@'.$d, '--apply', '--replace'));
+            tr_import_filters($u, $box.'@'.$d, array('--scope=account', '--target='.$box.'@'.$d, '--file='.$stage.'/filter-'.$box.'@'.$d, '--apply', '--replace'));
         }
 
         /* the domain's mail is handled elsewhere (Google, Microsoft...) */
@@ -1080,4 +1435,105 @@ function tr_mail($u, array $f, array $maildoms, $home) {
         file_put_contents($stage.'/user_prefs', $f['prefs']);
         tr_import($u, 'import_cpanel_spam.php', array('--user='.$u, '--file='.$stage.'/user_prefs', '--apply'));
     }
+
+    /* cPanel's "Spam Box": spam went to the mailboxes' spam folder */
+    if ($f['spambox'] && $maildoms) {
+        $r = spam_settings_set($u, array('junk' => true));
+        if (!empty($r['ok']))
+            tr_log($u, '   Spam goes to the Junk folder of every mailbox (Spam Box was on).');
+        else
+            tr_warn($u, 'Spam Box was on, but spam could not be sent to the Junk folder: '.$r['error']);
+    }
+
+    tr_webmail($u, $home, $here);
+}
+
+/*
+ * The sites' AWStats history. cPanel keeps it in ~/tmp/awstats (HTTPS in its
+ * ssl/ folder), which the home copy leaves out (tmp). Only real files
+ * awstatsMMYYYY.<site>.txt are read on the cPanel server, unpacked by reqad
+ * into a temporary folder and imported by import_awstats.php into the
+ * account's own sites (it reads the files line by line and never keeps the
+ * visitor addresses in them). An addon domain's stats are filed under its
+ * twin subdomain there: domains.map names it.
+ */
+function tr_awstats($u, $home, array $sites) {
+    $tmp = rtrim((string)shell_exec('runuser -u reqad -- mktemp -d 2>/dev/null'));
+    if (!preg_match('#^/[A-Za-z0-9/._-]+$#', $tmp) || !is_dir($tmp) || is_link($tmp)) {
+        tr_warn($u, 'The AWStats history was not taken: no temporary folder could be made for it.');
+        return;
+    }
+    $dir = $tmp.'/'.$u;
+    exec('runuser -u reqad -- mkdir '.escapeshellarg($dir));
+    $map = '';
+    foreach ($sites as $s)
+        if ($s['type'] === 'addon' && valid_domain($s['twin']) && valid_domain($s['domain']))
+            $map .= $s['twin'].' '.$s['domain']."\n";
+    file_put_contents($dir.'/domains.map', $map);
+    $script = <<<'SH'
+P=
+cd "$1/tmp/awstats" 2>/dev/null && P=$(pwd -P)
+for f in awstats[0-9]*.txt ssl/awstats[0-9]*.txt; do
+  [ -n "$P" ] && [ -f "$f" ] && [ ! -L "$f" ] && [ "$(readlink -f -- "$f")" = "$P/$f" ] && printf '%s\0' "$f"
+done | tar --null --no-recursion -T - -cf -
+SH;
+    $remote = 'set -- '.escapeshellarg($home)."\n".$script;
+    $local = 'runuser -u reqad -- tar -xf - -C '.escapeshellarg($dir).' --no-same-owner --no-same-permissions';
+    list($ok, $bytes, $e) = tr_pipe($u, $remote, $local, 'Copying the AWStats history');
+    if (!$ok)
+        tr_warn($u, 'The copy of the AWStats history reported problems'.($e !== '' ? ":\n".$e : '.'));
+    if (glob($dir.'/awstats*.txt') || glob($dir.'/ssl/awstats*.txt')) {
+        tr_log($u, 'Visitor stats from AWStats:');
+        tr_import($u, 'import_awstats.php', array('--dir='.$tmp, '--user='.$u, '--apply'));
+    } else
+        tr_log($u, 'Visitor stats: no AWStats history on the cPanel server.');
+    exec('rm -rf '.escapeshellarg($tmp));
+}
+
+/*
+ * The mailboxes' webmail data. cPanel keeps each mailbox's Roundcube database
+ * in ~/etc/<domain>/<box>.rcube.db (contacts, groups, collected addresses,
+ * identities, settings) and its CardDAV address books (phones, Thunderbird)
+ * in ~/.caldav/<box>@<domain>/<book>/*.vcf; the home copy leaves both out
+ * (etc and .caldav are cPanel's). Only real files are read on the cPanel
+ * server (nothing reached through a link), written here by the webmail's own
+ * user into a temporary folder, and added to Roundcube by
+ * import_cpanel_webmail.php (contacts already there are skipped, so a
+ * transfer started again adds nothing). Calendars are not taken.
+ */
+function tr_webmail($u, $home, array $boxes) {
+    if (!$boxes)
+        return;
+    $rc = roundcube_info();
+    if (empty($rc['installed'])) {
+        tr_log($u, 'Webmail is not installed here, so the webmail contacts and settings are not taken.');
+        return;
+    }
+    $owner = posix_getpwuid((int)@fileowner($rc['path'].'/config/config.inc.php'));
+    $tmp = $owner && (int)$owner['uid'] !== 0 ? rtrim((string)shell_exec('runuser -u '.escapeshellarg($owner['name']).' -- mktemp -d 2>/dev/null')) : '';
+    if (!preg_match('#^/[A-Za-z0-9/._-]+$#', $tmp) || !is_dir($tmp) || is_link($tmp)) {
+        tr_warn($u, 'The webmail contacts and settings were not taken: no temporary folder could be made for them.');
+        return;
+    }
+    $script = <<<'SH'
+cd "$1" || exit 3
+shift
+P=$(pwd -P)
+real() { [ "$(readlink -f -- "$1")" = "$P/$1" ]; }
+for x in "$@"; do
+  d=${x%%/*}; b=${x#*/}
+  f="etc/$d/$b.rcube.db"
+  [ -f "$f" ] && [ -s "$f" ] && real "$f" && printf '%s\0' "$f"
+  c=".caldav/$b@$d"
+  [ -d "$c" ] && real "$c" && find "$c" -mindepth 2 -maxdepth 2 -type f \( -name '*.vcf' -o -name .metadata \) -size -5M -print0
+done | tar --null --no-recursion -T - -cf -
+SH;
+    $remote = 'set -- '.implode(' ', array_map('escapeshellarg', array_merge(array($home), $boxes)))."\n".$script;
+    $local = 'runuser -u '.escapeshellarg($owner['name']).' -- tar -xf - -C '.escapeshellarg($tmp).' --no-same-owner --no-same-permissions';
+    list($ok, $bytes, $e) = tr_pipe($u, $remote, $local, 'Copying webmail data');
+    if (!$ok)
+        tr_warn($u, 'The copy of the webmail data reported problems'.($e !== '' ? ":\n".$e : '.'));
+    tr_log($u, 'Webmail contacts and settings:');
+    tr_import($u, 'import_cpanel_webmail.php', array('--dir='.$tmp, '--rc='.$rc['path'], '--apply'));
+    exec('rm -rf '.escapeshellarg($tmp));
 }

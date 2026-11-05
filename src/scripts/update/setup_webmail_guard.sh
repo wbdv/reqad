@@ -5,7 +5,10 @@
 # login watch never sees the real address. Three layers instead:
 #
 #   1. Roundcube: at most 3 failed logins per minute per mailbox
-#      (login_rate_limit) and the userlogins log (log_logins).
+#      (login_rate_limit) and its login log: log_logins with the file driver,
+#      so roundcubemail/logs/userlogins.log holds every sign-in, successful or
+#      failed, with the client address (the installer used to pick syslog,
+#      which put them, if at all, among the mail lines of /var/log/maillog).
 #   2. nginx (panel instance): login POSTs to /webmail/ limited per IP,
 #      10 a minute with a burst of 10, the rest answered 429.
 #   3. The plugin reqad_guard writes each failed login as a JSON line to
@@ -111,7 +114,9 @@ remove_old_watcher() {
     rm -f "$R/scripts/webmail_guard.php"
 }
 
-panel_vhosts() { grep -l 'location /webmail/' /etc/reqad/conf.d/*.conf 2>/dev/null | grep -v '/00-'; }
+# files with Roundcube's PHP location (a /webmail/ that only redirects to
+# webmail's own port, setup_webmail_port.sh, has nothing to limit)
+panel_vhosts() { grep -lF 'location ~ ^/webmail/(' /etc/reqad/conf.d/*.conf 2>/dev/null | grep -v '/00-'; }
 
 nginx_test_reload() {      # $1: files to restore on failure (from .wg-bak copies)
     if nginx -t -c "$NGINX_CONF" >/dev/null 2>&1; then
@@ -151,6 +156,9 @@ fi
 
 # --- 1. plugin + Roundcube settings -------------------------------------------
 block="$BEGIN
+// files in logs/: userlogins.log = every webmail sign-in, successful or failed,
+// with the client address (syslog would mix it into /var/log/maillog)
+\$config['log_driver'] = 'file';
 \$config['log_logins'] = true;
 \$config['login_rate_limit'] = 3;
 if (!in_array('reqad_guard', \$config['plugins'] ?? [], true)) {
@@ -160,7 +168,8 @@ $END"
 cur=$(sed -n "\|^$BEGIN\$|,\|^$END\$|p" "$CONFIG")
 if [ "$MODE" = dry ]; then
     cmp -s "$PLUGIN_SRC" "$PLUGIN_DIR/reqad_guard.php" || say "would install the plugin in $PLUGIN_DIR"
-    [ "$cur" = "$block" ] || say "would set log_logins, login_rate_limit and enable reqad_guard in $CONFIG"
+    [ "$cur" = "$block" ] || say "would set log_driver file, log_logins, login_rate_limit and enable reqad_guard in $CONFIG"
+    grep -qF "'rcmail-!24ByteDESkey*Str'" "$CONFIG" && say "would replace the sample des_key with one of its own"
 else
     mkdir -p "$PLUGIN_DIR"
     if ! cmp -s "$PLUGIN_SRC" "$PLUGIN_DIR/reqad_guard.php"; then
@@ -178,7 +187,18 @@ else
             sed -i "\|^$BEGIN\$|,\|^$END\$|d" "$CONFIG"
             say "config check failed - Roundcube settings left as they were"
         else
-            say "Roundcube: log_logins, login_rate_limit 3/min, plugin enabled"
+            say "Roundcube: login log (logs/userlogins.log), login_rate_limit 3/min, plugin enabled"
+        fi
+    fi
+    # The installer kept the sample des_key from config.inc.php.sample, the same
+    # on every server; Roundcube encrypts the mailbox password it keeps in the
+    # session with it. A key of our own (24 characters, as Roundcube wants);
+    # sessions open now end once.
+    if grep -qF "'rcmail-!24ByteDESkey*Str'" "$CONFIG"; then
+        key=$(head -c 512 /dev/urandom | tr -cd 'A-Za-z0-9' | cut -c1-24)
+        if [ ${#key} -eq 24 ]; then
+            KEY=$key perl -pi -e "s/\Q'rcmail-!24ByteDESkey*Str'\E/'\$ENV{KEY}'/" "$CONFIG"
+            say "Roundcube: own des_key instead of the sample one (open webmail sessions end once)"
         fi
     fi
     touch "$RC/logs/reqad-guard.log"

@@ -87,6 +87,12 @@ if ! [ -f /etc/reqad/conf.d/${hostname}.conf ]; then
     fi
 fi
 
+# The panel vhost names the hostname's Let's Encrypt certificate. When there is
+# none (port 80 not reachable from outside, DNS not ready), nginx would refuse to
+# start the panel: use a self-signed certificate until Let's Encrypt has one, and
+# switch back once it does. Before the scripts below that test the panel config.
+bash /usr/local/reqad/scripts/update/update_hostname_cert.sh 2>&1 | tee -a /usr/local/reqad/log/post_install.log
+
 #VERSION=$(rpm -q --qf "%{VERSION}\n" reqad)
 #if [ ${VERSION} == "1.0.26" ]; then
 #    echo "Update config files to ${VERSION}\n";
@@ -402,6 +408,12 @@ fi
 	# route), Roundcube login_rate_limit/log_logins, nginx limit on login POSTs,
 	# an lfd rule (CUSTOMn_LOG + regex.custom.pm) blocks IPs that keep failing.
 	bash /usr/local/reqad/scripts/update/setup_webmail_guard.sh --apply
+	# Webmail on a port of its own (2096): mailbox owners never need the panel's
+	# 2087, so Settings > Security > IP restriction can close it to everyone but
+	# the admin. 2087's /webmail/ (and 2083's, with a reqad-account that knows
+	# it) redirect there, csf opens 2096, the sites' /webmail links follow.
+	# After setup_webmail_guard.sh: the new server carries its login rate limit.
+	bash /usr/local/reqad/scripts/update/setup_webmail_port.sh
 	bash /usr/local/reqad/scripts/update/update_user_phpfpm.sh
 	bash /usr/local/reqad/scripts/update/update_default_nginx_host.sh
 	bash /usr/local/reqad/scripts/update/update_certbot_hostname.sh
@@ -561,6 +573,16 @@ fi
 	# /etc/exim/remotedomains (created empty). Only the stock line is changed.
 	# Idempotent, validated with `exim -bV -C` before it installs anything.
 	bash /usr/local/reqad/scripts/update/setup_exim_remote_domains.sh
+
+	# Sender domain check: refuse mail whose sender domain is on the Spamhaus
+	# Domain Block List (spam, phishing, malware, botnet - not hacked real
+	# sites), a block of its own at the top of acl_check_data. Also gives every
+	# bare Spamhaus IP list in a dnslists line the filter of real listing codes,
+	# so an error answer (127.255.255.x, public resolvers) never rejects all
+	# mail, and moves a dbl.spamhaus.org item out of the IP lists. Follows the
+	# setting exim-dbl (panel: Email > Exim > Blocklists; default on), so an
+	# admin's "off" stays off. Idempotent, validated with `exim -bV -C`.
+	bash /usr/local/reqad/scripts/update/setup_exim_dbl.sh
 
 	# `dnf update` upgrades what is installed and never ADDS a subpackage, so a
 	# server that never installed dovecot-sieve stays without it through every
@@ -837,6 +859,10 @@ bash /usr/local/reqad/scripts/update/update_wp_cache_blocks.sh 2>&1 | tee -a /us
 # /reqad-health and points monit's 2087 check at it (it fetched / and would now
 # get 401 and restart the panel in a loop). Idempotent; restores on nginx -t failure.
 bash /usr/local/reqad/scripts/update/fix_panel_ip_bypass.sh 2>&1 | tee -a /usr/local/reqad/log/post_install.log
+
+# The old Wordfence scan console is gone: drop the panel vhost's /websocket/
+# proxy to 127.0.0.1:2122 (websocat). Idempotent; restores on nginx -t failure.
+bash /usr/local/reqad/scripts/update/remove_panel_websocket.sh 2>&1 | tee -a /usr/local/reqad/log/post_install.log
 
 # Defence in depth for the same hole: a csf post hook rejects connections from
 # regular-user uids (>= 1000, i.e. hosting accounts) to the panel ports on

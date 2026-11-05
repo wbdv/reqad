@@ -22,20 +22,27 @@ if(isset($argv) && count($argv)>1) {
 }
 
 $db = new SQLite3(__DIR__.'/../db/reqad.db');
+$db->busyTimeout(15000);   /* the panel and transfers write too: wait, do not fail */
 
-$results = $db->query('SELECT count(*) as nb FROM accounts');
-$row = $results->fetchArray();
-$nb_accounts = (int)($row["nb"]);
-if($nb_accounts == 0) {
+/* All rows first, then du: a read left open during the du of every home
+   kept the database locked for minutes, and other writers (a transfer
+   giving an account its package) failed with "database is locked". */
+$rows = array();
+$results = $db->query('SELECT * FROM accounts');
+while ($results && ($row = $results->fetchArray(SQLITE3_ASSOC)))
+	$rows[] = $row;
+if ($results)
+	$results->finalize();
+if(count($rows) == 0) {
 	echo "There are no accounts created on this server.\n";
  	exit;
 } else {
-	$results = $db->query('SELECT * FROM accounts');
+	$upd = $db->prepare('UPDATE accounts SET disk_usage = :u WHERE user = :user');
 	$i=0;
 	echo "┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
 	echo "│ \033[97m   #   Domain                           User                Usage                           Status\033[0m   │\n";
 	echo "├──────────────────────────────────────────────────────────────────────────────────────────────────────┤\n";
-	while ($row = $results->fetchArray()) {
+	foreach ($rows as $row) {
 		$i++;
 		if($row["status"]!='active') {
 			echo "\033[41m"; echo "\033[97m"; // white on red
@@ -43,7 +50,7 @@ if($nb_accounts == 0) {
 		echo '│ '.substr(str_pad($row["id"].' ', 5, ' ', STR_PAD_LEFT), 0, 5);
 		echo '│ '.substr(str_pad($row["domain"], 31), 0, 31);
 		echo '│ '.substr(str_pad($row["user"], 18), 0, 18);
-		$disk_usage = shell_exec('du -sm /home/'.$row["user"]);
+		$disk_usage = shell_exec('du -sm '.escapeshellarg('/home/'.$row["user"]));
 		$disk_usage = (int)($disk_usage);
 
 /*
@@ -61,7 +68,10 @@ if($nb_accounts == 0) {
 		else
 			echo '│ '.substr(str_pad(number_format($disk_usage,0,'.',"'").' MB ', 30, ' ', STR_PAD_LEFT), 0, 30);
 
-		$db->query('UPDATE accounts SET disk_usage='.$disk_usage.' WHERE user="'.$row["user"].'"');
+		$upd->bindValue(':u', $disk_usage, SQLITE3_INTEGER);
+		$upd->bindValue(':user', $row["user"], SQLITE3_TEXT);
+		$upd->execute();
+		$upd->reset();
 
 		echo '│ '.substr(str_pad($row["status"], 9), 0, 9).'│';
 		if($row["status"]!='active')

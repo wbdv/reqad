@@ -162,6 +162,9 @@
                         <? } else { ?>
                           <span class="badge bg-red-lt border" title="Login is disabled: no IMAP/POP3 or SMTP AUTH. Mail is still delivered to this mailbox.">Disabled</span>
                         <? } ?>
+                        <? if(!empty($email['refuse_incoming'])) { ?>
+                          <span class="badge bg-orange-lt border" title="Incoming mail is refused. Senders get: <?=h($email['refuse_message']);?>">Refuses mail</span>
+                        <? } ?>
                         </td>
                         <td data-label="Filters">
                           <?	$fc = array_key_exists($email['email'], $filter_counts)
@@ -216,7 +219,7 @@
 </svg>
 							  Client Setup
                             </a>
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" data-bs-enabled="<?=$email['enabled']?1:0;?>" title="Edit this email account">Edit</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-email" data-bs-email="<?=$email['email'];?>" data-bs-enabled="<?=$email['enabled']?1:0;?>" data-bs-refuse="<?=!empty($email['refuse_incoming'])?1:0;?>" data-bs-refuse-text="<?=h($email['refuse_message'] ?? '');?>" title="Edit this email account">Edit</a>
                             <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-delete-email" data-bs-email="<?=$email['email'];?>">Delete</a>
                           </div>
                         </td>
@@ -225,14 +228,16 @@
                     </tbody>
                   </table>
                 </div>
-		        <div id="email-footer" class="card-footer d-flex align-items-center">
+		        <div id="email-footer" class="card-footer d-flex flex-wrap align-items-center gap-2">
 				<? if($nb_accounts > $items): ?>
 					<p class="m-0 text-muted"><span class="d-none d-xl-inline">Showing </span>1 to <?=$items;?> of <?=$nb_accounts;?> email accounts</p>
 					<ul class="pagination m-0 ms-auto">
 						<li class="page-item disabled"><a class="page-link" href="#" data-start="1"><svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><polyline points="15 6 9 12 15 18"></polyline></svg> prev</a></li>
-						<? for($p = 1; $p <= ceil($nb_accounts/$items); $p++): ?>
+						<? $pages = (int)ceil($nb_accounts/$items); $last = 0;
+						foreach(array_unique(array_filter(array(1, 2, 3, $pages - 1, $pages), function($p) use ($pages) { return $p >= 1 && $p <= $pages; })) as $p): ?>
+						<? if($p - $last > 1): ?><li class="page-item disabled"><span class="page-link">&hellip;</span></li><? endif; $last = $p; ?>
 						<li class="page-item <?=$p===1?'active':'';?>"><a class="page-link" href="#" data-start="<?=($p-1)*$items+1;?>"><?=$p;?></a></li>
-						<? endfor; ?>
+						<? endforeach; ?>
 						<li class="page-item"><a class="page-link" href="#" data-start="<?=$items+1;?>">next <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><polyline points="9 6 15 12 9 18"></polyline></svg></a></li>
 					</ul>
 				<? else: ?>
@@ -376,6 +381,23 @@
                 turning it back on restores access.
               </small>
             </div>
+
+            <div class="mb-1" style="margin-top:20px;">
+              <label class="form-check form-switch d-inline-flex align-items-center mb-0" style="cursor:pointer">
+                <input class="form-check-input" type="checkbox" name="refuse_incoming" id="refuse-incoming" value="1" style="margin-right:10px;margin-bottom:1px;">
+                <span class="form-check-label" style="cursor: pointer;line-height:21px;">Refuse incoming mail</span>
+              </label>
+              <small class="form-text text-muted" style="display:block;">
+                Every message to this address is refused while the sending server is still connected,
+                so the sender hears it from their own mail server and this server sends no bounce
+                (spam is never accepted either). The mailbox can still log in and send mail.
+              </small>
+              <div class="mt-2" id="refuse-text-wrap" style="display:none;">
+                <label class="form-label">Text the sender gets:</label>
+                <input type="text" class="form-control" name="refuse_message" id="refuse-message" maxlength="200" placeholder="<?=h(EMAIL_REFUSE_DEFAULT);?>">
+                <small class="form-text text-muted">Plain letters without accents (mail servers answer in ASCII), up to 200 characters. Empty = "<?=h(EMAIL_REFUSE_DEFAULT);?>"</small>
+              </div>
+            </div>
           </div>
           <div class="modal-footer">
             <a href="#" class="btn btn-link link-secondary" data-bs-dismiss="modal">
@@ -491,9 +513,14 @@ jQuery(document).ready(function () {
 			html += '<p class="m-0 text-muted"><span class="d-none d-xl-inline">Showing </span>' + start + ' to ' + Math.min(start + emailItems - 1, total) + ' of ' + total + ' email accounts</p>';
 			html += '<ul class="pagination m-0 ms-auto">';
 			html += '<li class="page-item' + (start === 1 ? ' disabled' : '') + '"><a class="page-link" href="#" data-start="' + Math.max(1, start - emailItems) + '">' + svgPrev + ' prev</a></li>';
-			for (var p = 1; p <= pages; p++) {
+			// 1 2 … 4 5 [6] 7 8 … 57 58 - only a window around the current page
+			var shown = {}, last = 0;
+			[1, 2, curPage - 2, curPage - 1, curPage, curPage + 1, curPage + 2, pages - 1, pages].forEach(function (p) { if (p >= 1 && p <= pages) shown[p] = 1; });
+			Object.keys(shown).map(Number).sort(function (a, b) { return a - b; }).forEach(function (p) {
+				if (p - last > 1) html += '<li class="page-item disabled"><span class="page-link">&hellip;</span></li>';
 				html += '<li class="page-item' + (p === curPage ? ' active' : '') + '"><a class="page-link" href="#" data-start="' + ((p - 1) * emailItems + 1) + '">' + p + '</a></li>';
-			}
+				last = p;
+			});
 			html += '<li class="page-item' + ((start + emailItems) > total ? ' disabled' : '') + '"><a class="page-link" href="#" data-start="' + (start + emailItems) + '">next ' + svgNext + '</a></li>';
 			html += '</ul>';
 		} else {
@@ -589,7 +616,13 @@ jQuery(document).ready(function () {
 		// optional, so the form can be submitted to flip the toggle alone.
 		$('#login-enabled').prop('checked', button.getAttribute('data-bs-enabled') !== '0')
 		                   .trigger('change');
+		$('#refuse-incoming').prop('checked', button.getAttribute('data-bs-refuse') === '1').trigger('change');
+		$('#refuse-message').val(button.getAttribute('data-bs-refuse-text') || '');
   	});
+
+	$('#refuse-incoming').on('change', function() {
+		$('#refuse-text-wrap').toggle($(this).is(':checked'));
+	});
 
 	/* The switch is labelled with the object ("Email account"); the word next to
 	   it carries the state, in the same Active/Disabled wording as the Status

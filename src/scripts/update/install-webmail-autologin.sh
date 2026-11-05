@@ -47,9 +47,9 @@ smtp_auth_on() {
         -e "s#^// No SMTP auth .*#// SMTP AUTH as the mailbox, so Exim's sending limits apply (auto-login binds the master user)#" \
         -e "s#^// SMTP: no auth .*#// SMTP: AUTH as the mailbox, so Exim's sending limits apply (auto-login binds the master user)#" \
         "$CONFIG" > "$new" || { rm -f "$new"; return 0; }
-    for php in php php82 php83 php81 php80 /usr/bin/php /opt/remi/php82/root/usr/bin/php; do
+    for php in /opt/reqad/php-current/usr/bin/php php php82 php83 php81 php80 /usr/bin/php /opt/remi/php82/root/usr/bin/php; do
         if command -v "$php" >/dev/null 2>&1; then
-            "$php" -l "$new" >/dev/null 2>&1 || { rm -f "$new"; say "SMTP AUTH edit failed the PHP syntax check, $CONFIG left as it was" >&2; return 0; }
+            "$php" -n -l "$new" >/dev/null 2>&1 || { rm -f "$new"; say "SMTP AUTH edit failed the PHP syntax check, $CONFIG left as it was" >&2; return 0; }
             break
         fi
     done
@@ -59,6 +59,46 @@ smtp_auth_on() {
     say "webmail now sends with SMTP AUTH as the mailbox"
 }
 smtp_auth_on
+
+# Webmail reads mail over plain IMAP on localhost:143, not ssl://localhost.
+# Over TLS each Roundcube request held one of Dovecot's imap-login processes for
+# as long as it ran (the login process stays as the TLS proxy), the same pool
+# every phone and desktop mail app holds all day; when it was full webmail said
+# "Connection to storage server failed". Without TLS the login process hands the
+# connection to imap and exits. Dovecot counts loopback connections as secured,
+# so plaintext login works there even with ssl = required - checked below on
+# this server before switching (AUTH=PLAIN offered, no LOGINDISABLED).
+# Switched only from the exact value the installer wrote, so an admin's own
+# imap_host is kept.
+imap_local_plain() {
+    grep -Eq "^\s*\\\$config\['imap_host'\]\s*=\s*'ssl://localhost(:993)?'\s*;" "$CONFIG" || return 0
+    local caps
+    caps=$(timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/143 || exit 1
+        while IFS= read -r -t 8 line <&3; do
+            case "$line" in "* OK [CAPABILITY "*) echo "$line"; break ;; esac
+        done
+        printf "a LOGOUT\r\n" >&3' 2>/dev/null)
+    case "$caps" in
+        *LOGINDISABLED*|"") say "dovecot does not allow plain login on 127.0.0.1:143, webmail stays on ssl://localhost"; return 0 ;;
+        *AUTH=PLAIN*) ;;
+        *) say "dovecot offers no AUTH=PLAIN on 127.0.0.1:143, webmail stays on ssl://localhost"; return 0 ;;
+    esac
+    local new="$CONFIG.imap-new"
+    sed -E "s#^(\s*\\\$config\['imap_host'\]\s*=\s*)'ssl://localhost(:993)?'\s*;#\1'localhost:143';#" \
+        "$CONFIG" > "$new" || { rm -f "$new"; return 0; }
+    grep -q "'localhost:143'" "$new" || { rm -f "$new"; return 0; }
+    for php in /opt/reqad/php-current/usr/bin/php php php82 php83 php81 php80 /usr/bin/php /opt/remi/php82/root/usr/bin/php; do
+        if command -v "$php" >/dev/null 2>&1; then
+            "$php" -n -l "$new" >/dev/null 2>&1 || { rm -f "$new"; say "imap_host edit failed the PHP syntax check, $CONFIG left as it was" >&2; return 0; }
+            break
+        fi
+    done
+    cp -a "$CONFIG" "$CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+    cat "$new" > "$CONFIG"
+    rm -f "$new"
+    say "webmail now reads mail over IMAP on localhost:143 (no TLS on loopback)"
+}
+imap_local_plain
 
 if grep -q "['\"]$PLUGIN['\"]" "$CONFIG"; then
     say "already enabled in roundcube config"
@@ -142,15 +182,17 @@ fi
 # Verify before replacing: the plugin must actually be there, and if a php
 # binary happens to exist the file must still parse. Never gate on php being
 # found -- only on what it says when it IS found.
+# -n: no php.ini, so no extensions - the ionCube loader 15.5.1 crashes
+# (segfault) on `php -l` with PHP 8.1 / 8.3 / 8.4, which read as a failed check.
 if ! grep -q "['\"]$PLUGIN['\"]" "$CONFIG.new"; then
     rm -f "$CONFIG.new"
     say "edit did not register the plugin, leaving $CONFIG untouched" >&2
     exit 0
 fi
 
-for php in php php82 php83 php81 php80 /usr/bin/php /opt/remi/php82/root/usr/bin/php; do
+for php in /opt/reqad/php-current/usr/bin/php php php82 php83 php81 php80 /usr/bin/php /opt/remi/php82/root/usr/bin/php; do
     if command -v "$php" >/dev/null 2>&1; then
-        if ! "$php" -l "$CONFIG.new" >/dev/null 2>&1; then
+        if ! "$php" -n -l "$CONFIG.new" >/dev/null 2>&1; then
             rm -f "$CONFIG.new"
             say "edited config failed the PHP syntax check, leaving $CONFIG untouched" >&2
             exit 0

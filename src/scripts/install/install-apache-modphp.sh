@@ -85,7 +85,10 @@ if ! systemctl is-active --quiet httpd; then
         fi
 
 		if [ "$(grep 'SetHandler server-status' /etc/httpd/conf/httpd.conf | awk {'print $2'})" != "server-status" ]; then
-			sed -i '/EnableSendfile on/a \\n<Location "\/server-status">\n\tSetHandler server-status\n\tRequire ip 127.0.0.1 ::1\n<\/Location>' /etc/httpd/conf/httpd.conf
+			sed -i '/EnableSendfile on/a \\n<Location "\/server-status">\n\tSetHandler server-status\n\tRewriteEngine Off\n\tRequire ip 127.0.0.1 ::1\n<\/Location>' /etc/httpd/conf/httpd.conf
+		elif ! grep -A1 'SetHandler server-status' /etc/httpd/conf/httpd.conf | grep -q 'RewriteEngine Off'; then
+			# a site's .htaccess rewrite (SPA fallback) would turn /server-status into its index page
+			sed -i '/SetHandler server-status/a \\tRewriteEngine Off' /etc/httpd/conf/httpd.conf
 		fi
 
 		# remove default 443 virtual host
@@ -160,6 +163,8 @@ bash /usr/local/reqad/scripts/update/setup_directory_index.sh >> ./install_reqad
 # an addon site in ~/public_html/<site> reads the main site's .htaccess too:
 # the same rights there as in the vhosts (stock userdir.conf refuses Options)
 bash /usr/local/reqad/scripts/update/setup_httpd_home_overrides.sh >> ./install_reqad.log 2>&1
+# hidden files (stock httpd only blocks .ht*) and AI assistant instruction files
+bash /usr/local/reqad/scripts/update/setup_site_file_denies.sh >> ./install_reqad.log 2>&1
 
 if grep -qE '^[[:space:]]*LoadModule[[:space:]]+proxy_module' ${MODDIR}/00-proxy.conf 2>/dev/null \
 	&& grep -qE '^[[:space:]]*LoadModule[[:space:]]+proxy_fcgi_module' ${MODDIR}/00-proxy.conf 2>/dev/null; then

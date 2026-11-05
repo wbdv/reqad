@@ -249,6 +249,7 @@ function app_nginx_block(array $a, $php) {
 		return $head.'location / {
     # files that exist in the document root, the rest goes to the app
     location ~ /\.(?!well-known/) { deny all; }
+    location ~* /(claude[^/]*|agents|gemini)\.md$ { return 404; }
     try_files $uri @reqad_app;
     expires 1h;
 }
@@ -292,6 +293,14 @@ function nginx_fpm_root($php) {
     # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store
     location ~ /\. {
         deny all;
+    }
+    # An ACME client other than certbot (certbot adds its own challenge location)
+    # needs /.well-known/: use this line instead of the block above
+    # location ~ /\.(?!well-known/) { deny all; }
+
+    # Instruction files of AI coding assistants (CLAUDE.md, AGENTS.md, GEMINI.md)
+    location ~* /(claude[^/]*|agents|gemini)\.md$ {
+        return 404;
     }
 
     # Deny access to any files with a .php extension in the uploads directory

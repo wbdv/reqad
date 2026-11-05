@@ -388,11 +388,14 @@ function dns_cluster_zones_out() {
 }
 
 /*
- * The SOA serials of $zones at a DNS server, asked over UDP all at once:
- * zone => serial (int), or 'refused' / 'missing' / 'not authoritative' /
- * 'no answer'. $timeout seconds for all of them together.
+ * The SOA serials of $zones at a DNS server, asked over UDP: zone => serial
+ * (int), or 'refused' / 'missing' / 'not authoritative' / 'no answer'.
+ * $timeout seconds for all of them together. The questions go out 40 at a
+ * time, and zones without an answer are asked twice more: a server (or the
+ * network) drops part of a burst of hundreds of UDP questions, and a lost
+ * packet must not show as a zone the secondary does not have.
  */
-function dns_soa_serials($ip, $port, array $zones, $timeout = 3.0) {
+function dns_soa_serials($ip, $port, array $zones, $timeout = 4.0) {
 	$out = array_fill_keys($zones, 'no answer');
 	if (!$zones)
 		return $out;
@@ -403,17 +406,7 @@ function dns_soa_serials($ip, $port, array $zones, $timeout = 3.0) {
 	stream_set_blocking($s, false);
 	$ids = array();
 	$id = mt_rand(1, 30000);
-	foreach ($zones as $z) {
-		$id = ($id % 65535) + 1;
-		$ids[$id] = $z;
-		$q = pack('nnnnnn', $id, 0, 1, 0, 0, 0);
-		foreach (explode('.', rtrim($z, '.')) as $l)
-			$q .= chr(strlen($l)).$l;
-		$q .= "\0".pack('nn', 6, 1);
-		@fwrite($s, $q);
-	}
-	$end = microtime(true) + $timeout;
-	$left = count($ids);
+	$waiting = array();     // zone => true: asked in this round, no answer yet
 	$skip = function ($p, $o) {
 		while ($o < strlen($p)) {
 			$l = ord($p[$o]);
@@ -425,41 +418,68 @@ function dns_soa_serials($ip, $port, array $zones, $timeout = 3.0) {
 		}
 		return strlen($p);
 	};
-	while ($left > 0 && ($wait = $end - microtime(true)) > 0) {
-		$r = array($s);
-		$w = $e = null;
-		if (!@stream_select($r, $w, $e, (int)$wait, (int)(fmod($wait, 1) * 1e6)))
-			break;
-		while (($p = @fread($s, 4096)) !== false && $p !== '') {
-			if (strlen($p) < 12)
-				continue;
-			$h = unpack('nid/nflags/nqd/nan', substr($p, 0, 8));
-			if (!isset($ids[$h['id']]) || $out[$ids[$h['id']]] !== 'no answer')
-				continue;
-			$z = $ids[$h['id']];
-			$left--;
-			$rcode = $h['flags'] & 0xF;
-			if ($rcode === 5) { $out[$z] = 'refused'; continue; }
-			if ($rcode === 9) { $out[$z] = 'not authoritative'; continue; }
-			if (!($h['flags'] & 0x400)) { $out[$z] = 'not authoritative'; continue; }
-			$o = 12;
-			for ($i = 0; $i < unpack('n', substr($p, 4, 2))[1]; $i++)
-				$o = $skip($p, $o) + 4;
-			$serial = 'missing';
-			for ($i = 0; $i < $h['an'] && $o + 10 <= strlen($p); $i++) {
-				$o = $skip($p, $o);
-				$rr = unpack('ntype/nclass/Nttl/nlen', substr($p, $o, 10));
-				$o += 10;
-				if ($rr['type'] === 6) {
-					$x = $skip($p, $skip($p, $o));
-					if ($x + 4 <= strlen($p))
-						$serial = unpack('N', substr($p, $x, 4))[1];
-					break;
+	/* read answers until $until or nothing is waiting (a late answer to an
+	   earlier round still counts: every id ever sent stays in $ids) */
+	$read = function ($until) use ($s, $skip, &$ids, &$out, &$waiting) {
+		while ($waiting && ($wait = $until - microtime(true)) > 0) {
+			$r = array($s);
+			$w = $e = null;
+			if (!@stream_select($r, $w, $e, (int)$wait, (int)(fmod($wait, 1) * 1e6)))
+				return;
+			while (($p = @fread($s, 4096)) !== false && $p !== '') {
+				if (strlen($p) < 12)
+					continue;
+				$h = unpack('nid/nflags/nqd/nan', substr($p, 0, 8));
+				if (!isset($ids[$h['id']]) || $out[$ids[$h['id']]] !== 'no answer')
+					continue;
+				$z = $ids[$h['id']];
+				unset($waiting[$z]);
+				$rcode = $h['flags'] & 0xF;
+				if ($rcode === 2)
+					continue;   // SERVFAIL: ask again next round
+				if ($rcode === 5) { $out[$z] = 'refused'; continue; }
+				if ($rcode === 9) { $out[$z] = 'not authoritative'; continue; }
+				if (!($h['flags'] & 0x400)) { $out[$z] = 'not authoritative'; continue; }
+				$o = 12;
+				for ($i = 0; $i < unpack('n', substr($p, 4, 2))[1]; $i++)
+					$o = $skip($p, $o) + 4;
+				$serial = 'missing';
+				for ($i = 0; $i < $h['an'] && $o + 10 <= strlen($p); $i++) {
+					$o = $skip($p, $o);
+					$rr = unpack('ntype/nclass/Nttl/nlen', substr($p, $o, 10));
+					$o += 10;
+					if ($rr['type'] === 6) {
+						$x = $skip($p, $skip($p, $o));
+						if ($x + 4 <= strlen($p))
+							$serial = unpack('N', substr($p, $x, 4))[1];
+						break;
+					}
+					$o += $rr['len'];
 				}
-				$o += $rr['len'];
+				$out[$z] = $serial;
 			}
-			$out[$z] = $serial;
 		}
+	};
+	$end = microtime(true) + $timeout;
+	for ($round = 0; $round < 3 && microtime(true) < $end; $round++) {
+		$ask = array_keys($out, 'no answer', true);
+		if (!$ask)
+			break;
+		$waiting = array();
+		foreach (array_chunk($ask, 40) as $group) {
+			foreach ($group as $z) {
+				$id = ($id % 65535) + 1;
+				$ids[$id] = $z;
+				$waiting[$z] = true;
+				$q = pack('nnnnnn', $id, 0, 1, 0, 0, 0);
+				foreach (explode('.', rtrim($z, '.')) as $l)
+					$q .= chr(strlen($l)).$l;
+				$q .= "\0".pack('nn', 6, 1);
+				@fwrite($s, $q);
+			}
+			$read(min($end, microtime(true) + 0.05));
+		}
+		$read(min($end, microtime(true) + 1.0));
 	}
 	fclose($s);
 	return $out;

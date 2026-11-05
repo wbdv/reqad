@@ -5,6 +5,8 @@
 	$nb_accounts = (int)($row["nb"]);
 	$php_versions = array_map('trim', explode(',', $ini['php_versions']));
 	$modphp = (php_mode($ini) === 'modphp');   // handler choice: mod_php or php-fpm
+	// disk quota box in Create / Manage account; an add-on that sets the real limit itself (Hosting Pro: packages) hides it
+	$quota_field = !empty($ini['quota']) && plugin_filter('accounts.quota.field', true);
 	$php_version_colors = [
 		'7.2' => '#4299e1',
 		'7.4' => '#2da6b4',
@@ -55,6 +57,15 @@
 			if (($pc['after'] ?? '') === 'domain') $plugin_cols_d[] = $pc;
 			else                                   $plugin_cols[] = $pc;
 		}
+	/* core columns a plugin leaves out when its own columns would make the
+	   table scroll sideways ('accounts.columns.hide': 'email', 'shell') */
+	$hide_cols = array_flip(array_filter((array)plugin_filter('accounts.columns.hide', array()), 'is_string'));
+	$show_email = isset($ini["email"]) && $ini["email"] == 1 && !isset($hide_cols['email']);
+	$show_shell = !isset($hide_cols['shell']);
+	/* resellers (db 1056): user => owner; the Owner filter shows once there are any */
+	$acct_owners = account_owners();
+	$owner_names = array_values(array_unique($acct_owners));
+	sort($owner_names);
 
 	if(!isset($errmsg))
 		$errmsg = '';
@@ -94,7 +105,13 @@
 	$ssl_msgtoken = (isset($_GET['sslmsg']) && preg_match('/^[0-9a-f]{16}$/', $_GET['sslmsg'])) ? $_GET['sslmsg'] : '';
 ?>
 
-<?	if($nb_accounts == 0 ) { ?>
+<?	/* the menu and title go out now; the table is held back until its last
+	   row is built, so it shows in one piece instead of row by row (each row is
+	   more than output_buffering's 4 KB, so PHP would send them one at a time) */
+	if (ob_get_level() > 0) @ob_flush();
+	flush();
+	ob_start();
+	if($nb_accounts == 0 ) { ?>
 		<p style="padding:14px;">There are no accouns created on this server.</p>
 <? 	} else { ?>
 
@@ -115,7 +132,7 @@
 					<? endforeach; ?>
                         <th class="w-10" style="background-color:#DEF;">Usage</th>
                         <th style="background-color:#DEF;">Status</th>
-					<? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
+					<? if( $show_email ) { ?>
                         <th style="background-color:#DEF;">Email</th>
 					<? } ?>
                         <th style="background-color:#DEF;">PHP Version</th>
@@ -134,7 +151,15 @@
                             <button id="account-search-clear" type="button" title="Clear" style="display:none;position:absolute;right:7px;top:50%;transform:translateY(-50%);background:none;border:none;padding:0;cursor:pointer;color:#aaa;font-size:15px;line-height:1;">&#x2715;</button>
                           </div>
 						</td>
-						<td style="padding:4px 8px;" colspan="<?=((isset($ini["email"]) && $ini["email"]==1)?5:4) + count($plugin_cols) + count($plugin_cols_d); ?>">&nbsp;</td>
+						<td style="padding:4px 8px;" colspan="<?=($show_email?5:4) + count($plugin_cols) + count($plugin_cols_d); ?>"><? if($owner_names): ?>
+                          <select id="account-owner" class="form-select form-select-sm" style="width:auto;display:inline-block;font-size:10pt;" aria-label="Owner">
+                            <option value="*">All owners</option>
+                            <option value="">Server admin (me)</option>
+                          <? foreach($owner_names as $on): ?>
+                            <option value="<?=h($on);?>"<?=(($_GET['owner'] ?? '') === $on) ? ' selected' : '';?>>Reseller <?=h($on);?></option>
+                          <? endforeach; ?>
+                          </select>
+						<? else: ?>&nbsp;<? endif; ?></td>
                         <td style="padding:4px 8px;">
                         </td>
                         <td colspan="<?=7 + ($modphp ? 1 : 0);?>" style="padding:4px 8px;"></td>
@@ -151,16 +176,15 @@
 
                       	$results = $db->query('SELECT * FROM accounts ORDER BY domain');
                       	$shelllog_on = shelllog_enabled();
+                      	$acct_contacts = account_contacts();
                       	while ($row = $results->fetchArray()) {
                         	$i++;
-							if($row["disk_quota"] == 0)
-								$row["disk_quota"] = (int)($DISKSPACE/20);
 							// version/handler, or 'off'/'off' when PHP is disabled
 							list($phpversion, $phphandler) = account_php($row['domain']);
 							$acct_shell = account_shell_get($row['user']);
 							$domain = $row["domain"];
                     ?>
-                      <tr class="account-row" data-domain="<?=h($domain);?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none;':'';?><?=($row["status"] == 'suspended'||$row["status"] == 'suspended')?'background-color:#FEE;':'';?>">
+                      <tr class="account-row" data-domain="<?=h($domain);?>" data-owner="<?=h($acct_owners[$row['user']] ?? '');?>" data-idx="<?=$i;?>" style="<?=$i>$items?'display:none;':'';?><?=($row["status"] == 'suspended'||$row["status"] == 'suspended')?'background-color:#FEE;':'';?>">
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
@@ -205,8 +229,8 @@
                         <td data-label="User">
                           <div class="d-flex py-1 align-items-center">
                             <div class="flex-fill">
-                            <?=h($row["user"]);?>
-                            <? if($acct_shell === 'jailed' || $acct_shell === 'none'): $sh_lbl = $acct_shell === 'jailed' ? array('jailed shell', 'Shell access: jailed (own home only)') : array('SFTP only', 'Shell access: none, SFTP only'); ?><? if($shelllog_on): ?><a href="/shell-activity/<?=h($row['user']);?>/" class="badge ms-1 text-decoration-none" style="background:#f1f3f5;color:#495057;" title="<?=h($sh_lbl[1]);?> - see what it ran"><?=h($sh_lbl[0]);?></a><? else: ?><span class="badge ms-1" style="background:#f1f3f5;color:#495057;" title="<?=h($sh_lbl[1]);?>"><?=h($sh_lbl[0]);?></span><? endif; ?><? endif; ?>
+                            <?=plugin_filter('accounts.user.name', h($row["user"]), $row['user']);?>
+                            <? if($show_shell && ($acct_shell === 'jailed' || $acct_shell === 'none')): $sh_lbl = $acct_shell === 'jailed' ? array('jailed shell', 'Shell access: jailed (own home only)') : array('SFTP only', 'Shell access: none, SFTP only'); ?><? if($shelllog_on): ?><a href="/shell-activity/<?=h($row['user']);?>/" class="badge ms-1 text-decoration-none" style="background:#f1f3f5;color:#495057;" title="<?=h($sh_lbl[1]);?> - see what it ran"><?=h($sh_lbl[0]);?></a><? else: ?><span class="badge ms-1" style="background:#f1f3f5;color:#495057;" title="<?=h($sh_lbl[1]);?>"><?=h($sh_lbl[0]);?></span><? endif; ?><? endif; ?>
                             <?=plugin_filter('accounts.user.badge', '', $row['user']);?>
                             </div>
                           </div>
@@ -215,12 +239,18 @@
                         <td data-label="<?=h($pc['title']);?>"><?=call_user_func($pc['cell'], $row);?></td>
 					<? endforeach; ?>
                         <td data-label="Usage">
-						<? $disk_pct = $DISKSPACE > 0 ? round($row["disk_usage"]*100/$DISKSPACE, 1) : 0; ?>
+						<?
+							// against the account's quota when it has one (also set by a package), else the server's disk
+							$disk_mb = function ($mb) { return $mb > 1024 ? round($mb/1024, 1).' GB' : (int)$mb.' MB'; };
+							$disk_q = (int)$row["disk_quota"];
+							$disk_pct = $disk_q > 0 ? round($row["disk_usage"]*100/$disk_q, 1) : ($DISKSPACE > 0 ? round($row["disk_usage"]*100/$DISKSPACE, 1) : 0);
+							$disk_bar = $disk_q > 0 ? ($disk_pct >= 100 ? ' bg-red' : ($disk_pct >= 90 ? ' bg-orange' : '')) : '';
+						?>
                           <div class="d-flex">
-                            <div><strong><?=$row["disk_usage"]>1024?round($row["disk_usage"]/1024,1).' GB':$row["disk_usage"].' MB';?></strong> <span class="text-muted">(<?=$disk_pct;?>%)</span></div>
+                            <div><strong><?=$disk_mb($row["disk_usage"]);?></strong><? if($disk_q > 0): ?> <span class="text-muted">/ <?=$disk_mb($disk_q);?></span><? endif; ?> <span class="text-muted" title="<?=$disk_q > 0 ? 'Of the account\'s disk quota' : 'Of the server\'s disk (no quota)';?>">(<?=$disk_pct;?>%)</span></div>
                           </div>
                           <div class="progress progress-xs">
-                            <div class="progress-bar" role="progressbar" style="width: <?=min($disk_pct, 100);?>%"></div>
+                            <div class="progress-bar<?=$disk_bar;?>" role="progressbar" style="width: <?=min($disk_pct, 100);?>%"></div>
                           </div>
                         </td>
                         <td class="text-muted" data-label="Status">
@@ -232,8 +262,8 @@
                           <span class="badge bg-red-lt border">Suspended</span>
                         <? } ?>
                         </td>
-					<? if( isset($ini["email"]) && $ini["email"]==1 ) { ?>
-                        <td class="text-muted data-label="Email">
+					<? if( $show_email ) { ?>
+                        <td class="text-muted" data-label="Email">
                           <? if($row["has_email"] == true) { ?>
                           <div class="badge bg-blue-lt border text-blue">Yes</div>
                           <? } else { ?>
@@ -243,7 +273,7 @@
 					<? } ?>
                         <td class="text-muted" data-label="PHP Version">
 						<? if($phpversion == 'off'): ?>
-							<span class="badge bg-grey-lt border badge-muted">PHP disabled</span>
+							<span class="badge bg-grey-lt border badge-muted" title="PHP is off: .php files are not run">No PHP</span>
 						<? else: ?>
 							<? $php_color = $php_version_colors[$phpversion] ?? $php_version_colors[substr($phpversion, 0, 1)] ?? '#aaa'; ?>
 							<span class="badge" style="background-color:<?=$php_color;?>">PHP <?=h($phpversion);?></span>
@@ -259,7 +289,7 @@
                         </td>
                         <td>
                           <div class="btn-list flex-nowrap">
-                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-account" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>" data-bs-phpversion="<?=h($phpversion);?>" data-bs-phphandler="<?=h($phphandler);?>" data-bs-hasemail="<?=$row["has_email"];?>" data-bs-shell="<?=h($acct_shell);?>" <? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Manage</a>
+                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-edit-account" data-bs-user="<?=h($row["user"]);?>" data-bs-domain="<?=h($row["domain"]);?>" data-bs-phpversion="<?=h($phpversion);?>" data-bs-phphandler="<?=h($phphandler);?>" data-bs-hasemail="<?=$row["has_email"];?>" data-bs-shell="<?=h($acct_shell);?>" data-bs-contact="<?=h($acct_contacts[$row["user"]] ?? '');?>" <? if($quota_field) { ?>data-bs-disk-quota="<?=$row["disk_quota"];?>"<? } ?>>Manage</a>
                             <a href="/account/<?=h($row["user"]);?>/?tab=config" class="btn btn-white btn-md btn-icon" title="Advanced settings" aria-label="Advanced settings for <?=h($row["user"]);?>">
                               <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"></path><path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065z"></path><path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0"></path></svg>
                             </a>
@@ -301,6 +331,7 @@
 				</div>
             </div>
 			<?  } ?>
+<? ob_end_flush(); ?>
 
             </div>
           </div>
@@ -336,10 +367,17 @@
                 Please enter a username.
               </div>
             </div>
-			<? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>
+			<? if($quota_field) { ?>
             <div class="mb-3">
               <label class="form-label">Disk Space Quota</label>
-              <input name="disk_quota" type="range" class="form-range mb-2" value="1024" min="0" max="10240" step="256" oninput="if(this.value==0) { this.nextElementSibling.value = 'disabled'; } else { this.nextElementSibling.value = this.value + ' MB'; }" style="width:80%;align:left;margin-right:20px;" /><output>1024 MB</output></input>
+              <input type="hidden" name="disk_quota" id="diskquota-create" value="1024">
+              <div class="input-group" style="max-width:320px;">
+                <input type="number" class="form-control" id="diskquota-create-num" min="0" step="any" value="1" oninput="diskQuotaSync('create')">
+                <select class="form-select" id="diskquota-create-unit" style="max-width:90px;" onchange="diskQuotaSync('create')">
+                  <option value="1024" selected>GB</option>
+                  <option value="1">MB</option>
+                </select>
+              </div>
               <small id="userHelpBlock" class="form-text text-muted" style="display:block;margin-top:8px;">
                 Disk space quota is optional, you can set it to zero to disable account level quota.
               </small>
@@ -460,10 +498,17 @@
               <label class="form-label">Domain name:</label>
               <span id="domain-title"></span>
             </div>
-			<? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>
+			<? if($quota_field) { ?>
             <div class="mb-3">
               <label class="form-label">Disk Space Quota</label>
-              <input name="disk_quota" id="diskquota-edit" type="range" class="form-range mb-2" value="1024" min="0" max="<?=$ini["quota"];?>" step="256" oninput="if(this.value==0) { this.nextElementSibling.value = 'disabled'; } else { this.nextElementSibling.value = this.value + ' MB'; }" style="width:80%;align:left;margin-right:20px;" /><output><?=$ini["quota"];?> MB</output></input>
+              <input type="hidden" name="disk_quota" id="diskquota-edit" value="0">
+              <div class="input-group" style="max-width:320px;">
+                <input type="number" class="form-control" id="diskquota-edit-num" min="0" step="any" value="0" oninput="diskQuotaSync('edit')">
+                <select class="form-select" id="diskquota-edit-unit" style="max-width:90px;" onchange="diskQuotaSync('edit')">
+                  <option value="1024">GB</option>
+                  <option value="1">MB</option>
+                </select>
+              </div>
               <small id="userHelpBlock" class="form-text text-muted" style="display:block;margin-top:8px;">
                 Disk space quota is optional, you can set it to zero to disable account level quota.
               </small>
@@ -499,7 +544,7 @@
 					<br />
           			<label class="form-label">PHP version:</label>
 		            <select name="phpversion" id="phpversion" class="form-select">
-						<option value="off">Disable PHP</option>
+						<option value="off">No PHP</option>
 					<? if($modphp): ?>
 						<option value="<?=$ini['php'];?>:mod_php">PHP <?=$ini['php'];?> (mod_php)</option>
 						<option value="<?=$ini['php'];?>:fpm">PHP <?=$ini['php'];?> (php-fpm)</option>
@@ -530,6 +575,18 @@
 				</div>
 			  	</div>
 			  <? } ?>
+		    </div>
+
+			<div class="row">
+              <div class="col-lg-6">
+                <div class="mb-3">
+          			<label class="form-label">Contact email:</label>
+					<input type="email" class="form-control" name="contact" id="contact-edit" maxlength="254" autocomplete="off" placeholder="none">
+				</div>
+			  </div>
+              <div class="col-lg-6">
+				<div class="text-muted mb-3" style="font-size:.8rem;padding-top:30px;">Where the account gets its messages (alerts, new sign-ins). Counts as confirmed; leave empty to remove it.</div>
+			  </div>
 		    </div>
 
 			<?=plugin_filter('accounts.edit.form', '');?>
@@ -609,6 +666,13 @@
     if(feature_enabled($ini, 'filemanager')) include('templates/file-manager-modal.php');
 ?>
 <script>
+	// Create / Manage account: number + GB/MB -> disk_quota in MB (0 = no quota)
+	function diskQuotaSync(which) {
+		var n = parseFloat($('#diskquota-' + which + '-num').val());
+		var mb = (isNaN(n) || n < 0) ? 0 : Math.round(n * parseInt($('#diskquota-' + which + '-unit').val(), 10));
+		$('#diskquota-' + which).val(mb);
+	}
+
 jQuery(document).ready(function () {
 	'use strict';
 
@@ -695,25 +759,37 @@ jQuery(document).ready(function () {
 		$('#account-search-clear').toggle($(this).val() !== '');
 	});
 
-	$('#account-search').on('keydown', function(e) {
-		if (e.key !== 'Enter') return;
-		var q = $(this).val().toLowerCase().trim();
-		if (q === '') { clearAccountSearch(); return; }
+	/* the search box (Enter) and, with resellers, the Owner select */
+	function filterAccounts() {
+		var q = ($('#account-search').val() || '').toLowerCase().trim();
+		var owner = $('#account-owner').length ? $('#account-owner').val() : '*';
+		if (q === '' && owner === '*') { showAccountPage(accountStart); return; }
 		var shown = 0;
 		$('.account-row').each(function() {
-			var matches = $(this).data('domain').toLowerCase().indexOf(q) !== -1;
+			var matches = (q === '' || String($(this).data('domain')).toLowerCase().indexOf(q) !== -1)
+				&& (owner === '*' || String($(this).attr('data-owner')) === owner);
 			$(this).toggle(matches);
 			if (matches) shown++;
 		});
-		$('#account-footer').html('<p class="m-0 text-muted">' + shown + ' result' + (shown !== 1 ? 's' : '') + ' for &ldquo;' + $('<span>').text(q).html() + '&rdquo;</p>');
+		var what = [];
+		if (q !== '') what.push('for &ldquo;' + $('<span>').text(q).html() + '&rdquo;');
+		if (owner !== '*') what.push(owner === '' ? 'owned by you' : 'of reseller ' + $('<span>').text(owner).html());
+		$('#account-footer').html('<p class="m-0 text-muted">' + shown + ' account' + (shown !== 1 ? 's' : '') + ' ' + what.join(', ') + '</p>');
+	}
+
+	$('#account-search').on('keydown', function(e) {
+		if (e.key !== 'Enter') return;
+		filterAccounts();
 	});
+	$('#account-owner').on('change', filterAccounts);
+	if ($('#account-owner').length && $('#account-owner').val() !== '*') filterAccounts();
 
 	$('#account-search-clear').on('click', clearAccountSearch);
 
 	function clearAccountSearch() {
 		$('#account-search').val('');
 		$('#account-search-clear').hide();
-		showAccountPage(accountStart);
+		filterAccounts();
 	}
 
 	$('[data-bs-toggle="popover"]').popover({
@@ -815,10 +891,13 @@ jQuery(document).ready(function () {
 		$('#password2').val('');
 		// Advanced settings (premium) — point the link at this account's page
 		$('#advanced-settings-link').attr('href', '/account/' + user + '/');
-	<? if(isset($ini["quota"]) && (int)($ini["quota"])>0) { ?>
-		var disk_quota = button.getAttribute('data-bs-disk-quota')
+	<? if($quota_field) { ?>
+		var disk_quota = parseInt(button.getAttribute('data-bs-disk-quota'), 10) || 0;
+		// GB unless the quota isn't whole GB (CLI, API, a package): then MB
+		var in_gb = disk_quota % 1024 == 0;
+		$('#diskquota-edit-unit').val(in_gb ? '1024' : '1');
+		$('#diskquota-edit-num').val(in_gb ? disk_quota / 1024 : disk_quota);
 		$('#diskquota-edit').val(disk_quota);
-		$('#diskquota-edit').next().html(disk_quota + ' MB');
 	<? } ?>
 	<?php if($modphp): ?>
 		$('#phpversion').val(phpversion == 'off' ? 'off' : phpversion + ':' + phphandler);
@@ -826,6 +905,7 @@ jQuery(document).ready(function () {
 		$('#phpversion').val(phpversion);
 	<?php endif; ?>
 		$('#hasemail').prop( "checked", hasemail);
+		$('#contact-edit').val(button.getAttribute('data-bs-contact') || '');
 		var shell = button.getAttribute('data-bs-shell') || 'full';
 		// full shell access is off on this server (root_access=0), but this account still has it
 		var fullOff = shell === 'full' && !$('#shell-edit option[value="full"]').length;

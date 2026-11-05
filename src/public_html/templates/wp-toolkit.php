@@ -70,10 +70,6 @@
           </div>
 		<? } ?>
 
-<?php /*
-		<div id="progress" class="alert alert-info" role="alert" style="background:#EEF0FF;display:none;"></div>
-*/ ?>
-
 		<div class="col-12">
             <div class="card">
 			<div class="table-responsive">
@@ -117,7 +113,7 @@
                         <td data-label="ID">
                           <div class="d-flex">
                             <div class="flex-fill">
-                              <div class="text-muted"><?=$row['title'];?></div>
+                              <div class="text-muted"><?=h(wordpress_title_garbled((string)$row['title']) ? '' : $row['title']);?></div>
                             </div>
                           </div>
                         </td>
@@ -182,7 +178,7 @@
                             <input type="hidden" name="user" value="<?=htmlspecialchars($row["user"], ENT_QUOTES);?>">
                             <input type="hidden" name="id" value="<?=(int)$row["id"];?>">
                             <button type="submit" class="btn btn-white btn-md">Login</button></form>
-<? /*                            <a href="#" class="btn btn-white btn-md" data-bs-toggle="modal" data-bs-target="#modal-wp-scan" data-bs-user="<?=$row["user"];?>">Scan</a> */ ?>
+                            <?=plugin_filter('wptoolkit.site_buttons', '', $row);?>
 <? /*                            <a href="#" class="btn btn-white disabled" data-bs-toggle="modal" data-bs-target="#modal-wp-clone" data-bs-user="<?=$row["user"];?>">Clone</a> */ ?>
                           </div>
                         </td>
@@ -286,26 +282,6 @@
     	</div>
 		</form>
 
-<? /*		<form method="post" action="/" id="wp-scan" class="needs-validation" novalidate="" style="padding-left:14px;margin-left:-14px;"> */ ?>
-		<div class="modal modal-blur fade" id="modal-wp-scan" tabindex="-1" role="dialog" aria-hidden="true">
-      	<div class="modal-dialog modal-lg" role="document" style="min-width:90%">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title" style="font-size:16pt;margin:40px 0 15px 0;">Wordfence Scan</h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-          </div>
-          <div class="modal-body">
-		  	<p>Below is the scan done with <a href="https://github.com/wordfence/wordfence-cli" target="_blank">wordfence-cli</a>, output from console:</p>
-			<div id="console" style="background:#222;color:#ccc;padding:10px 20px;height:500px;width:auto;font-family: 'Roboto Mono', monospace, monospace;overflow:auto;white-space: pre;"></div>
-		  </div>
-		  <div class="modal-footer">
-			<input type="submit" id="submit-btn2" class="btn btn-primary" data-bs-dismiss="modal" value="Close" />
-          </div>
-	  	</div>
-    	</div>
-<? /*		</form> */ ?>
-		</div><!-- /#modal-wp-scan : close the outer .modal wrapper (its </form> closer above is commented out, leaving it open) -->
-
 
 	<?php
     include('templates/footer.php');
@@ -381,266 +357,6 @@ jQuery(document).ready(function () {
 	$.post('./ajax-wp-rescan-status/', { action: 'ajax-wp-rescan-status' }, null, 'json').done(function(r) {
 		if(r.running) { rescanBusy(true); setTimeout(rescanPoll, 2000); }
 	});
-
-	var ws;
-	var wsopen = false;
-	var scanning = false;
-
-	function showstate(state) {
-		switch(state) {
-			case 0:
-				return 'CONNECTING'; break;
-			case 1:
-				return 'OPEN'; break;
-			case 2:
-				return 'CLOSING'; break;
-			case 3:
-				return 'CLOSED'; break;
-			default:
-				return 'UNKNOWN '+state;
-		}
-	}
-
-	function escapeHtml(unsafe) {		
-  		return unsafe
-    	.replaceAll("&", "&amp;")
-	    .replaceAll("<", "&lt;")
-    	.replaceAll(">", "&gt;")
-	    .replaceAll('"', "&quot;")
-    	.replaceAll("'", "&#039;");
-	};
-
-	// show progress. if process is running on server, open websocket
-	jQuery.ajax({
-		method: "POST",
-		url: "./ajax-wp-scan/",
-		data: { action: 'ajax-wp-scan', user: '' }
-	}).done(function( msg ) {
-		console.log('RESPONSE ajax-wp-scan '+msg);
-		console.log(msg.trim().substring(0, 27));
-		if(msg.trim().substring(0, 27) == '*** resuming connection ***') {
-			scanning = true;
-			var user = msg.trim().substring(28);
-			console.log('show progress // user: '+user);
-			//$('#progress').show().html('Scanning in progress, <a href="javascript:" onClick="$(\'#modal-wp-scan\').modal(\'toggle\');">click here to view details</a>.');
-			//$('.btn-white').addClass("disabled");
-			//$('.btn-white').attr("disabled", "disabled");
-
-			ws = new WebSocket('wss://<?=$_SERVER['SERVER_NAME'];?>:2087/websocket/');
-			ws.onerror = function() {
-				console.log('Error opening websocket');
-				wsopen = false;
-			}
-
-			ws.onopen = function() {
-				wsopen = true;
-				//$('#console').append('<br/>'+msg);
-				$('#console').append('<font color=green>CONNECTED TO SERVER, WAIT FOR OUTPUT</font>');
-				console.log('OPEN WEBSOCKET // wsopen: ' + wsopen + ' state: ' + showstate(ws.readyState));
-				//console.log(ws.readyState);
-				$('#progress').show().html('Scanning user <b>'+user+'</b> in progress, <a href="javascript:" onClick="$(\'#modal-wp-scan\').modal(\'toggle\');">click here to view details</a>.');
-				$('.btn-white').addClass("disabled");
-				$('.btn-white').attr("disabled", "disabled");
-			}
-
-			ws.onmessage = function(event) {
-				$('#console').append('<br/>'+escapeHtml(event.data));
-				$('#console').scrollTop($('#console').prop("scrollHeight"));
-			};
-
-			ws.onclose = function() {
-				if(wsopen) {
-					$('#console').append('<br/><font color=green>DISCONNECTED</font><br />');
-					wsopen = false;
-				}
-				$('#console').scrollTop($('#console').prop("scrollHeight"));
-				console.log('CLOSING WEBSOCKET // scanning: ' + scanning + ' wsopen: ' + wsopen + ' state: ' + showstate(ws.readyState));
-				$('#progress').show().html('Scanning user <b>'+user+'</b> completed. <a href="javascript:" onClick="$(\'#modal-wp-scan\').modal(\'toggle\');">Click here to view details</a>.');
-				$('.btn-white').removeClass("disabled");
-				$('.btn-white').removeAttr("disabled");
-				//setInterval(function() {$('#modal-wp-scan').modal("hide") }.bind(this), 5000);
-				//console.log(ws.readyState);
-			};
-		}
-	});
-
-
-	$('#modal-wp-scan').on('show.bs.modal', function (event) {
-//		event.preventDefault();
-//		event.stopPropagation();
-		console.log('show // scanning: '+scanning+' wsopen: '+wsopen);
-		var button = event.relatedTarget;
-		var user = '';
-		if(button) {
-			user = button.getAttribute('data-bs-user');
-		}
-		$('#console').scrollTop($('#console').prop("scrollHeight"));
-
-		if(scanning && !wsopen && button) {
-			scanning = false;
-		}
-
-		if(!scanning) {
-			scanning = true;
-			$('#console').html('');
-			console.log('POST ajax-wp-scan '+user);
-			jQuery.ajax({
-				method: "POST",
-				url: "./ajax-wp-scan/",
-				data: { action: 'ajax-wp-scan', user: user }
-			}).done(function( msg ) {
-				console.log('RESPONSE ajax-wp-scan '+msg);
-				//$('#console').append(msg);
-
-				if(!wsopen) {
-					ws = new WebSocket('wss://<?=$_SERVER['SERVER_NAME'];?>:2087/websocket/');
-					ws.onerror = function() {
-						console.log('Error opening websocket');
-						wsopen = false;
-					}
-
-					ws.onopen = function() {
-						wsopen = true;
-						//scanning = true;
-						//$('#console').append('<br/>'+msg);
-						$('#console').append('<font color=green>CONNECTED TO SERVER, WAITING FOR OUTPUT</font>');
-						console.log('OPEN WEBSOCKET // wsopen: ' + wsopen + ' state: ' + showstate(ws.readyState));
-						//console.log(ws.readyState);
-						$('#progress').show().html('Scanning user <b>'+user+'</b> in progress, <a href="javascript:" onClick="$(\'#modal-wp-scan\').modal(\'toggle\');">click here to view details</a>.');
-						$('.btn-white').addClass("disabled");
-						$('.btn-white').attr("disabled", "disabled");
-					}
-
-					ws.onmessage = function(event) {
-						$('#console').append('<br/>'+escapeHtml(event.data));
-						$('#console').scrollTop($('#console').prop("scrollHeight"));
-					};
-
-					ws.onclose = function() {
-						if(wsopen) {
-							$('#console').append('<br/><font color=green>DISCONNECTED</font><br />');
-							wsopen = false;
-						}
-						$('#console').scrollTop($('#console').prop("scrollHeight"));
-						console.log('CLOSING WEBSOCKET // scanning: ' + scanning + ' wsopen: ' + wsopen + ' state: ' + showstate(ws.readyState));
-						$('#progress').show().html('Scanning user <b>'+user+'</b> completed. <a href="javascript:" onClick="$(\'#modal-wp-scan\').modal(\'toggle\');">Click here to view details</a>.');
-						$('.btn-white').removeClass("disabled");
-						$('.btn-white').removeAttr("disabled");
-						//setInterval(function() {$('#modal-wp-scan').modal("hide") }.bind(this), 5000);
-						//console.log(ws.readyState);
-						//scanning = false;
-					};
-				}
-			}).fail(function() {
-				//scanning = false;
-    			console.log("ajax error");
-  			});
-		}
-	});
-
-//	$('.scan').on('click', function (event) {
-//		console.log('scan button clicked');
-//		scanning = false;
-//		//$('#console').html('');
-//	});
-
-<? /*	
-	$('#modal-wp-scan').on('hide.bs.modal', function (event) {
-		console.log('hide // scanning: '+scanning+' wsopen: '+wsopen);
-		if(scanning) {
-			event.preventDefault();
-			event.stopPropagation();
-			$('#console').append('<br /><span style="color:#fff">*** closing connection ***</span>');
-			$('#console').scrollTop($('#console').prop("scrollHeight"));
-//			if(ws.readyState===WebSocket.CONNECTNG || ws.readyState===WebSocket.OPEN) {
-//				ws.close();
-				//setInterval(function() {
-				//	scanning = false;
-				//	console.log('hide timeout');
-				//	$('#modal-wp-scan').hide(); 
-				//	$('.modal-backdrop').hide(); 
-				//}.bind(this), 3000);
-				setTimeout( function () {
-//					scanning = false;
-//					console.log('hide timeout');
-//					$('.modal').modal('hide');
-					$(this).modal('hide');
-					$('.modal-backdrop').hide();
-				}, 3000);
-//			}
-//			wsopen = false;
-			scanning = false;
-		}
-	});
-*/ ?>	
-
-<? /*	
-//		$('#console').append('<br>Processing file: /home/wptest/public_html/wp-content/themes/twentytwentyfour/templates/inde.html');
-//		$('#console').append('<br>Processing file: /home/wptest/public_html/wp-content/themes/twentytwentyfour/templates.html');
-		if(wsopen == false) {
-			ws = new WebSocket('wss://<?=$_SERVER['SERVER_NAME'];?>:2087/websocket/');
-			wsopen = true
-		}
-	
-		ws.onopen = function() {
-			$('#console').html('<span style="color:#fff"># wordfence malware-scan /home/wp/public_html/</span>');
-			$('#console').append('<br/>CONNECT');
-			ws.send("/usr/local/bin/wordfence malware-scan --no-color --no-banner --verbose /home/wp/public_html/ 2>&1 | websocat -s 2122");
-			//ws.send("/usr/bin/sudo /usr/local/bin/wordfence malware-scan --no-color --no-banner --verbose /home/wptest/public_html/ 2>&1");
-			// ws.send("/usr/bin/sudo /usr/local/bin/wordfence vuln-scan --no-color --no-banner -v --output-format csv /home/wp/public_html/ 2>&1");
-			// shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh > /usr/local/reqad/wordfence.log 2>&1");
-			console.log(ws.readyState);
-			//wp.send("/usr/local/reqad/scripts/wordfence_vuln.sh > /usr/local/reqad/wordfence.log 2>&1");
-			//ws.send("/usr/local/reqad/scripts/wordfence_vuln.sh");
-			//ws.send("tail -f /usr/local/reqad/log/wordfence.log");
-			//ws.send("/usr/bin/sudo find /home/wp/ 2>&1");
-			//ws.send("/usr/bin/sudo journalctl -f");
-			//ws.send("/usr/bin/sudo /usr/local/bin/wordfence vuln-scan --no-color -v --output-format csv /home/wp/public_html/ 2>&1");
-		};
-		ws.onclose = function() {
-			$('#console').append('</br>CONNETION LOST / DISCONNECTED');
-			$('#console').scrollTop($('#console').prop("scrollHeight"));
-			//setInterval(function() {$('#modal-wp-scan').modal("hide") }.bind(this), 5000);
-			console.log(ws.readyState);
-		};
-		ws.onmessage = function(event) {
-			$('#console').append('<br/>'+event.data);
-			$('#console').scrollTop($('#console').prop("scrollHeight"));
-		};
-	});
-
-	$('#wp-scan').on('submit', function (event) {
-		console.log('submit');
-		event.preventDefault();
-		event.stopPropagation();
-//		ws.send("^C ^C ^C ^C close");
-		$('#console').append('<br /><span style="color:#fff">*** closing connection ***</span>');
-		ws.close();
-		$('#submit-btn2').prop('value', 'Stopping ...');
-		$('#submit-btn2').prop('disabled', true);
-		$('#submit-btn2').prop('value', 'Stop and close');
-		$('#submit-btn2').prop('disabled', false);
-		setInterval(function() {
-			$('#modal-wp-scan').modal("hide"); 
-		}.bind(this), 2000);
-	});
-
-	$('#wp-scan').on('hide.bs.modal', function (event) {
-		console.log('hide');
-		//event.preventDefault();
-		//event.stopPropagation();
-		$('#console').append('<br /><span style="color:#fff">*** closing connection ***</span>');
-		if(ws.readyState===WebSocket.CONNECTNG || ws.readyState===WebSocket.OPEN) {
-			ws.close();
-		}
-		//$('#submit-btn2').prop('value', 'Stopping ...');
-		//$('#submit-btn2').prop('disabled', true);
-		//setInterval(function() {
-		//	$('#modal-wp-scan').hide(); 
-		//	$('#wp-scan').hide(); 
-		//}.bind(this), 2000);
-	});
-*/ ?>
 
 });
 </script>

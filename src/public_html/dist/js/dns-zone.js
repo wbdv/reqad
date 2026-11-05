@@ -933,7 +933,9 @@ jQuery(function ($) {
       if (id === 'other') return 'Another provider';
       return MP && MP.providers[id] ? MP.providers[id].name : id;
     }
-    function mpShows(st) { return !st.mx || !st.mx.length ? 'No mail' : (st.provider === 'other' ? st.mx[0].host : mpName(st.provider)); }
+    /* the MX to name: a placeholder one (Outlook.com's personal domains add one under .invalid) says nothing */
+    function mpHost(st) { var real = st.mx.filter(function (m) { return !/\.invalid\.?$/i.test(m.host); })[0]; return (real || st.mx[0]).host; }
+    function mpShows(st) { return !st.mx || !st.mx.length ? 'No mail' : (st.provider === 'other' ? mpHost(st) : mpName(st.provider)); }
     function mpLoad() {
       call('mail').then(function (j) {
         if (!j.ok || !j.data) return;
@@ -1003,7 +1005,7 @@ jQuery(function ($) {
       mpDom = d; mpDone = false;
       PF[0].reset(); showErr(PM, '');
       $('#dz-mp-h').text('Mail provider for ' + d);
-      $('#dz-mp-now').text(!st.mx || !st.mx.length ? 'Now: no MX record' : 'Now: ' + mpName(st.provider) + (st.provider === 'local' || st.provider === 'other' ? ' (' + st.mx[0].host + ')' : ''));
+      $('#dz-mp-now').text(!st.mx || !st.mx.length ? 'Now: no MX record' : 'Now: ' + mpName(st.provider) + (st.provider === 'local' || st.provider === 'other' ? ' (' + mpHost(st) + ')' : ''));
       var box = $('#dz-mp-opts').empty();
       Object.keys(MP.providers).forEach(function (id) {
         box.append($('<label class="dz-opt"></label>').append($('<input type="radio" name="mp">').val(id)).append(logo(id)).append($('<span></span>').text(mpName(id))));

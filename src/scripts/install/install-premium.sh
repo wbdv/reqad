@@ -68,6 +68,7 @@ A_FTP=1
 A_CLAMAV=1
 A_WIREGUARD=0
 A_MINECRAFT=0
+A_IMAV=0
 CLAMAV_SCAN='none'
 
 # server-software.ini switches (they make a feature exist; each is still
@@ -130,6 +131,8 @@ Add-ons (installed unless left out):
 Add-ons (installed only when asked for):
   --wireguard          WireGuard VPN peers                       (reqad-wireguard)
   --minecraft          a Minecraft Java server                   (reqad-minecraft)
+  --imunifyav          malware scanner for the accounts' files   (reqad-imunifyav +
+                       CloudLinux's free ImunifyAV, ~512 MB of memory)
 
 Features (switched on unless left out; each is then turned on in Settings):
   --no-api             REST API
@@ -234,6 +237,7 @@ parse_args() {
                 CLAMAV_SCAN=$2; shift 2 ;;
             --wireguard)        A_WIREGUARD=1; shift ;;
             --minecraft)        A_MINECRAFT=1; shift ;;
+            --imunifyav)        A_IMAV=1; shift ;;
 
             --no-api)           F_API=0; shift ;;
             --no-mcp)           F_MCP=0; shift ;;
@@ -722,7 +726,7 @@ _segments() {
 # is cursor value ${#ITEMS[@]}, below the scrolling part.
 ITEMS=(
     h:base base template php phpx remi email sshport sshkey tz adminmail skipupd
-    h:addons account hosting modsec ftp clamav clamscan wireguard minecraft
+    h:addons account hosting modsec ftp clamav clamscan imav wireguard minecraft
     h:features api mcp deploy dnscluster
 )
 N_ITEMS=${#ITEMS[@]}
@@ -817,6 +821,7 @@ form_init() {
         rpm -q --quiet reqad-clamav       && { I_CLAMAV=1;    A_CLAMAV=1; }
         rpm -q --quiet reqad-wireguard    && { I_WIREGUARD=1; A_WIREGUARD=1; }
         rpm -q --quiet reqad-minecraft    && { I_MINECRAFT=1; A_MINECRAFT=1; }
+        rpm -q --quiet reqad-imunifyav    && { I_IMAV=1;      A_IMAV=1; }
         [ "$(ini_get dnscluster)" == "1" ] && F_DNSCLUSTER=1
     fi
     cursor=0
@@ -835,6 +840,7 @@ _item_var() {
         clamav)     R_VAR=A_CLAMAV ;;
         wireguard)  R_VAR=A_WIREGUARD ;;
         minecraft)  R_VAR=A_MINECRAFT ;;
+        imav)       R_VAR=A_IMAV ;;
         api)        R_VAR=F_API ;;
         mcp)        R_VAR=F_MCP ;;
         deploy)     R_VAR=F_DEPLOY ;;
@@ -853,6 +859,7 @@ _item_installed() {
         clamav)    [ -n "$I_CLAMAV" ] ;;
         wireguard) [ -n "$I_WIREGUARD" ] ;;
         minecraft) [ -n "$I_MINECRAFT" ] ;;
+        imav)      [ -n "$I_IMAV" ] ;;
         *)         return 1 ;;
     esac
 }
@@ -894,6 +901,7 @@ _item_label() {
         clamscan)   R_LABEL='ClamAV scan' ;;
         wireguard)  R_LABEL='WireGuard' ;;
         minecraft)  R_LABEL='Minecraft' ;;
+        imav)       R_LABEL='ImunifyAV' ;;
         api)        R_LABEL='REST API' ;;
         mcp)        R_LABEL='AI assistants' ;;
         deploy)     R_LABEL='Deployments' ;;
@@ -985,6 +993,7 @@ _item_desc() {
             esac ;;
         wireguard) R_DESC='WireGuard VPN peers, managed from the panel (reqad-wireguard).' ;;
         minecraft) R_DESC='A Minecraft Java server, managed from the panel (reqad-minecraft).' ;;
+        imav)      R_DESC="Malware scanner for the accounts' files: CloudLinux's free ImunifyAV (reqad-imunifyav)." ;;
         api)       R_DESC='REST API: it stays off until turned on in Settings > API access.' ;;
         mcp)       R_DESC='AI assistants over SSH (MCP): off until turned on in Settings > AI access.' ;;
         deploy)    R_DESC='Git deployments and Node.js / Python apps (Accounts > Deployments).' ;;
@@ -1765,6 +1774,20 @@ install_addons() {
         result "ClamAV" "left out"
     fi
 
+    if [ "$A_IMAV" -eq 1 ]; then
+        # the add-on, then CloudLinux's agent through it (its installer, a few minutes)
+        if addon "Malware scanner" reqad-imunifyav; then
+            if rpm -q --quiet imunify-antivirus; then
+                say "ImunifyAV" OK "already installed"
+            elif "${RPATH}/bin/reqad" imav install >> "$LOG" 2>&1; then
+                say "ImunifyAV" DONE
+                result "ImunifyAV" "installed: Settings > Malware scanner"
+            else
+                say "ImunifyAV" ERROR "see ${LOG}; install it later on Settings > Malware scanner"
+                result "ImunifyAV" "FAILED (see ${LOG})"
+            fi
+        fi
+    fi
     [ "$A_WIREGUARD" -eq 1 ] && addon "WireGuard" reqad-wireguard
     [ "$A_MINECRAFT" -eq 1 ] && addon "Minecraft" reqad-minecraft
     return 0
@@ -1857,6 +1880,7 @@ print_plan() {
     [ "$A_CLAMAV" -eq 1 ]    && list+=" clamav(scan:${CLAMAV_SCAN})"
     [ "$A_WIREGUARD" -eq 1 ] && list+=" wireguard"
     [ "$A_MINECRAFT" -eq 1 ] && list+=" minecraft"
+    [ "$A_IMAV" -eq 1 ]      && list+=" imunifyav"
     printf "  add-ons      %s\n" "${list:- none}"
     printf "  features      api=%s mcp=%s deployments=%s dnscluster=%s\n\n" "$F_API" "$F_MCP" "$F_DEPLOY" "$F_DNSCLUSTER"
 }

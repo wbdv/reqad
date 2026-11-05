@@ -24,8 +24,16 @@ if (!is_file($db_path)) {
 $db    = new SQLite3($db_path);
 $today = date('Y-m-d');
 
+$db->busyTimeout(15000);
+/* rows first: the checks below run commands, and an open read would keep
+   the panel database locked for other writers meanwhile */
+$rows = array();
 $results = $db->query('SELECT * FROM autoresponders');
-while ($row = $results->fetchArray(SQLITE3_ASSOC)) {
+while ($results && ($row = $results->fetchArray(SQLITE3_ASSOC)))
+    $rows[] = $row;
+if ($results)
+    $results->finalize();
+foreach ($rows as $row) {
     $user   = $row['user'];
     $domain = $row['domain'];
 

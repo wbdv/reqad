@@ -931,32 +931,6 @@
         exit;
     }
 
-	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-wp-scan' && isset($_POST["user"])) {
-        $user = trim($_POST["user"]);
-		#echo "User:".$user."\n";
-		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ajax-wp-scan $user\n", 3, '../log/debug_log');
-		#echo "/usr/local/bin/wordfence malware-scan --no-color --no-banner --verbose /home/wp/public_html/ 2>&1 | websocat -s 2122";
-		#shell_exec("/usr/local/bin/wordfence malware-scan --no-color --no-banner --verbose /home/wp/public_html/ 2>&1 | websocat -s 2122 &");
-		/* Empty $user means "scan everything"; anything else must be a real
-		   account name before it becomes a script argument. */
-		if($user != '' && !valid_username($user)) {
-			echo "Invalid user.";
-			exit;
-		}
-		$q_user = escapeshellarg($user);
-		if($user == '') {
-			$output = shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $q_user");
-			echo $output;
-		} else {
-			shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $q_user > /usr/local/reqad/wordfence.log 2>&1");
-		}
-		#$output = shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $user 2>&1");
-		#echo("/usr/local/reqad/scripts/wordfence_vuln.sh $user\n");
-		#shell_exec("/usr/local/reqad/scripts/wordfence_vuln.sh $user");
-		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ajax-wp-scan // $output\n", 3, '../log/debug_log');
-		exit;
-	}
-
 	/* WP Toolkit "Rescan Wordpress" — run scripts/scan_for_wordpress (root-only,
 	   upserts the wordpress table) detached, so a slow wp-cli sweep over many
 	   accounts never holds the request open. The log doubles as the job state:
@@ -1120,11 +1094,37 @@
 		exit;
 	}
 
+	/* MySQLTuner report: a background job like the PHP install. The plain-text
+	   output streams into the page through ajax-php-modules-status and is kept
+	   as reports/mysqltuner.txt (the page colours the [OK] / [!!] / [--] marks).
+	   One run at a time: a second click gets the running job back. */
 	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-mysqltuner') {
-		error_log(date("Y-m-d H:i:s").substr((string)microtime(), 1, 8)." ".$_SERVER["REMOTE_ADDR"]." ajax-mysqltuner\n", 3, '../log/debug_log');
-		#shell_exec("sudo /root//mysqltuner.pl | /usr/local/bin/terminal-to-html > /usr/local/reqad/reports/mysqltuner.html 2>&1");
-		shell_exec("sudo mysqltuner --color | terminal-to-html > /usr/local/reqad/reports/mysqltuner.html");
-		echo "OK";
+		header('Content-Type: application/json');
+		$state = '/tmp/reqad_mysqltuner.job';
+		$prev  = is_file($state) ? trim((string)@file_get_contents($state)) : '';
+		if(preg_match('/^[a-f0-9]{16}$/', $prev)) {
+			$plog = "/tmp/reqad_job_{$prev}.log";
+			if(is_file($plog) && time() - filemtime($plog) < 600
+			   && strpos((string)@file_get_contents($plog), '###DONE:') === false) {
+				echo json_encode(['job_id' => $prev, 'running' => true]);
+				exit;
+			}
+		}
+		$job_id   = bin2hex(random_bytes(8));
+		$log_file = "/tmp/reqad_job_{$job_id}.log";
+		$sh_file  = "/tmp/reqad_job_{$job_id}.sh";
+		$out      = _PATH . '/reports/mysqltuner.txt';
+		$script  = "#!/bin/bash\nEXIT=0\ntrap 'echo \"###DONE:\$EXIT###\"' EXIT\n";
+		$script .= "OUT=" . escapeshellarg($out) . "\n";
+		$script .= "sudo -n mysqltuner --nocolor 2>&1 | tee \"\$OUT.new\"\n";
+		$script .= "[ \${PIPESTATUS[0]} -eq 0 ] || EXIT=1\n";
+		$script .= "if [ \$EXIT -eq 0 ]; then mv -f \"\$OUT.new\" \"\$OUT\"; else rm -f \"\$OUT.new\"; fi\n";
+		$script .= "rm -f " . escapeshellarg($sh_file) . "\n";
+		file_put_contents($sh_file, $script);
+		chmod($sh_file, 0700);
+		file_put_contents($state, $job_id);
+		shell_exec("nohup bash " . escapeshellarg($sh_file) . " >> " . escapeshellarg($log_file) . " 2>&1 &");
+		echo json_encode(['job_id' => $job_id]);
 		exit;
 	}
 
@@ -1830,11 +1830,19 @@
 		if($test !== 'ok') { echo json_encode(['error' => 'SSH connection failed: '.$test]); exit; }
 
 		list($acct_data, $res_data) = transfer_whmapi($ssh, [
-			'listaccts want=user,domain,owner,plan,ip,ipv6,suspended,diskused,startdate',
+			'listaccts want=user,domain,owner,plan,ip,ipv6,suspended,diskused,startdate,email',
 			'listresellers',
 		]);
+		/* cPanel DNSONLY has no accounts (listaccts fails), only zones: it is
+		   offered with an empty list, for its DNS zones */
+		$dnsonly = false;
 		if($acct_data === null) {
-			echo json_encode(['error' => 'Connected, but whmapi1 did not answer. Is this a cPanel server, and is the SSH user root?']); exit;
+			list($zone_data) = transfer_whmapi($ssh, ['listzones']);
+			if($zone_data === null) {
+				echo json_encode(['error' => 'Connected, but whmapi1 did not answer. Is this a cPanel server, and is the SSH user root?']); exit;
+			}
+			$dnsonly = true;
+			$acct_data = ['acct' => []];
 		}
 		$resellers = array_values(array_filter((array)($res_data['reseller'] ?? []), 'is_string'));
 
@@ -1862,6 +1870,9 @@
 				'suspended'   => (int)($a['suspended'] ?? 0),
 				'diskused'    => (string)($a['diskused'] ?? ''),
 				'is_reseller' => in_array($u, $resellers, true),
+				// the first contact address (a reseller's sign-in codes go there by default)
+				'email'       => (string)(array_values(array_filter(preg_split('/[\s,;]+/', strtolower((string)($a['email'] ?? '')), -1, PREG_SPLIT_NO_EMPTY),
+				                   function($e) { return filter_var($e, FILTER_VALIDATE_EMAIL) && strlen($e) <= 254; }))[0] ?? ''),
 				'user_here'   => isset($local_users[$u]),
 				'domain_here' => $local_domains[$dom] ?? '',
 			];
@@ -1874,7 +1885,9 @@
 			'server'    => $server,
 			'port'      => $port,
 			'ruser'     => $ruser,
-			'warning'   => $host_known ? '' : "Host '{$server}' was not in known_hosts and has been added automatically. Verify the server fingerprint if this is the first connection.",
+			'dnsonly'   => $dnsonly,
+			'warning'   => trim(($dnsonly ? 'This server has no hosting accounts (cPanel DNSONLY): only its DNS zones can be copied (DNS zones button). ' : '')
+			                    .($host_known ? '' : "Host '{$server}' was not in known_hosts and has been added automatically. Verify the server fingerprint if this is the first connection.")),
 		]);
 		exit;
 	}
@@ -1946,6 +1959,25 @@
 		$r = transfer_job_start(['server' => trim($_POST['server'] ?? ''), 'port' => (int)($_POST['port'] ?? 22), 'ruser' => trim($_POST['ruser'] ?? 'root')],
 		                        $accounts, array_map('strval', (array)($_POST['parts'] ?? [])),
 		                        (array)json_decode((string)($_POST['php_map'] ?? '{}'), true));
+		echo json_encode($r['ok'] ? ['id' => $r['data']['id']] : ['error' => $r['error']]);
+		exit;
+	}
+
+	// Transfer tool: every DNS zone on the cPanel server (its accounts' and the rest)
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-zones') {
+		header('Content-Type: application/json');
+		$ssh = transfer_ssh(trim($_POST["server"] ?? ''), (int)($_POST["port"] ?? 22), trim($_POST["ruser"] ?? 'root'), $err);
+		if($err !== '') { echo json_encode(['error' => $err]); exit; }
+		$r = transfer_zones($ssh);
+		echo json_encode($r['ok'] ? $r['data'] : ['error' => $r['error']]);
+		exit;
+	}
+
+	// Transfer tool: copy the chosen DNS zones here (a background job)
+	if(isset($_POST["action"]) && $_POST["action"] == 'ajax-transfer-zones-start') {
+		header('Content-Type: application/json');
+		$zones = array_values(array_filter(array_map('strval', (array)json_decode((string)($_POST['zones'] ?? '[]'), true)), 'strlen'));
+		$r = transfer_zones_start(['server' => trim($_POST['server'] ?? ''), 'port' => (int)($_POST['port'] ?? 22), 'ruser' => trim($_POST['ruser'] ?? 'root')], $zones);
 		echo json_encode($r['ok'] ? ['id' => $r['data']['id']] : ['error' => $r['error']]);
 		exit;
 	}
@@ -2251,7 +2283,7 @@
         if(!webmail_autologin_enabled()) { echo json_encode(array('error' => 'Webmail auto-login is not enabled.')); exit; }
         $token = webmail_ticket_create($_POST["email"]);
         if($token === '') { echo json_encode(array('error' => 'No such mailbox.')); exit; }
-        echo json_encode(array('ok' => true, 'token' => $token, 'url' => '/webmail/'));
+        echo json_encode(array('ok' => true, 'token' => $token, 'url' => webmail_url() ?: '/webmail/'));
         exit;
     }
 

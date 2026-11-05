@@ -879,9 +879,27 @@ function mail_dns_check($domain) {
 	return $r[strtolower($domain)] ?? null;
 }
 
+/* After a fresh check (the Deliverability page, a fix): update the stored
+   mail_dns health items of these domains at once, so Needs attention and
+   the menu badges do not wait for the next health run. $checks: domain =>
+   mail_dns_check() result. */
+function mail_dns_health_refresh(array $checks) {
+	global $db;
+	if (!function_exists('health_item_refresh'))
+		return;
+	$ud = email_userdomains();
+	foreach ($checks as $d => $c) {
+		$user = $ud[$d] ?? '';
+		if ($user !== '' && is_array($c))
+			health_item_refresh($db, 'mail_dns:'.$user.':'.$d, health_mail_dns_item($user, $d, $c));
+	}
+}
+
 /* Add the missing mail records of $domain at the server's DNS provider: MX
    (when there is none), SPF, DKIM (also when it does not match this server's
-   key while mail comes here), DMARC. Records that are there are left alone. */
+   key while mail comes here), DMARC. Records that are there are left alone.
+   The check returned has 'pending': records written that the domain's name
+   server does not show yet (not offered again, not counted as missing). */
 function mail_dns_fix($domain) {
 	global $db;
 	$domain = strtolower(trim((string)$domain));
@@ -905,7 +923,24 @@ function mail_dns_fix($domain) {
 	route_log("mail dns fix $domain: ".implode(', ', $done).($errs ? ' / failed: '.implode('; ', $errs) : ''));
 	if ($done)
 		plugin_hook('mail_dns.fixed', array('domain' => $domain, 'records' => $done));
+	/* the name server asked may answer from before the change for a few
+	   seconds (a secondary still waiting for its copy, the provider's own
+	   delay): ask again a few times, then trust what was written, so the
+	   page does not offer the same fix again */
+	$added = array_map('strtolower', $done);
 	$after = mail_dns_check($domain);
+	for ($i = 0; $i < 3 && array_intersect($added, $after['fixable']); $i++) {
+		sleep(2);
+		$after = mail_dns_check($domain);
+	}
+	$after['pending'] = array_values(array_intersect($added, $after['fixable']));
+	foreach ($after['pending'] as $k) {
+		$after['checks'][$k] = array('state' => 'info', 'text' => 'Added. '.($after['ns'] !== '' ? $after['ns'] : 'The domain\'s name server')
+			.' does not show it yet: check again in a minute.');
+		$after['missing'] = array_values(array_filter($after['missing'], function ($m) use ($k) { return stripos($m, $k.' ') !== 0; }));
+	}
+	$after['fixable'] = array_values(array_diff($after['fixable'], $after['pending']));
+	mail_dns_health_refresh(array($domain => $after));
 	if (!$done)
 		return result_error('The records could not be added: '.implode('; ', $errs), array('check' => $after));
 	return result_ok('Added for '.$domain.': '.implode(', ', $done).'.', array('check' => $after, 'added' => $done),
@@ -1554,6 +1589,75 @@ function mail_log_grep(array $needles, $ci = true) {
 	return (string)shell_exec('sudo -n cat '.implode(' ', array_map('escapeshellarg', mail_log_files())).' 2>/dev/null | tail -n 300000 | grep -a -F'.($ci ? ' -i' : '').$e.' 2>/dev/null');
 }
 
+/* Dovecot's log (syslog's maillog: the current file and the one before it,
+   when not compressed), for the filter lines of LMTP sessions $sids: per
+   session, stored (folders), forwarded (addresses), discard, reject. Pigeonhole
+   logs only what a filter did ("stored mail into mailbox 'X'", "redirect action:
+   forwarded to <X>", "discard action: ...", "reject action: ..."): a session
+   without lines had no filter, or one that did nothing. */
+function mail_log_sieve(array $sids) {
+	$sids = array_values(array_unique(array_filter($sids, function ($s) { return preg_match('~^[A-Za-z0-9+/:]{10,40}$~', $s); })));
+	if (!$sids)
+		return array();
+	$prev = trim((string)shell_exec("sudo -n find /var/log -maxdepth 1 -name 'maillog-*' ! -name '*.gz' -printf '%T@ %p\\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2-"));
+	$files = array_merge($prev !== '' ? array($prev) : array(), array('/var/log/maillog'));
+	$e = '';
+	foreach ($sids as $s)
+		$e .= ' -e '.escapeshellarg('<'.$s.'>: sieve: ');
+	$text = (string)shell_exec('sudo -n cat '.implode(' ', array_map('escapeshellarg', $files)).' 2>/dev/null | grep -a -F'.$e.' 2>/dev/null');
+	$res = array();
+	foreach (explode("\n", $text) as $line) {
+		if (!preg_match('~<([A-Za-z0-9+/:]{10,40})>: sieve: msgid=(?:<[^>]*>|\S+): (.*)$~', $line, $m))
+			continue;
+		$r = &$res[$m[1]];
+		if ($r === null)
+			$r = array('stored' => array(), 'forwarded' => array(), 'discard' => false, 'reject' => false);
+		if (preg_match("~stored mail into mailbox '(.*)'~", $m[2], $t))
+			$r['stored'][] = $t[1];
+		elseif (preg_match('~^redirect action: forwarded to <([^>]*)>~', $m[2], $t))
+			$r['forwarded'][] = $t[1];
+		elseif (strpos($m[2], 'discard action') === 0)
+			$r['discard'] = true;
+		elseif (strpos($m[2], 'reject action') === 0)
+			$r['reject'] = true;
+		unset($r);
+	}
+	return $res;
+}
+
+/* One recipient row of mail_log_search() with what the mailbox's filters did
+   ($sieve: mail_log_sieve()): forwarded = a row per address (via, detail
+   'Forwarded by a filter'), plus the mailbox row while a copy was kept (detail
+   'mailbox', or the folder when not the inbox); deleted = status 'discarded',
+   detail 'Deleted by a filter'; refused = status 'bounced'. */
+function mail_log_filtered(array $x, array $sieve) {
+	$f = isset($x['sess']) ? ($sieve[$x['sess']] ?? null) : null;
+	unset($x['sess']);
+	if ($f === null)
+		return array($x);
+	$rows = array();
+	foreach (array_unique($f['forwarded']) as $a)
+		$rows[] = array('to' => $x['to'], 'via' => $a, 'status' => 'delivered', 'time' => $x['time'], 'detail' => 'Forwarded by a filter');
+	$stored = array_values(array_unique($f['stored']));
+	if ($stored) {
+		$other = array_values(array_filter($stored, function ($b) { return strcasecmp($b, 'INBOX') !== 0; }));
+		if ($other)
+			$x['detail'] = 'Put in the folder '.implode(', ', $other).' by a filter';
+		array_unshift($rows, $x);
+	} elseif ($f['reject']) {
+		$x['status'] = 'bounced';
+		$x['detail'] = 'Refused by a filter';
+		array_unshift($rows, $x);
+	} elseif (!$rows && $f['discard']) {
+		$x['status'] = 'discarded';
+		$x['detail'] = 'Deleted by a filter';
+		$rows[] = $x;
+	} elseif (!$rows) {
+		$rows[] = $x;
+	}
+	return $rows;
+}
+
 /*
  * Messages in the delivery log, newest first.
  *   $domains  only messages to or from these domains (null = all: server only)
@@ -1561,9 +1665,10 @@ function mail_log_grep(array $needles, $ci = true) {
  *   $limit    at most this many messages (1-200)
  * Returns array(messages => [{id, time, from, subject, size, spam (score or
  * null), spam_flag, direction (in|out|local), recipients: [{to, via (where a
- * forwarder sent it), status (delivered|deferred|bounced|discarded (no mailbox
- * or forwarder has the address)|refused|waiting),
- * time, detail}]}], refused => [{time, from, to, host, reason}] (refused
+ * forwarder or a mailbox's filter sent it), status (delivered|deferred|bounced|
+ * discarded (no mailbox or forwarder has the address, or detail 'Deleted by a
+ * filter')|refused|waiting), time, detail ('mailbox', a filter's doing, or the
+ * receiving server's answer)}]}], refused => [{time, from, to, host, reason}] (refused
  * before the message was taken), since (the oldest line read)).
  */
 function mail_log_search($domains, $search = '', $limit = 50) {
@@ -1600,6 +1705,7 @@ function mail_log_search($domains, $search = '', $limit = 50) {
 	$refused = array_reverse(array_slice($refused, -$limit));
 	$ids = array_slice(array_keys($ids), -$limit);
 	$msgs = array();
+	$sess = '';
 	if ($ids) {
 		foreach (explode("\n", mail_log_grep($ids, false)) as $line) {
 			if (!preg_match('/^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\S* (?:\[\d+\] )?('.$idre.') (.*)$/', $line, $m) || !in_array($m[2], $ids, true))
@@ -1632,6 +1738,9 @@ function mail_log_search($domains, $search = '', $limit = 50) {
 					$st = 'discarded';     // the last router: no mailbox or forwarder has the address
 				} elseif ($st === 'delivered' && preg_match('/ T=\S*(?:local|lmtp|dovecot)/i', $r[4])) {
 					$detail = 'mailbox';    // put in a mailbox on this server
+					/* Dovecot's session id in its reply: its filter lines carry it */
+					if (preg_match('/ C="250 [0-9.]+ <[^>]*> ([A-Za-z0-9+\/:]{10,40}) Saved"/', $r[4], $t))
+						$sess = $t[1];
 				} elseif ($st === 'delivered') {
 					if (preg_match('/ H=(\S+)/', $r[4], $t)) $detail = $t[1];
 					if (preg_match('/ C="((?:[^"\\\\]|\\\\.)*)"/', $r[4], $t)) $detail .= ($detail !== '' ? ': ' : '').stripcslashes($t[1]);
@@ -1642,6 +1751,9 @@ function mail_log_search($domains, $search = '', $limit = 50) {
 				}
 				$key = strtolower($to.'|'.$via);
 				$g['recipients'][$key] = array('to' => $to, 'via' => $via, 'status' => $st, 'time' => $time, 'detail' => substr($detail, 0, 400));
+				if ($sess !== '')
+					$g['recipients'][$key]['sess'] = $sess;
+				$sess = '';
 			} elseif ($rest === 'Completed') {
 				$g['done'] = true;
 			} elseif (preg_match('/SpamAssassin as \S+ detected message as (NOT )?spam \((-?[0-9.]+)\)/', $rest, $r)) {
@@ -1655,6 +1767,13 @@ function mail_log_search($domains, $search = '', $limit = 50) {
 			unset($g);
 		}
 	}
+	/* what the mailboxes' filters did with what Exim put in them */
+	$sids = array();
+	foreach ($msgs as $g)
+		foreach ($g['recipients'] as $x)
+			if (isset($x['sess']))
+				$sids[] = $x['sess'];
+	$sieve = mail_log_sieve($sids);
 	$out = array();
 	foreach ($ids as $id) {
 		if (!isset($msgs[$id]))
@@ -1664,7 +1783,8 @@ function mail_log_search($domains, $search = '', $limit = 50) {
 		$rc = array();
 		foreach ($g['recipients'] as $x)
 			if ($mine || $ours($x['to']) || ($x['via'] !== '' && $ours($x['via'])))
-				$rc[] = $x;
+				foreach (mail_log_filtered($x, $sieve) as $y)
+					$rc[] = $y;
 		$seen = array_map(function ($x) { return strtolower($x['to']); }, $rc);
 		foreach ($g['for'] as $f)
 			if (($mine || $ours($f)) && !in_array(strtolower($f), $seen, true))

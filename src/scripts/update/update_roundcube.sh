@@ -19,10 +19,18 @@ fi
 
 # --- Update nginx webmail location if still using old config ---
 update_nginx_webmail() {
-    local conf
-    conf=$(grep -rl "location /webmail" /etc/reqad/conf.d/ /etc/nginx/conf.d/ 2>/dev/null | grep '\.conf$' | head -1)
+    local conf f
+    # only an old-style block (an alias to Roundcube, no $rc_script): never a
+    # /webmail/ that redirects to webmail's own port (setup_webmail_port.sh)
+    conf=''
+    for f in $(grep -rl "location /webmail" /etc/reqad/conf.d/ /etc/nginx/conf.d/ 2>/dev/null | grep '\.conf$'); do
+        grep -q "rc_script" "$f" && continue
+        grep -q "reqad-webmail-port\|:2096" "$f" && continue
+        grep -q "roundcubemail" "$f" || continue
+        conf=$f
+        break
+    done
     [ -z "$conf" ] && return 0
-    grep -q "rc_script" "$conf" 2>/dev/null && return 0
 
     echo "Updating nginx webmail location in $conf ..."
     python3 - "$conf" <<'PYEOF'
@@ -188,7 +196,7 @@ addition = (sep + "\n    // Sieve filters, shared with Reqad's Email Filters pag
 open(path, 'w').write(src[:m.end()] + inner + addition + src[i:])
 PYEOF
 
-    if ! /usr/bin/php82 -l "$cfg" >/dev/null 2>&1; then
+    if ! /usr/bin/php82 -n -l "$cfg" >/dev/null 2>&1; then
         echo "ERROR: the edited config does not parse — restoring the backup." >&2
         cp -a "$(ls -t "$cfg".bak-* | head -1)" "$cfg"
         return 1

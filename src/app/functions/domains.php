@@ -228,6 +228,11 @@ function domain_sites($account, $certs = true) {
 	$mail = $on ? email_userdomains() : array();
 	$prefs = $on ? domain_mail_prefs($account) : array();
 	$had = $on ? domain_mail_had() : array();
+	$boxes = array();
+	foreach ($on ? mailbox_list() : array() as $m) {
+		$d = substr($m, strrpos($m, '@') + 1);
+		$boxes[$d] = ($boxes[$d] ?? 0) + 1;
+	}
 	$sites = array(array('domain' => $main, 'kind' => 'main', 'subdomain_of' => '', 'docroot' => '/home/'.$account.'/public_html',
 	                     'folder' => '~/public_html', 'www' => in_array('www.'.$main, $aliases, true),
 	                     'aliases' => array_values(array_diff($aliases, array('www.'.$main))), 'created' => (string)($acct['created'] ?? ''),
@@ -249,7 +254,7 @@ function domain_sites($account, $certs = true) {
 		                 'aliases' => array(), 'created' => (string)$a['created'], 'mail' => $has,
 		                 /* on | off (chosen) | missing (should have mail, has none) | '' (the account has no email) */
 		                 'mail_state' => !$on ? '' : ($has ? 'on' : (domain_mail_wanted($d, $sub, $prefs, $had) ? 'missing' : 'off')),
-		                 'cert' => $certs ? domain_cert($d) : null);
+		                 'mailboxes' => $has ? ($boxes[$d] ?? 0) : 0, 'cert' => $certs ? domain_cert($d) : null);
 	}
 	return $sites;
 }
@@ -298,9 +303,13 @@ function domain_cert($domain) {
 		$names = array(strtolower((string)$c['subject']['CN']));
 	$until = (int)$c['validTo_time_t'];
 	$self = ssl_is_self_signed($c);
-	return array('issuer' => $self ? '' : (string)($c['issuer']['O'] ?? ($c['issuer']['CN'] ?? '')), 'until' => $until,
-	             'expired' => $until < time(), 'self_signed' => $self,
-	             'lets_encrypt' => strpos((string)$c['_file'], '/etc/letsencrypt/') === 0, 'names' => $names);
+	$cert = array('issuer' => $self ? '' : (string)($c['issuer']['O'] ?? ($c['issuer']['CN'] ?? '')), 'until' => $until,
+	              'expired' => $until < time(), 'self_signed' => $self,
+	              'lets_encrypt' => strpos((string)$c['_file'], '/etc/letsencrypt/') === 0, 'names' => $names);
+	/* how it renews (app/functions/ssl_renew.php): certbot | auto | manual | '' */
+	$cert['renew'] = ssl_renew_kind($cert);
+	$cert['renew_at'] = ssl_renew_at($cert, $cert['renew']);
+	return $cert;
 }
 
 /* Is $name covered by a certificate for $names (exactly, or by a *.x)? */
@@ -361,6 +370,47 @@ function domain_dns_remove($account, $name) {
 		return '';
 	$r = dns_rrset_set($name, 'A', array());
 	return $r === '' ? 'removed' : '';
+}
+
+/* The DNS of a site that was removed. Its own zone at the DNS provider (the
+   zone named exactly $domain) goes too, unless something still on this
+   server is in it: another site, alias or mail domain of any account (a
+   subdomain site of $domain; $domain's own mail when it stays), the
+   server's name or a name server the zones name. Otherwise, or when there is no such zone, only the A records of
+   $domain, www (and mail with $mail) that still point only here go.
+   array(zone: 'removed' | 'kept' | '' (none), keep: the name that kept it,
+   error: the provider's refusal). */
+function domain_dns_forget($account, $domain, $mail = false) {
+	global $db, $ini;
+	$out = array('zone' => '', 'keep' => '', 'error' => '');
+	$zones = dns_managed() && dns_provider_load($db) !== 'none' && function_exists('get_zones') ? get_zones() : null;
+	if (is_array($zones) && isset($zones[$domain]) && !isset(dns_key_zone_map()[$domain])) {
+		/* read fresh: dns_owner_map() is kept for the process and may predate the removal */
+		$names = array_merge(array_keys(email_userdomains()), array_keys(addon_domain_list($ini)),
+		                     array((string)gethostname()), dns_expected_nameservers(''), dns_expected_nameservers($domain));
+		$res = $db->query('SELECT domain AS n FROM accounts UNION SELECT alias FROM aliases WHERE is_wildcard = 0');
+		while ($res && ($r = $res->fetchArray(SQLITE3_ASSOC)))
+			$names[] = (string)$r['n'];
+		foreach ($names as $n) {
+			$n = dns_host_canon($n);
+			if ($n === $domain || substr($n, -strlen($domain) - 1) === '.'.$domain) {
+				$out['keep'] = $n;
+				break;
+			}
+		}
+		if ($out['keep'] === '') {
+			$r = dns_zone_delete($domain);
+			if ($r['ok']) {
+				$out['zone'] = 'removed';
+				return $out;
+			}
+			$out['error'] = $r['error'];
+		}
+		$out['zone'] = 'kept';
+	}
+	foreach (array_merge(array($domain, 'www.'.$domain), $mail ? array('mail.'.$domain) : array()) as $n)
+		domain_dns_remove($account, $n);
+	return $out;
 }
 
 /* A note for a new name that does not point here yet ('' when it does). */
@@ -629,8 +679,9 @@ function domain_mail_dns_off($account, $domain, array &$warn) {
 
 /* An addon site's mail goes with the site: its userdomains line, exim files,
    DKIM keys, domain filters and autoresponder rows. Mailboxes are not
-   deleted here (domain_addon_delete() refuses while there are any) except
-   with $mailboxes, when the whole account goes. */
+   deleted here (domain_addon_delete() refuses while there are any, unless
+   asked to delete them) except with $mailboxes: their /etc/dovecot/users
+   lines go, their Maildirs stay. */
 function domain_mail_remove($account, $domain, $mailboxes = false) {
 	global $db;
 	if ((email_userdomains()[$domain] ?? '') === $account)
@@ -754,9 +805,11 @@ function domain_addon_add($account, $domain, $folder = '', $www = null, $mail = 
 
 /* Remove an addon domain or subdomain of the account: its vhost, PHP pool
    and certificate; its folder too with $files (not when another site still
-   uses it). */
-function domain_addon_delete($account, $domain, $files = false) {
-	global $ini;
+   uses it). Refused while it has mailboxes, unless $mailboxes: then their
+   addresses go too (dovecot, exim, their filters and autoresponders), and
+   their mail stays in ~/mail/<domain> unless $mail_files. */
+function domain_addon_delete($account, $domain, $files = false, $mailboxes = false, $mail_files = false) {
+	global $db, $ini;
 	$domain = strtolower(trim((string)$domain));
 	$a = addon_domain_get($ini, $domain);
 	if (!$a || $a['user'] !== $account)
@@ -765,11 +818,13 @@ function domain_addon_delete($account, $domain, $files = false) {
 		return result_error("$domain is deployed from Git; remove its deployment first.");
 	if (function_exists('app_get') && app_get($domain))
 		return result_error("$domain runs an app; remove the app first.");
+	$owner = email_userdomains()[$domain] ?? '';
 	$boxes = domain_mailboxes($domain);
-	if ($boxes)
+	if ($boxes && (!$mailboxes || ($owner !== '' && $owner !== $account)))
 		return result_error(count($boxes) === 1
 			? "$domain still has the mailbox {$boxes[0]}. Delete it in Email first, or keep the site."
-			: "$domain still has ".count($boxes)." mailboxes. Delete them in Email first, or keep the site.");
+			: "$domain still has ".count($boxes)." mailboxes. Delete them in Email first, or keep the site.",
+			$owner === '' || $owner === $account ? array('code' => 'mailboxes', 'mailboxes' => count($boxes)) : array());
 	$home = '/home/'.$account;
 	$docroot = rtrim((string)$a['docroot'], '/');
 	$folder = strpos($docroot, $home.'/') === 0 ? substr($docroot, strlen($home) + 1) : '';
@@ -784,7 +839,7 @@ function domain_addon_delete($account, $domain, $files = false) {
 				return result_error(domain_tilde($docroot, $account)." also holds the files of {$s['domain']}. Remove $domain without its files.");
 		}
 	}
-	route_log("account $account: remove site $domain".($files ? " with $docroot" : ''));
+	route_log("account $account: remove site $domain".($files ? " with $docroot" : '').($boxes ? ' and its '.count($boxes).' mailboxes' : ''));
 	$out = (string)shell_exec('sudo -n '._PATH.'/scripts/deldomain --domain='.escapeshellarg($domain).' --delete-cert 2>&1');
 	if (is_file(addon_vhost_path($ini, $domain))) {
 		$why = preg_match_all('/^Error:\s*(.+)$/m', $out, $m) ? trim(end($m[1])) : '';
@@ -800,12 +855,39 @@ function domain_addon_delete($account, $domain, $files = false) {
 			$warn[] = 'Its files were not all deleted: '.$r['error'];
 	} else
 		$msg = "$domain removed. Its files stay in ".domain_tilde($docroot, $account).'.';
-	$owner = email_userdomains()[$domain] ?? '';
 	$mail = $owner === $account;
+	foreach ($boxes as $m)
+		foreach (ef_purge_mailbox($db, $m) as $line)
+			route_log("delete email $m: $line");
 	if ($mail || ($owner === '' && email_domain_exists($domain)))
-		domain_mail_remove($account, $domain);
-	foreach (array_merge(array($domain, 'www.'.$domain), $mail ? array('mail.'.$domain) : array()) as $n)
-		domain_dns_remove($account, $n);
+		domain_mail_remove($account, $domain, (bool)$boxes);
+	elseif ($boxes)
+		shell_exec('sudo -n sed -i '.escapeshellarg('/^[^:]*@'.sed_bre_escape($domain).':/d').' /etc/dovecot/users');
+	foreach ($boxes as $m)
+		plugin_hook('mailbox.deleted', array('email' => $m));
+	if ($boxes)
+		mailbox_list(true);
+	$maildir = 'mail/'.$domain;
+	$gone = false;
+	if ($mail_files) {
+		$r = files_delete($account, array($maildir));
+		$gone = $r['ok'];
+		if (!$r['ok'] && $r['error'] !== 'There is no such file or folder.')
+			$warn[] = "~/$maildir was not all deleted: ".$r['error'];
+	}
+	if ($boxes)
+		$msg .= ' '.(count($boxes) === 1 ? "Its mailbox {$boxes[0]} was deleted" : 'Its '.count($boxes).' mailboxes were deleted')
+		       .($gone ? ', with the mail in ~/'.$maildir.'.' : ($mail_files ? '.' : "; the mail stays in ~/$maildir."));
+	elseif ($gone)
+		$msg .= " ~/$maildir was deleted.";
+	$dns = domain_dns_forget($account, $domain, $mail);
+	if ($dns['zone'] === 'removed')
+		$msg .= " Its DNS zone was removed.";
+	elseif ($dns['error'] !== '')
+		$warn[] = "Its DNS zone was not removed: ".$dns['error'];
+	elseif ($dns['zone'] === 'kept')
+		$msg .= $dns['keep'] === $domain ? " Its DNS zone stays: its email is still on this server."
+		                                 : " Its DNS zone stays, because {$dns['keep']} is still on this server.";
 	domain_mail_forget($domain);
 	wp_cache_rules_forget($domain);
 	plugin_hook('addon.deleted', array('account' => $account, 'domain' => $domain, 'files' => (bool)$files));
@@ -918,6 +1000,7 @@ function domain_alias_delete($account, $alias) {
    cover); with $check also points (domain_points() of the names). */
 function ssl_sites($account, $check = false) {
 	$out = array();
+	$free = $state = null;
 	foreach (domain_sites($account) as $s) {
 		list($names, $wild) = domain_site_cert_names($account, $s);
 		$have = $s['cert'] && !$s['cert']['self_signed'] && !$s['cert']['expired'] ? $s['cert']['names'] : array();
@@ -925,7 +1008,18 @@ function ssl_sites($account, $check = false) {
 		foreach (array_merge($names, $wild) as $n)
 			if (!domain_cert_covers($have, $n))
 				$missing[] = $n;
-		$out[] = array('domain' => $s['domain'], 'kind' => $s['kind'], 'subdomain_of' => $s['subdomain_of'], 'cert' => $s['cert'],
+		$c = $s['cert'];
+		/* a free certificate from elsewhere is replaced only when the package gives free ones */
+		if ($c && $c['renew'] === 'auto') {
+			if ($free === null)
+				$free = ssl_free_error($account) === '';
+			if (!$free) {
+				$c['renew'] = 'manual';
+				$c['renew_at'] = 0;
+			} else
+				$c['renew_error'] = (string)(($state ?? ($state = ssl_renew_state()))[$s['domain']]['e'] ?? '');
+		}
+		$out[] = array('domain' => $s['domain'], 'kind' => $s['kind'], 'subdomain_of' => $s['subdomain_of'], 'cert' => $c,
 		               'names' => $names, 'wildcards' => $wild, 'missing' => $missing);
 	}
 	if ($check) {

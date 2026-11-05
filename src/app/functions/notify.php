@@ -281,6 +281,53 @@ function account_contact_import($user, $email) {
 	return result_ok('', array('email' => $email, 'kept' => false));
 }
 
+/* Is $email ('' = none) one the admin may set as a contact address: '' or the error */
+function account_contact_error($email) {
+	$email = strtolower(trim((string)$email));
+	if ($email !== '' && (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 254))
+		return 'The contact email '.$email.' is not a valid email address.';
+	return '';
+}
+
+/*
+ * The server admin sets (or with '' removes) the contact address of $user:
+ * the admin typed it, so it counts as confirmed - no code, and no message to
+ * the old or new address (account_contact_tell_old() is for changes made in
+ * the account's own panel). The kinds of message stay as they are.
+ */
+function account_contact_set($user, $email) {
+	if (!auth_ready())
+		return result_error('The login tables are missing (db 1037).');
+	$email = strtolower(trim((string)$email));
+	if (($e = account_contact_error($email)) !== '')
+		return result_error($e);
+	$p = auth_principal($user, 'account');
+	$old = $p ? (string)$p['email'] : '';
+	if ($email === $old)
+		return result_ok('', array('email' => $old, 'changed' => false));
+	if (!$p) {
+		auth_q("INSERT OR IGNORE INTO auth_principals (type, username, pw_hash, email, created_at)
+		        VALUES ('account', :u, '', '', :ts)", array('u' => (string)$user, 'ts' => time()));
+		$p = auth_principal($user, 'account');
+		if (!$p)
+			return result_error('The account\'s panel login could not be made.');
+	}
+	auth_q('UPDATE auth_principals SET email = :e WHERE id = :id', array('e' => $email, 'id' => (int)$p['id']));
+	auth_log_event('contact_changed', ($email !== '' ? $email : '(removed)').' (by the server admin)', (int)$p['id'], $user);
+	plugin_hook('account.contact_changed', array('account' => $user, 'email' => $email, 'old' => $old));
+	return result_ok('', array('email' => $email, 'changed' => true));
+}
+
+/* user => contact address, for every account that has one (one query, for lists) */
+function account_contacts() {
+	if (!function_exists('auth_ready') || !auth_ready())
+		return array();
+	$out = array();
+	foreach (auth_rows("SELECT username, email FROM auth_principals WHERE type = 'account' AND email != ''") as $r)
+		$out[$r['username']] = (string)$r['email'];
+	return $out;
+}
+
 /* Tell the address that was replaced ($new) or removed ($new = '') - always,
    whatever kinds of message it had chosen. The new one is shown masked. */
 function account_contact_tell_old($user, $old, $new) {

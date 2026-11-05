@@ -25,10 +25,18 @@ if ($errmsg == '') {
 	if (is_file(addon_vhost_path($ini, $domain)))
 		$errmsg = "Error: Addon domain ".$domain." could not be removed: ".trim((string)$output);
 	else {
+		$dns = domain_dns_forget($addon['user'], $domain);
 		domain_mail_forget($domain);
 		wp_cache_rules_forget($domain);
 		plugin_hook('addon.deleted', array('account' => $addon['user'], 'domain' => $domain, 'files' => $del_docroot));
 		$successmsg = "Addon domain ".$domain." was removed".($del_docroot ? ", together with its document root." : ". Its files in ".$addon['docroot']." were kept.");
+		if ($dns['zone'] === 'removed')
+			$successmsg .= " Its DNS zone was removed.";
+		elseif ($dns['error'] !== '')
+			$successmsg .= " Its DNS zone was not removed: ".$dns['error'];
+		elseif ($dns['zone'] === 'kept')
+			$successmsg .= $dns['keep'] === $domain ? " Its DNS zone stays: its email is still on this server."
+			                                        : " Its DNS zone stays, because ".$dns['keep']." is still on this server.";
 	}
 }
 

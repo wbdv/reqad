@@ -59,11 +59,18 @@
 	#dz-page .dz-filter input, #dz-page .dz-filter select { font-size: 10pt; padding: 5px 8px; }
 	#dz-page .dz-q { position: relative; }
 	#dz-page .dz-q button { display: none; position: absolute; right: 7px; top: 50%; transform: translateY(-50%); background: none; border: none; padding: 0; color: #aaa; font-size: 15px; line-height: 1; cursor: pointer; }
+	/* room for the clear button, and no second (browser's own) one */
+	#dz-page .dz-q input { padding-right: 26px; }
+	#dz-page .dz-q input::-webkit-search-cancel-button { -webkit-appearance: none; display: none; }
+	/* the zone filter is moved 8px left (its text lines up with the zones), so its button too */
+	#dz-page #dz-q + button { right: 15px; }
 	#dz-page .dz-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 	#dz-page .dz-shimmer { display: inline-block; width: 60px; height: 9px; border-radius: 4px; background: linear-gradient(90deg, #eef1f5 25%, #f8f9fb 50%, #eef1f5 75%); background-size: 200% 100%; animation: dzsh 1.2s infinite; }
 	@keyframes dzsh { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
 	/* monospaced names: no bold, the label dark and the domain grey */
 	#dz-page .dz-name .dz-lbl { color: #1d273b; }
+	/* a very long name is cut (its title has all of it), so the value column keeps its room */
+	#dz-page .dz-name .dz-lbl { display: inline-block; max-width: 36ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 	#dz-page .dz-name .dz-dom { color: #8a94a6; }
 	#dz-page .dz-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 	@media (min-width: 1200px) { #dz-page .dz-grid { grid-template-columns: minmax(0, 1fr) 360px; } }
@@ -98,6 +105,7 @@
 	#dz-page .dz-mp li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid #eef0f3; }
 	#dz-page .dz-mp li:first-child { border-top: 0; }
 	#dz-page .dz-mp .dz-mp-t { flex: 1 1 auto; min-width: 0; font-size: 13px; }
+	#dz-page .dz-mp .dz-mp-t > .text-muted { display: block; overflow-wrap: anywhere; }
 	#dz-page .dz-mp .dz-mp-t b { display: block; font-family: var(--tblr-font-monospace, monospace); font-weight: 400; color: #1d273b; overflow: hidden; text-overflow: ellipsis; }
 	.dz-logo { width: 26px; height: 26px; flex: 0 0 26px; display: inline-flex; align-items: center; justify-content: center; border-radius: 6px; background: #f4f6fa; color: #556; }
 	.dz-logo svg { width: 18px; height: 18px; }
@@ -147,6 +155,7 @@
 		#dz-tbl tbody td.dz-selc { grid-area: sel; padding-right: 12px !important; }
 		#dz-page:not(.dz-selecting) #dz-tbl tbody td.dz-selc { display: none; }
 		#dz-tbl tbody td.dz-name { grid-area: name; white-space: normal; word-break: break-all; }
+		#dz-page #dz-tbl tbody td.dz-name .dz-lbl { display: inline; max-width: none; }
 		#dz-tbl tbody td.dz-type { grid-area: type; padding-right: 10px !important; }
 		#dz-tbl tbody td.dz-ttl { grid-area: ttl; font-size: 12px; }
 		#dz-tbl tbody td.dz-act { grid-area: act; align-self: start; padding-left: 8px !important; }
@@ -162,6 +171,7 @@
 		#dz-list thead tr.dz-filter td:first-child, #dz-list thead tr.dz-filter td[colspan] { display: none; }
 		#dz-list thead tr.dz-filter td:nth-child(2) { flex: 1 1 auto; min-width: 0; }
 		#dz-list thead tr.dz-filter #dz-q { margin: 0 !important; border: 1px solid #dadfe5 !important; }
+		#dz-list thead tr.dz-filter #dz-q + button { right: 7px; }
 		#dz-list tbody tr { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; column-gap: 12px;
 			grid-template-areas: "zn zn zn act" "own recs chk chk"; padding: 10px 16px; border-top: 1px solid rgba(98,105,118,.16); }
 		#dz-list tbody tr:first-child { border-top: 0; }

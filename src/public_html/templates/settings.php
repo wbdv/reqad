@@ -15,6 +15,12 @@
 	$s_telemetry = setting_get('telemetry') !== '0';
 	$s_upd       = auto_update_status();
 	$s_dnf       = dnf_automatic_status();
+	$s_lim       = limits_defaults();
+	$s_lim_use   = limits_defaults_usage();
+	$s_mysql_max = 0;
+	foreach (mysql_rows("SHOW GLOBAL VARIABLES LIKE 'max_connections'") as $l)
+		$s_mysql_max = (int)(explode("\t", $l)[1] ?? 0);
+	$s_mb = function ($mb) { return $mb >= 1024 ? rtrim(rtrim(number_format($mb / 1024, 1), '0'), '.').' GB' : $mb.' MB'; };
 
 	/* systemd prints "Sat 2026-09-12 06:06:17 EEST"; the seconds are noise */
 	$s_nosec = function ($t) { return preg_replace('/(\d\d:\d\d):\d\d/', '$1', $t); };
@@ -53,10 +59,12 @@
 
 <style>
 	/* one card, one row per setting: label column on the left, stacked on phones */
-	#settings .set-row { padding: 1.25rem 0; border-top: 1px solid rgba(98,105,118,.16); }
-	#settings .set-row:first-child { border-top: 0; padding-top: 0; }
-	#settings .set-label { font-weight: 600; padding-top: 2px; }
-	#settings .set-hint { display: block; color: #656d77; font-size: 90%; margin-top: 4px; }
+	#settings .set-row, #default-limits .set-row { padding: 1.25rem 0; border-top: 1px solid rgba(98,105,118,.16); }
+	#settings .set-row:first-child, #default-limits .set-row:first-child { border-top: 0; padding-top: 0; }
+	#settings .set-label, #default-limits .set-label { font-weight: 600; padding-top: 2px; }
+	#settings .set-hint, #default-limits .set-hint { display: block; color: #656d77; font-size: 90%; margin-top: 4px; }
+	#default-limits { scroll-margin-top: 1rem; }
+	#default-limits .lim-field { width: 150px; }
 	/* switches: same geometry as the Email account one, hints lined up under the label text */
 	#settings .form-switch .form-check-input { margin-right: 10px; margin-bottom: 1px; }
 	#settings .form-switch .form-check-label { line-height: 21px; cursor: pointer; }
@@ -132,7 +140,7 @@
 						<span class="form-check-label">Open webmail from every site's <code>/webmail</code> address</span>
 					</label>
 <?php $s_wm_host = webmail_link_host(); ?>
-					<small class="set-hint under-switch"><code>https://example.com/webmail</code> goes to <code>https://<?=h($s_wm_host !== '' ? $s_wm_host : '<hostname>');?>:2087/webmail/</code>, on the sites of accounts with email.</small>
+					<small class="set-hint under-switch"><code>https://example.com/webmail</code> goes to <code>https://<?=h($s_wm_host !== '' ? $s_wm_host : '<hostname>');?>:<?=(int)webmail_port();?>/webmail/</code>, on the sites of accounts with email.</small>
 				</div>
 			</div>
 <?php endif; ?>
@@ -221,6 +229,71 @@
 		</div>
 		<div class="card-footer">
 			<input type="submit" id="submit-btn" class="btn btn-primary" value="Save settings">
+		</div>
+		</div>
+		</form>
+
+		<!-- ─── default limits: their own form, applied to every account on
+		     "Server defaults" (limits_defaults_set(), modules/settings_limits.php) -->
+		<form method="post" action="/" id="default-limits" class="mt-3" autocomplete="off">
+		<input type="hidden" name="action" value="settings-limits">
+		<div class="card">
+		<div class="card-header">
+			<div>
+				<h3 class="card-title">Default limits</h3>
+				<div class="text-muted small mt-1">
+					For hosting accounts set to <b>Server defaults</b>: <?=(int)$s_lim_use['session'];?> of <?=(int)$s_lim_use['accounts'];?> accounts for SSH, cron and terminal,
+					<?=(int)$s_lim_use['db'];?> of <?=(int)$s_lim_use['accounts'];?> for databases. The others keep their own limits (the account's Advanced Config &rsaquo; Limits<?=function_exists('hosting_enabled') && hosting_enabled() ? ', or their hosting package\'s' : '';?>).
+				</div>
+			</div>
+		</div>
+		<div class="card-body">
+
+			<div class="row set-row">
+				<div class="col-md-3 set-label">SSH, cron and terminal</div>
+				<div class="col-md-9">
+					<div class="d-flex flex-wrap" style="gap:12px 20px;">
+						<div>
+							<label class="form-label mb-1" for="lim-cpu">CPU</label>
+							<div class="input-group lim-field">
+								<input type="number" class="form-control" name="cpu" id="lim-cpu" min="5" max="<?=(int)$s_lim['cores'] * 100;?>" step="5" value="<?=(int)$s_lim['cpu'];?>" required>
+								<span class="input-group-text">%</span>
+							</div>
+						</div>
+						<div>
+							<label class="form-label mb-1" for="lim-mem">Memory</label>
+							<div class="input-group lim-field">
+								<input type="number" class="form-control" name="memory" id="lim-mem" min="64" step="64"<?=$s_lim['ram_mb'] ? ' max="'.(int)$s_lim['ram_mb'].'"' : '';?> value="<?=$s_lim['memory_mb'] ? (int)$s_lim['memory_mb'] : '';?>" placeholder="auto">
+								<span class="input-group-text">MB</span>
+							</div>
+						</div>
+						<div>
+							<label class="form-label mb-1" for="lim-proc">Processes</label>
+							<input type="number" class="form-control lim-field" name="processes" id="lim-proc" min="16" max="100000" value="<?=(int)$s_lim['processes'];?>" required>
+						</div>
+					</div>
+					<small class="set-hint">CPU: 100% = one core; this server has <?=(int)$s_lim['cores'];?> core<?=$s_lim['cores'] == 1 ? '' : 's';?> (up to <?=(int)$s_lim['cores'] * 100;?>%). A busy job is slowed down, never stopped.</small>
+					<small class="set-hint">Memory: empty = automatic, a quarter of the RAM up to 2 GB (<?=h($s_mb($s_lim['builtin']['memory_auto_mb']));?> here; the server has <?=h($s_mb($s_lim['ram_mb']));?>). At the limit the kernel stops the account's largest process.</small>
+					<small class="set-hint">All of an account's sessions share these limits. Website PHP is not limited here: each site's PHP-FPM pool has its own worker limit.</small>
+				</div>
+			</div>
+
+			<div class="row set-row">
+				<div class="col-md-3 set-label">Databases</div>
+				<div class="col-md-9">
+					<label class="form-label mb-1" for="lim-dbc">Connections at once per database user</label>
+					<input type="number" class="form-control lim-field" name="db_conn" id="lim-dbc" min="0" max="10000" value="<?=(int)$s_lim['db_conn'];?>" required>
+					<small class="set-hint">0 = no limit. MariaDB counts per database user, not per account; more connections are refused with "too many connections". Takes effect for new connections.</small>
+<?php if ($s_mysql_max): ?>
+					<small class="set-hint" id="lim-dbc-max" data-max="<?=$s_mysql_max;?>">The whole MariaDB server allows <b><?=number_format($s_mysql_max);?></b> connections (<code>max_connections</code>)<span id="lim-dbc-warn" class="text-warning"<?=$s_lim['db_conn'] === 0 || $s_lim['db_conn'] >= $s_mysql_max ? '' : ' hidden';?>> - with this limit one busy site can take all of them; raise <code>max_connections</code> in <code>/etc/my.cnf.d/</code> too</span>.</small>
+<?php endif; ?>
+				</div>
+			</div>
+
+		</div>
+		<div class="card-footer d-flex align-items-center flex-wrap" style="gap:12px;">
+			<button type="submit" class="btn btn-primary" id="lim-save">Save default limits</button>
+			<span class="text-muted small">Applies at once, also to sessions already running. Built-in values: CPU <?=(int)$s_lim['builtin']['cpu'];?>%, memory automatic, <?=(int)$s_lim['builtin']['processes'];?> processes, <?=(int)$s_lim['builtin']['db_conn'];?> database connections.</span>
 		</div>
 		</div>
 		</form>
@@ -450,6 +523,15 @@ jQuery(document).ready(function () {
 		$('#submit-btn').prop('value', 'Saving...').prop('disabled', true);
 	});
 	$email.on('input', function () { $email.removeClass('is-invalid'); $('#email-feedback').hide(); });
+
+	/* Default limits: warn when the database limit could fill MariaDB */
+	$('#lim-dbc').on('input', function () {
+		var max = parseInt($('#lim-dbc-max').data('max'), 10), v = parseInt(this.value, 10);
+		if (max) $('#lim-dbc-warn').prop('hidden', !(v === 0 || v >= max));
+	});
+	$('#default-limits').on('submit', function () {
+		$('#lim-save').text('Saving...').prop('disabled', true);
+	});
 
 	/* the test goes to the address in the main form, saved or not — with no
 	   valid address there is nowhere to send it, so the button is disabled */
